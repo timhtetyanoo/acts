@@ -136,6 +136,9 @@ std::tuple<unsigned, SectorProjector> msSectorAndProj(
 
 MuonExpandedSector::MuonExpandedSector(unsigned msSector,
                                        SectorProjector proj) {
+  if (msSector < 1 || msSector > MuonSectorMapping::s_numSectors) {
+    throw std::invalid_argument("MuonExpandedSector: msSector is out of range");
+  }
   m_sector = static_cast<std::int8_t>(
       (2 * msSector + Acts::toUnderlying(proj)) % s_nExpanded);
 }
@@ -143,21 +146,32 @@ MuonExpandedSector::MuonExpandedSector(unsigned msSector,
 MuonExpandedSector::MuonExpandedSector(double phi) {
   std::vector<int> sectors{};
   MuonSectorMapping::getSectors(phi, sectors);
-  assert(!sectors.empty());
+  if (sectors.empty()) {
+    throw std::invalid_argument(
+        "MuonExpandedSector: no MS sector for the given phi");
+  }
   if (sectors.size() == 1) {
     *this = MuonExpandedSector{static_cast<unsigned>(sectors[0]),
                                SectorProjector::center};
   } else {
     const int dS = static_cast<int>((sectors[1] - sectors[0]) %
                                     MuonSectorMapping::s_numSectors);
-    assert(std::abs(dS) == 1);
+    if (std::abs(dS) != 1) {
+      throw std::invalid_argument(
+          "MuonExpandedSector: overlap sectors are not neighbours");
+    }
     *this = MuonExpandedSector{static_cast<unsigned>(sectors[0]),
                                static_cast<SectorProjector>(dS)};
   }
 }
 
 MuonExpandedSector::MuonExpandedSector(std::int8_t expandedSector)
-    : m_sector{expandedSector} {}
+    : m_sector{expandedSector} {
+  if (expandedSector < 0 || expandedSector >= s_nExpanded) {
+    throw std::invalid_argument(
+        "MuonExpandedSector: expanded sector is out of range");
+  }
+}
 
 bool MuonExpandedSector::operator<(const MuonExpandedSector& other) const {
   return sector() < other.sector();
