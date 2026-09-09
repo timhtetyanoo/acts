@@ -23,6 +23,118 @@
 using namespace Acts::UnitLiterals;
 
 namespace ActsExamples {
+
+MuonStationIndex stationIndex(MuonSpacePoint::MuonId::StationName stName) {
+  using StationName = MuonSpacePoint::MuonId::StationName;
+  switch (stName) {
+    case StationName::BIS:
+    case StationName::BIL:
+      return MuonStationIndex::BI;
+    case StationName::BMS:
+    case StationName::BML:
+      return MuonStationIndex::BM;
+    case StationName::BOS:
+    case StationName::BOL:
+      return MuonStationIndex::BO;
+    case StationName::BEE:
+      return MuonStationIndex::BE;
+    case StationName::EIS:
+    case StationName::EIL:
+      return MuonStationIndex::EI;
+    case StationName::EMS:
+    case StationName::EML:
+      return MuonStationIndex::EM;
+    case StationName::EOS:
+    case StationName::EOL:
+      return MuonStationIndex::EO;
+    case StationName::EES:
+    case StationName::EEL:
+      return MuonStationIndex::EE;
+    default:
+      return MuonStationIndex::UnDef;
+  }
+}
+
+MuonLayerIndex layerIndex(MuonStationIndex stIdx) {
+  switch (stIdx) {
+    case MuonStationIndex::BI:
+    case MuonStationIndex::EI:
+      return MuonLayerIndex::Inner;
+    case MuonStationIndex::BM:
+    case MuonStationIndex::EM:
+      return MuonLayerIndex::Middle;
+    case MuonStationIndex::BO:
+    case MuonStationIndex::EO:
+      return MuonLayerIndex::Outer;
+    case MuonStationIndex::EE:
+      return MuonLayerIndex::Extended;
+    case MuonStationIndex::BE:
+      return MuonLayerIndex::BarrelExtended;
+    default:
+      return MuonLayerIndex::UnDef;
+  }
+}
+
+bool isBarrel(MuonStationIndex stIdx) {
+  switch (stIdx) {
+    case MuonStationIndex::BI:
+    case MuonStationIndex::BM:
+    case MuonStationIndex::BO:
+    case MuonStationIndex::BE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::string toString(MuonStationIndex stIdx) {
+  switch (stIdx) {
+    case MuonStationIndex::BI:
+      return "BI";
+    case MuonStationIndex::BM:
+      return "BM";
+    case MuonStationIndex::BO:
+      return "BO";
+    case MuonStationIndex::BE:
+      return "BE";
+    case MuonStationIndex::EI:
+      return "EI";
+    case MuonStationIndex::EM:
+      return "EM";
+    case MuonStationIndex::EO:
+      return "EO";
+    case MuonStationIndex::EE:
+      return "EE";
+    default:
+      return "Unknown";
+  }
+}
+
+std::string toString(MuonLayerIndex layIdx) {
+  switch (layIdx) {
+    case MuonLayerIndex::Inner:
+      return "Inner";
+    case MuonLayerIndex::Middle:
+      return "Middle";
+    case MuonLayerIndex::Outer:
+      return "Outer";
+    case MuonLayerIndex::Extended:
+      return "Extended";
+    case MuonLayerIndex::BarrelExtended:
+      return "BarrelExtended";
+    default:
+      return "Unknown";
+  }
+}
+
+std::ostream& operator<<(std::ostream& ostr, MuonStationIndex stIdx) {
+  return ostr << toString(stIdx);
+}
+
+std::ostream& operator<<(std::ostream& ostr, MuonLayerIndex layIdx) {
+  return ostr << toString(layIdx);
+}
+
 namespace MuonSectorMapping {
 double sectorSize(int sector) {
   const int idx = sector % 2;

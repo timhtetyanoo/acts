@@ -21,6 +21,46 @@
 
 namespace ActsExamples {
 
+/// @brief Classification of the MS station layers
+enum class MuonStationIndex : std::int8_t {
+  UnDef = -1,  ///< Undefined station
+  BI,          ///< Barrel inner
+  BM,          ///< Barrel middle
+  BO,          ///< Barrel outer
+  BE,          ///< Barrel endcap extension
+  EI,          ///< Endcap inner
+  EM,          ///< Endcap middle
+  EO,          ///< Endcap outer
+  EE,          ///< Endcap extension
+  MaxVal       ///< Number of stations
+};
+
+/// @brief Classification of the layer inside the MS
+enum class MuonLayerIndex : std::int8_t {
+  UnDef = -1,      ///< Undefined layer
+  Inner,           ///< Inner station layer
+  Middle,          ///< Middle station layer
+  Outer,           ///< Outer station layer
+  Extended,        ///< Endcap extension layer
+  BarrelExtended,  ///< Barrel endcap-extension layer
+  MaxVal           ///< Number of layers
+};
+
+/// @brief Maps an MS station name onto its station index
+MuonStationIndex stationIndex(MuonSpacePoint::MuonId::StationName stName);
+/// @brief Maps a station index onto its layer index
+MuonLayerIndex layerIndex(MuonStationIndex stIdx);
+/// @brief Returns whether the station index is located in the barrel
+bool isBarrel(MuonStationIndex stIdx);
+/// @brief Return the station index as a string
+std::string toString(MuonStationIndex stIdx);
+/// @brief Return the layer index as a string
+std::string toString(MuonLayerIndex layIdx);
+/// @brief Stream a station index
+std::ostream& operator<<(std::ostream& ostr, MuonStationIndex stIdx);
+/// @brief Stream a layer index
+std::ostream& operator<<(std::ostream& ostr, MuonLayerIndex layIdx);
+
 namespace MuonSectorMapping {
 constexpr unsigned int s_numSectors = 16;
 constexpr double s_eighthPi = std::numbers::pi / 8.;
@@ -134,5 +174,7 @@ class MuonExpandedSector {
 
 }  // namespace ActsExamples
 
+ACTS_OSTREAM_FORMATTER(ActsExamples::MuonStationIndex);
+ACTS_OSTREAM_FORMATTER(ActsExamples::MuonLayerIndex);
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonExpandedSector::SectorProjector);
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonExpandedSector);
