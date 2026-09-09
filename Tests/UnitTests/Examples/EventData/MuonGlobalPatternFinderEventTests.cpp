@@ -8,15 +8,18 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include "Acts/Utilities/Helpers.hpp"
 #include "ActsExamples/EventData/MuonGlobalPatternFinderEvent.hpp"
 #include "ActsTests/CommonHelpers/FloatComparisons.hpp"
 
 #include <numbers>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 using namespace ActsExamples;
 using SectorProjector = MuonExpandedSector::SectorProjector;
+using StationName = MuonSpacePoint::MuonId::StationName;
 
 namespace ActsExamples::Test {
 
@@ -36,6 +39,65 @@ constexpr unsigned prevSector(unsigned s) {
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(MuonGlobalPatternFinderEventTests)
+
+BOOST_AUTO_TEST_CASE(StationMapping) {
+  const std::vector<std::tuple<StationName, MuonStationIndex, MuonLayerIndex>>
+      expected{
+          {StationName::BIS, MuonStationIndex::BI, MuonLayerIndex::Inner},
+          {StationName::BIL, MuonStationIndex::BI, MuonLayerIndex::Inner},
+          {StationName::BMS, MuonStationIndex::BM, MuonLayerIndex::Middle},
+          {StationName::BML, MuonStationIndex::BM, MuonLayerIndex::Middle},
+          {StationName::BOS, MuonStationIndex::BO, MuonLayerIndex::Outer},
+          {StationName::BOL, MuonStationIndex::BO, MuonLayerIndex::Outer},
+          {StationName::BEE, MuonStationIndex::BE,
+           MuonLayerIndex::BarrelExtended},
+          {StationName::EIS, MuonStationIndex::EI, MuonLayerIndex::Inner},
+          {StationName::EIL, MuonStationIndex::EI, MuonLayerIndex::Inner},
+          {StationName::EMS, MuonStationIndex::EM, MuonLayerIndex::Middle},
+          {StationName::EML, MuonStationIndex::EM, MuonLayerIndex::Middle},
+          {StationName::EOS, MuonStationIndex::EO, MuonLayerIndex::Outer},
+          {StationName::EOL, MuonStationIndex::EO, MuonLayerIndex::Outer},
+          {StationName::EES, MuonStationIndex::EE, MuonLayerIndex::Extended},
+          {StationName::EEL, MuonStationIndex::EE, MuonLayerIndex::Extended},
+      };
+
+  for (const auto& [stName, stIdx, layIdx] : expected) {
+    BOOST_CHECK_EQUAL(stationIndex(stName), stIdx);
+    BOOST_CHECK_EQUAL(layerIndex(stationIndex(stName)), layIdx);
+  }
+
+  for (std::int8_t st = Acts::toUnderlying(StationName::UnDef) + 1;
+       st < Acts::toUnderlying(StationName::MaxVal); ++st) {
+    const auto stName = static_cast<StationName>(st);
+    const auto stIdx = stationIndex(stName);
+    BOOST_CHECK(stIdx != MuonStationIndex::UnDef);
+    BOOST_CHECK(layerIndex(stIdx) != MuonLayerIndex::UnDef);
+  }
+
+  BOOST_CHECK(isBarrel(MuonStationIndex::BI));
+  BOOST_CHECK(isBarrel(MuonStationIndex::BM));
+  BOOST_CHECK(isBarrel(MuonStationIndex::BO));
+  BOOST_CHECK(isBarrel(MuonStationIndex::BE));
+  BOOST_CHECK(!isBarrel(MuonStationIndex::EI));
+  BOOST_CHECK(!isBarrel(MuonStationIndex::EM));
+  BOOST_CHECK(!isBarrel(MuonStationIndex::EO));
+  BOOST_CHECK(!isBarrel(MuonStationIndex::EE));
+  BOOST_CHECK(!isBarrel(MuonStationIndex::UnDef));
+
+  BOOST_CHECK_EQUAL(stationIndex(StationName::UnDef), MuonStationIndex::UnDef);
+  BOOST_CHECK_EQUAL(layerIndex(MuonStationIndex::UnDef), MuonLayerIndex::UnDef);
+
+  for (std::int8_t st = Acts::toUnderlying(MuonStationIndex::UnDef) + 1;
+       st < Acts::toUnderlying(MuonStationIndex::MaxVal); ++st) {
+    BOOST_CHECK(!toString(static_cast<MuonStationIndex>(st)).empty());
+  }
+  for (std::int8_t lay = Acts::toUnderlying(MuonLayerIndex::UnDef) + 1;
+       lay < Acts::toUnderlying(MuonLayerIndex::MaxVal); ++lay) {
+    BOOST_CHECK(!toString(static_cast<MuonLayerIndex>(lay)).empty());
+  }
+  BOOST_CHECK_EQUAL(toString(MuonStationIndex::UnDef), "Unknown");
+  BOOST_CHECK_EQUAL(toString(MuonLayerIndex::UnDef), "Unknown");
+}
 
 BOOST_AUTO_TEST_CASE(SectorMapping) {
   for (int s = 1; s <= nSectors; ++s) {
