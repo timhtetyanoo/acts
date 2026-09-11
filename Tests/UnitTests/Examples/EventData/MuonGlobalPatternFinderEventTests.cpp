@@ -12,9 +12,12 @@
 #include "ActsExamples/EventData/MuonGlobalPatternFinderEvent.hpp"
 #include "ActsTests/CommonHelpers/FloatComparisons.hpp"
 
+#include <algorithm>
 #include <numbers>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 using namespace ActsExamples;
@@ -97,6 +100,88 @@ BOOST_AUTO_TEST_CASE(StationMapping) {
   }
   BOOST_CHECK_EQUAL(toString(MuonStationIndex::UnDef), "Unknown");
   BOOST_CHECK_EQUAL(toString(MuonLayerIndex::UnDef), "Unknown");
+}
+
+BOOST_AUTO_TEST_CASE(GlobalPattern) {
+  using DetSide = MuonSpacePoint::MuonId::DetSide;
+  using TechField = MuonSpacePoint::MuonId::TechField;
+
+  auto makeHit = [](StationName st) {
+    MuonSpacePoint sp;
+    MuonSpacePoint::MuonId id;
+    id.setChamber(st, DetSide::A, 1, TechField::Mdt);
+    sp.setId(id);
+    return sp;
+  };
+
+  MuonSpacePointBucket bisBucket{makeHit(StationName::BIS),
+                                 makeHit(StationName::BIS)};
+  MuonSpacePointBucket bmsBucket{makeHit(StationName::BMS)};
+
+  MuonGlobalPattern::HitCollection hits;
+  hits[MuonStationIndex::BI] = {&bisBucket[0], &bisBucket[1]};
+  hits[MuonStationIndex::BM] = {&bmsBucket[0]};
+
+  MuonGlobalPattern::BucketCollection buckets;
+  buckets[MuonStationIndex::BI] = {&bisBucket};
+  buckets[MuonStationIndex::BM] = {&bmsBucket};
+
+  MuonGlobalPattern pat{std::move(hits), std::move(buckets)};
+
+  auto stations = pat.getStations();
+  std::sort(stations.begin(), stations.end(),
+            [](MuonStationIndex a, MuonStationIndex b) {
+              return Acts::toUnderlying(a) < Acts::toUnderlying(b);
+            });
+  BOOST_CHECK_EQUAL(stations.size(), 2u);
+  BOOST_CHECK_EQUAL(stations.front(), MuonStationIndex::BI);
+  BOOST_CHECK_EQUAL(stations.back(), MuonStationIndex::BM);
+
+  BOOST_CHECK_EQUAL(pat.hitsInStation(MuonStationIndex::BI).size(), 2u);
+  BOOST_CHECK_EQUAL(pat.hitsInStation(MuonStationIndex::BM).size(), 1u);
+  BOOST_CHECK(pat.hitsInStation(MuonStationIndex::EO).empty());
+  BOOST_CHECK_EQUAL(pat.bucketsInStation(MuonStationIndex::BI).size(), 1u);
+  BOOST_CHECK(pat.bucketsInStation(MuonStationIndex::EO).empty());
+  BOOST_CHECK_EQUAL(pat.hitsPerStation().size(), 2u);
+
+  pat.setTheta(0.3);
+  pat.setPhi(1.1);
+  pat.setNPrecisionLayers(4);
+  pat.setNTriggerLayers(2);
+  pat.setNPhiLayers(3);
+  pat.setMeanNormResidual2(0.42);
+  CHECK_CLOSE_ABS(pat.theta(), 0.3, 1e-12);
+  CHECK_CLOSE_ABS(pat.phi(), 1.1, 1e-12);
+  BOOST_CHECK_EQUAL(pat.nPrecisionLayers(), 4u);
+  BOOST_CHECK_EQUAL(pat.nTriggerLayers(), 2u);
+  BOOST_CHECK_EQUAL(pat.nPhiLayers(), 3u);
+  CHECK_CLOSE_ABS(pat.meanNormResidual2(), 0.42, 1e-12);
+
+  pat.setSector(0);
+  BOOST_CHECK_EQUAL(pat.sector(), 16u);
+  BOOST_CHECK_EQUAL(pat.secondarySector(), 16u);
+  BOOST_CHECK(!pat.isSectorOverlap());
+
+  pat.setSector(1);
+  BOOST_CHECK_EQUAL(pat.sector(), 16u);
+  BOOST_CHECK_EQUAL(pat.secondarySector(), 1u);
+  BOOST_CHECK(pat.isSectorOverlap());
+  CHECK_CLOSE_ABS(pat.sectorPhi(), pat.expSector().phi(), 1e-12);
+
+  MuonGlobalPattern sameHits = pat;
+  sameHits.setTheta(2.5);
+  BOOST_CHECK(pat == sameHits);
+
+  MuonGlobalPattern::HitCollection otherHits;
+  otherHits[MuonStationIndex::BI] = {&bisBucket[0]};
+  MuonGlobalPattern::BucketCollection otherBuckets;
+  otherBuckets[MuonStationIndex::BI] = {&bisBucket};
+  MuonGlobalPattern other{std::move(otherHits), std::move(otherBuckets)};
+  BOOST_CHECK(!(pat == other));
+
+  std::ostringstream oss;
+  oss << pat;
+  BOOST_CHECK(!oss.str().empty());
 }
 
 BOOST_AUTO_TEST_CASE(SectorMapping) {
