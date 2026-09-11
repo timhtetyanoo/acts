@@ -17,6 +17,7 @@
 #include <numbers>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ActsExamples {
@@ -172,9 +173,106 @@ class MuonExpandedSector {
   std::int8_t m_sector{0};
 };
 
+/// @brief Data class representing a muon spectrometer global pattern.
+class MuonGlobalPattern {
+ public:
+  using HitType = const MuonSpacePoint*;
+  using StIndex = MuonStationIndex;
+  using HitCollection = std::unordered_map<StIndex, std::vector<HitType>>;
+  using BucketCollection =
+      std::unordered_map<StIndex, std::vector<const MuonSpacePointBucket*>>;
+
+  /// @brief Constructor consuming the hit collection per station
+  MuonGlobalPattern(HitCollection&& hitPerStation,
+                    BucketCollection&& bucketPerStation);
+  MuonGlobalPattern() = delete;
+
+  /// @brief Set the average theta of the pattern
+  void setTheta(double theta) { m_theta = theta; }
+  /// @brief Set the average phi of the pattern
+  void setPhi(double phi) { m_phi = phi; }
+  /// @brief Set the main sector of the pattern
+  void setSector(std::int8_t sector) { m_sector = MuonExpandedSector{sector}; }
+  /// @brief Set the number of precision layers in the pattern
+  void setNPrecisionLayers(unsigned n) { m_nPrecisionLayers = n; }
+  /// @brief Set the number of trigger layers in the pattern
+  void setNTriggerLayers(unsigned n) { m_nTriggerLayers = n; }
+  /// @brief Set the number of phi layers in the pattern
+  void setNPhiLayers(unsigned n) { m_nPhiLayers = n; }
+  /// @brief Set the mean over eta hits of the square of their residual
+  ///        divided by the acceptance window from pattern finding
+  void setMeanNormResidual2(double res) { m_meanNormResidual2 = res; }
+
+  /// @brief Return the average global theta of the pattern
+  double theta() const { return m_theta; }
+  /// @brief Return the average global phi of the pattern
+  double phi() const { return m_phi; }
+  /// @brief Return the main sector where the pattern is located
+  unsigned sector() const { return m_sector.msSector(); }
+  /// @brief Return the associated sector of the pattern
+  unsigned secondarySector() const { return m_sector.adjacentMsSector(); }
+  /// @brief Return whether the pattern is located in the overlap region
+  ///        between two sectors
+  bool isSectorOverlap() const { return sector() != secondarySector(); }
+  /// @brief Return the expanded sector of the pattern
+  const MuonExpandedSector& expSector() const { return m_sector; }
+  /// @brief Return the sector phi of the pattern. It is the central phi of
+  ///        the sector or the value at the edge in case of overlap
+  double sectorPhi() const;
+  /// @brief Return the associated stations to the pattern
+  std::vector<StIndex> getStations() const;
+  /// @brief Return the pattern hits in the given station
+  const std::vector<HitType>& hitsInStation(StIndex station) const;
+  /// @brief Return the parent buckets of the pattern in the given station
+  const std::vector<const MuonSpacePointBucket*>& bucketsInStation(
+      StIndex station) const;
+  /// @brief Return the number of precision layers in the pattern
+  unsigned nPrecisionLayers() const { return m_nPrecisionLayers; }
+  /// @brief Return the number of trigger layers in the pattern
+  unsigned nTriggerLayers() const { return m_nTriggerLayers; }
+  /// @brief Return the number of phi layers in the pattern
+  unsigned nPhiLayers() const { return m_nPhiLayers; }
+  /// @brief Return the mean over eta hits of the square of their residual
+  ///        divided by the acceptance window from pattern finding
+  double meanNormResidual2() const { return m_meanNormResidual2; }
+  /// @brief Return the hits per station
+  const HitCollection& hitsPerStation() const { return m_hitsInStation; }
+
+  /// @brief The print-out operator
+  friend std::ostream& operator<<(std::ostream& ostr,
+                                  const MuonGlobalPattern& gp) {
+    return gp.print(ostr);
+  }
+  /// @brief Equality operator. Compares hit content only and ignores
+  ///        kinematics and quality fields
+  bool operator==(const MuonGlobalPattern& other) const {
+    return m_hitsInStation == other.m_hitsInStation;
+  }
+
+ private:
+  std::ostream& print(std::ostream& ostr) const;
+
+  double m_theta{0.};
+  double m_phi{0.};
+  unsigned m_nPrecisionLayers{0};
+  unsigned m_nTriggerLayers{0};
+  unsigned m_nPhiLayers{0};
+  double m_meanNormResidual2{0.};
+
+  /// Default is raw expanded sector 0 (MS sector 16, centre). Callers should
+  /// setSector before use.
+  MuonExpandedSector m_sector{static_cast<std::int8_t>(0)};
+
+  HitCollection m_hitsInStation{};
+  BucketCollection m_parentBuckets{};
+};
+
+using MuonGlobalPatternContainer = std::vector<MuonGlobalPattern>;
+
 }  // namespace ActsExamples
 
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonStationIndex);
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonLayerIndex);
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonExpandedSector::SectorProjector);
 ACTS_OSTREAM_FORMATTER(ActsExamples::MuonExpandedSector);
+ACTS_OSTREAM_FORMATTER(ActsExamples::MuonGlobalPattern);

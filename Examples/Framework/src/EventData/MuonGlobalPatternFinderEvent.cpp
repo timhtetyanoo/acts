@@ -16,8 +16,12 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <format>
+#include <iterator>
+#include <ranges>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 using namespace Acts::UnitLiterals;
@@ -353,6 +357,62 @@ std::string MuonExpandedSector::toString(SectorProjector projector) {
 std::ostream& MuonExpandedSector::print(std::ostream& ostr) const {
   ostr << "Expanded sector: " << static_cast<int>(sector()) << " -> "
        << projector() << " of sector " << msSector();
+  return ostr;
+}
+
+MuonGlobalPattern::MuonGlobalPattern(HitCollection&& hitPerStation,
+                                     BucketCollection&& bucketPerStation)
+    : m_hitsInStation(std::move(hitPerStation)),
+      m_parentBuckets(std::move(bucketPerStation)) {}
+
+double MuonGlobalPattern::sectorPhi() const {
+  return m_sector.phi();
+}
+
+std::vector<MuonGlobalPattern::StIndex> MuonGlobalPattern::getStations() const {
+  std::vector<StIndex> out{};
+  out.reserve(m_hitsInStation.size());
+  std::ranges::transform(m_hitsInStation, std::back_inserter(out),
+                         [](const auto& pair) { return pair.first; });
+  return out;
+}
+
+const std::vector<MuonGlobalPattern::HitType>& MuonGlobalPattern::hitsInStation(
+    StIndex station) const {
+  const auto it = m_hitsInStation.find(station);
+  if (it != m_hitsInStation.end()) {
+    return it->second;
+  }
+  static const std::vector<HitType> empty{};
+  return empty;
+}
+
+const std::vector<const MuonSpacePointBucket*>&
+MuonGlobalPattern::bucketsInStation(StIndex station) const {
+  const auto it = m_parentBuckets.find(station);
+  if (it != m_parentBuckets.end()) {
+    return it->second;
+  }
+  static const std::vector<const MuonSpacePointBucket*> empty{};
+  return empty;
+}
+
+std::ostream& MuonGlobalPattern::print(std::ostream& ostr) const {
+  ostr << std::format(
+      "SpacePoint Pattern, Sector: {} & {}, theta: {}, Phi: {}, Sector Phi: "
+      "{}, nPrecisionLayers: {}, nTriggerLayers: {}, nPhiLayers: {}, mean "
+      "normalized residual squared: {}",
+      sector(), isSectorOverlap() ? std::to_string(secondarySector()) : "-",
+      theta() / 1_degree, phi() / 1_degree, sectorPhi() / 1_degree,
+      nPrecisionLayers(), nTriggerLayers(), nPhiLayers(), meanNormResidual2());
+  ostr << ", Hit per station: \n";
+  for (const auto& [station, hits] : m_hitsInStation) {
+    ostr << std::format(" Station {}: {} hits\n", toString(station),
+                        hits.size());
+    for (const auto& hit : hits) {
+      ostr << " " << *hit << "\n";
+    }
+  }
   return ostr;
 }
 
