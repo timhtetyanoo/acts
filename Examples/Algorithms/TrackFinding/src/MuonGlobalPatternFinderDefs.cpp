@@ -9,27 +9,52 @@
 #include "ActsExamples/TrackFinding/MuonGlobalPatternFinderDefs.hpp"
 
 #include "Acts/Definitions/Common.hpp"
-#include "Acts/Definitions/Units.hpp"
+#include "Acts/Surfaces/detail/PlanarHelper.hpp"
 #include "Acts/Utilities/MathHelpers.hpp"
+#include "Acts/Utilities/UnitVectors.hpp"
+#include "Acts/Utilities/VectorHelpers.hpp"
+#include "Acts/Utilities/detail/periodic.hpp"
 #include "ActsExamples/TrackFinding/MuonGlobalPatternFinderUtils.hpp"
 
-#include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 
 using namespace Acts::UnitLiterals;
+using Acts::VectorHelpers::perp;
+using Acts::VectorHelpers::phi;
+using Acts::VectorHelpers::theta;
+
+namespace ActsExamples::MuonGlobalPatternFinderDefs {
 
 namespace {
 
 /// @brief Gradient of the azimuthal coordinate
 /// @param pos: Position where the gradient is to be computed
 Acts::Vector3 phiGradient(const Acts::Vector3& pos) {
-  return Acts::Vector3{-pos.y(), pos.x(), 0.} / pos.perp2();
+  return Acts::Vector3{-pos.y(), pos.x(), 0.} / pos.head<2>().squaredNorm();
+}
+
+/// @brief Size of an expanded sector in phi
+double expandedSectorSize(const MuonExpandedSector& sect) {
+  const auto sector1 = static_cast<int>(sect.msSector());
+  const auto sector2 = static_cast<int>(sect.adjacentMsSector());
+  if (sector1 == sector2) {
+    return MuonSectorMapping::sectorSize(sector1);
+  }
+  // The overlap size is the same for small and large sectors
+  return MuonSectorMapping::sectorWidth(sector1) -
+         MuonSectorMapping::sectorSize(sector1);
+}
+
+/// @brief Convert an angle from radians to degrees
+constexpr double inDeg(double angle) {
+  return angle / 1._degree;
 }
 
 }  // namespace
-
-namespace ActsExamples::MuonGlobalPatternFinderDefs {
 
 HitPayload::HitPayload(const MuonSpacePoint* sp,
                        const MuonSpacePointBucket* bucket,
@@ -73,7 +98,7 @@ HitPayload::HitPayload(const MuonSpacePoint* sp,
     discCov = Acts::square(sp->driftRadius()) + covEta;
 
     if (measuresPhi) {
-      phiCov = discCov / position.perp2() +
+      phiCov = discCov / position.head<2>().squaredNorm() +
                Acts::square(sensorDir.dot(phiGradient(position))) *
                    (covPhi - discCov);
     }
@@ -138,10 +163,250 @@ double HitPayload::residualVariance(const Acts::Vector3& contractionVector,
 
 void CandidateHit::print(std::ostream& ostr) const {
   ostr << *sp() << ", glob Z/R/phi: " << hit->position.z() << " / "
-       << hit->position.perp() << " / " << hit->position.phi() / 1_degree
+       << perp(hit->position) << " / " << inDeg(phi(hit->position))
        << ", st: " << station
        << ", loc/glob lay: " << static_cast<int>(hit->locLayer) << "/"
        << static_cast<int>(globLayer);
+}
+
+PatternState::PatternState(const CandidateHit& seed, std::int8_t expSector,
+                           const PatternFinderConfig* cfg,
+                           const Acts::Logger* logger)
+    : cfg{cfg},
+      m_logger{logger},
+      lastInsertedHit{seed},
+      prevLayerHit{seed},
+      lineAnchorHit{seed},
+      patTheta{theta(seed->position)},
+      expSect{expSector} {
+  if (cfg == nullptr || logger == nullptr) {
+    throw std::invalid_argument(
+        "PatternState: the configuration and the logger must be provided");
+  }
+  hitsPerStation[stationIdx(seed.station)].push_back(seed);
+
+  if (seed->isPrecision) {
+    ++nPrecisionLayers;
+  } else {
+    ++nTriggerLayers;
+  }
+  if (seed->measuresPhi) {
+    ++nPhiLayers;
+  }
+  updatePatternPhi();
+  needLineUpdate = true;
+}
+
+void PatternState::moveLineAnchorHit(const CandidateHit& refHit) {
+  // Treat first the special case where we have only one station
+  if (nStations(false) < 2u) {
+    // The hit search direction has been inverted without finding any hit in
+    // other stations beside the initial one. So the anchor is the last hit.
+    lineAnchorHit = lastInsertedHit;
+    return;
+  }
+  // Find first the closest station to the reference hit among the pattern
+  // stations
+  const auto closestSt = std::ranges::min_element(
+      hitsPerStation, std::ranges::less{},
+      [&refHit](const std::vector<CandidateHit>& hits) {
+        if (hits.empty() || hits.front().station == refHit.station) {
+          return std::numeric_limits<int>::max();
+        }
+        return std::abs(hits.front().globLayer - refHit.globLayer);
+      });
+  // Then find the closest hit in that station to the reference hit
+  lineAnchorHit = *std::ranges::min_element(
+      *closestSt, std::ranges::less{}, [&refHit](const CandidateHit& hit) {
+        return std::abs(hit.globLayer - refHit.globLayer);
+      });
+}
+
+void PatternState::updateLineParameters(const Acts::Vector3& beamSpot) {
+  if (!needLineUpdate) {
+    return;
+  }
+  const Acts::Vector3 pos1 = projToPhiPlane(*lineAnchorHit);
+  const Acts::Vector3 pos2 = projToPhiPlane(*lastInsertedHit);
+  Acts::Vector3 d = pos2 - pos1;
+  leverArm = d.norm();
+
+  // Check whether we have to use the beamspot instead of the anchor hit to
+  // draw the line
+  useBeamspot = lastInsertedHit.station == lineAnchorHit.station &&
+                leverArm < cfg->minHitDistance4Line;
+  if (useBeamspot) {
+    linePos = beamSpot;
+    d = pos2 - beamSpot;
+    leverArm = d.norm();
+  } else {
+    linePos = pos1;
+  }
+  lineDir = d / leverArm;
+  needLineUpdate = false;
+
+  ACTS_VERBOSE("updateLineParameters() Updated --> linePos R/z/theta: "
+               << perp(linePos) << " / " << linePos.z() << " / "
+               << inDeg(theta(linePos))
+               << ", lineDir theta: " << inDeg(theta(lineDir))
+               << ", LeverArm: " << leverArm
+               << ", Use beamspot: " << useBeamspot);
+}
+
+Acts::Vector3 PatternState::projToPhiPlane(const HitPayload& hit) const {
+  // The bending plane contains the beam axis, i.e. it has no offset
+  return Acts::PlanarHelper::intersectPlane(hit.position, hit.sensorDir,
+                                            bendPlaneNorm, 0.)
+      .position();
+}
+
+void PatternState::updatePatternPhi() {
+  if (nPhiLayers == 0u) {
+    // Without phi hits, use the central phi of the sector / overlap region,
+    // with the variance of a uniform distribution over the expanded sector
+    patPhi = MuonSectorMapping::sectorOverlapPhi(
+        static_cast<int>(expSect.msSector()),
+        static_cast<int>(expSect.adjacentMsSector()));
+    patPhiCov = Acts::square(expandedSectorSize(expSect)) / 3.;
+    bendPlaneNorm =
+        Acts::makeDirectionFromPhiTheta(patPhi + 90._degree, 90._degree);
+    ACTS_VERBOSE("updatePatternPhi() No phi hits in the pattern, set pattern "
+                 "phi to "
+                 << inDeg(patPhi) << " +- " << inDeg(std::sqrt(patPhiCov)));
+    return;
+  }
+  double sumSin{0.};
+  double sumCos{0.};
+  double sumWeight{0.};
+  auto processPhiHit = [&sumSin, &sumCos, &sumWeight](const HitPayload& hit) {
+    if (!hit.measuresPhi) {
+      return;
+    }
+    if (hit.phiCov < Acts::s_epsilon) {
+      std::ostringstream sstr{};
+      sstr << "PatternState: unexpected phi hit with zero variance in the phi "
+              "direction: "
+           << *hit.sp;
+      throw std::runtime_error(sstr.str());
+    }
+    const double weight = 1. / hit.phiCov;
+    const double hitPhi = phi(hit.position);
+    sumSin += weight * std::sin(hitPhi);
+    sumCos += weight * std::cos(hitPhi);
+    sumWeight += weight;
+  };
+  for (const std::vector<CandidateHit>& hits : hitsPerStation) {
+    for (const CandidateHit& hit : hits) {
+      processPhiHit(*hit);
+    }
+  }
+  for (const HitPayload& hit : phiOnlyHits) {
+    processPhiHit(hit);
+  }
+  patPhi = std::atan2(sumSin, sumCos);
+  patPhiCov = 1. / sumWeight;
+  bendPlaneNorm =
+      Acts::makeDirectionFromPhiTheta(patPhi + 90._degree, 90._degree);
+  ACTS_VERBOSE("updatePatternPhi() Updated pattern phi to "
+               << inDeg(patPhi) << " +- " << inDeg(std::sqrt(patPhiCov)));
+}
+
+bool PatternState::isPhiCompatible(const HitPayload& hit) const {
+  const double testPhi = phi(hit.position);
+  if (nPhiLayers > 0u) {
+    const double deltaPhiSigma = std::sqrt(patPhiCov + hit.phiCov);
+    const double deltaPhi = Acts::detail::radian_sym(patPhi - testPhi);
+    if (std::abs(deltaPhi) > cfg->nPhiSigma * deltaPhiSigma) {
+      ACTS_VERBOSE("isPhiCompatible() The pattern with phi = "
+                   << inDeg(patPhi) << " +- " << inDeg(std::sqrt(patPhiCov))
+                   << " is not compatible with the test hit with phi "
+                   << inDeg(testPhi) << " +- " << inDeg(std::sqrt(hit.phiCov)));
+      return false;
+    }
+    return true;
+  }
+  const auto sector1 = static_cast<int>(expSect.msSector());
+  const auto sector2 = static_cast<int>(expSect.adjacentMsSector());
+  const bool isCompatible =
+      MuonSectorMapping::insideSector(sector1, testPhi) &&
+      (sector1 == sector2 || MuonSectorMapping::insideSector(sector2, testPhi));
+  if (!isCompatible) {
+    ACTS_VERBOSE("isPhiCompatible() The test hit with phi = "
+                 << inDeg(testPhi) << " is not inside the pattern sectors: "
+                 << sector1 << " and " << sector2);
+  }
+  return isCompatible;
+}
+
+bool PatternState::isInPattern(const HitPayload& hit) const {
+  const std::vector<CandidateHit>& hits =
+      hitsPerStation[stationIdx(hit.station)];
+  return std::ranges::any_of(
+      hits, [&hit](const CandidateHit& c) { return *c == hit; });
+}
+
+std::uint8_t PatternState::nStations(bool onlyGoodStations) const {
+  return static_cast<std::uint8_t>(std::ranges::count_if(
+      hitsPerStation,
+      [this, onlyGoodStations](const std::vector<CandidateHit>& hits) {
+        return !hits.empty() &&
+               (!onlyGoodStations || hits.size() >= cfg->minStationLayers);
+      }));
+}
+
+std::uint8_t PatternState::nBendingLayers() const {
+  return static_cast<std::uint8_t>(nPrecisionLayers + nTriggerLayers);
+}
+
+double PatternState::getMeanResidual2() const {
+  if (isFinalized) {
+    return meanNormResidual2;
+  }
+  return meanNormResidual2 / nBendingLayers();
+}
+
+std::vector<const MuonSpacePointBucket*> PatternState::getParentBuckets()
+    const {
+  std::vector<const MuonSpacePointBucket*> buckets{};
+  for (const std::vector<CandidateHit>& hits : hitsPerStation) {
+    for (const CandidateHit& hit : hits) {
+      if (std::ranges::find(buckets, hit->bucket) == buckets.end()) {
+        buckets.push_back(hit->bucket);
+      }
+    }
+  }
+  return buckets;
+}
+
+void PatternState::print(std::ostream& ostr, bool detailedPrint) const {
+  ostr << "PatternState Exp Sector: " << static_cast<int>(expSect.sector())
+       << ", Theta: " << inDeg(patTheta) << ", Phi: " << inDeg(patPhi)
+       << " +- " << inDeg(std::sqrt(patPhiCov))
+       << ", nPrec: " << static_cast<int>(nPrecisionLayers)
+       << ", nEtaNonPrec: " << static_cast<int>(nTriggerLayers)
+       << ", nPhi: " << static_cast<int>(nPhiLayers)
+       << ", mean norm res sq: " << getMeanResidual2()
+       << ", dirTheta: " << inDeg(theta(lineDir)) << ", Hit per station: \n";
+  for (std::size_t st = 0u; st < s_nStations; ++st) {
+    const std::vector<CandidateHit>& hits = hitsPerStation[st];
+    if (hits.empty()) {
+      continue;
+    }
+    ostr << "  Station "
+         << static_cast<MuonStationIndex>(static_cast<std::int8_t>(st))
+         << " has " << hits.size() << " hits ";
+    if (detailedPrint) {
+      ostr << "\n";
+      for (const CandidateHit& hit : hits) {
+        ostr << "    " << hit << "\n";
+      }
+    }
+  }
+  if (!detailedPrint) {
+    ostr << "\n    Last hit: " << lastInsertedHit
+         << "\n    prevLayerHit: " << prevLayerHit
+         << "\n    lineAnchorHit: " << lineAnchorHit;
+  }
 }
 
 }  // namespace ActsExamples::MuonGlobalPatternFinderDefs
