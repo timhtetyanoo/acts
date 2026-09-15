@@ -11,3 +11,9 @@ target_link_libraries(
     ActsUnitTestMuonGlobalPatternFinderUtils
     PRIVATE ActsExamplesTrackFinding ActsExamplesFramework
 )
+
+add_unittest(MuonGlobalPatternFinderDefs MuonGlobalPatternFinderDefsTests.cpp)
+target_link_libraries(
+    ActsUnitTestMuonGlobalPatternFinderDefs
+    PRIVATE ActsExamplesTrackFinding ActsExamplesFramework
+)
