@@ -11,6 +11,7 @@ acts_add_library(
     src/MuonGlobalPatternFinderUtils.cpp
     src/MuonGlobalPatternFinderDefs.cpp
     src/MuonGlobalPatternFinder.cpp
+    src/MuonGlobalPatternFinding.cpp
     src/GraphBasedSeedingAlgorithm.cpp
     src/TrackParamsLookupEstimation.cpp
     src/GridTripletSeedingAlgorithm.cpp
