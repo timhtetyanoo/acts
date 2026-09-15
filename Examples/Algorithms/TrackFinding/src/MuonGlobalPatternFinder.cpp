@@ -13,12 +13,16 @@
 #include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/StringHelpers.hpp"
 #include "Acts/Utilities/VectorHelpers.hpp"
+#include "Acts/Utilities/detail/periodic.hpp"
 #include "ActsExamples/TrackFinding/MuonGlobalPatternFinderUtils.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <format>
+#include <iterator>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -29,7 +33,20 @@ using Acts::VectorHelpers::phi;
 
 namespace ActsExamples {
 
+using MuonGlobalPatternFinderDefs::brief;
 using MuonGlobalPatternFinderDefs::detailed;
+using MuonGlobalPatternFinderDefs::LineTestDecision;
+using MuonGlobalPatternFinderDefs::LineTestRes;
+using MuonGlobalPatternFinderDefs::s_nStations;
+
+namespace {
+
+constexpr auto s_thetaIdx =
+    Acts::toUnderlying(MuonGlobalPatternFinder::SeedCoords::eTheta);
+constexpr auto s_sectorIdx =
+    Acts::toUnderlying(MuonGlobalPatternFinder::SeedCoords::eSector);
+
+}  // namespace
 
 MuonGlobalPatternFinder::MuonGlobalPatternFinder(
     Config config, std::unique_ptr<const Acts::Logger> logger)
@@ -119,9 +136,8 @@ MuonGlobalPatternFinder::SearchTreeData MuonGlobalPatternFinder::constructTree(
                                 pos - pos.dot(planeNormal) * planeNormal});
 
       SearchTree_t::coordinate_t coords{};
-      coords[Acts::toUnderlying(SeedCoords::eTheta)] =
-          std::atan2(projR, pos.z());
-      coords[Acts::toUnderlying(SeedCoords::eSector)] = expSect.sector();
+      coords[s_thetaIdx] = std::atan2(projR, pos.z());
+      coords[s_sectorIdx] = expSect.sector();
       ACTS_VERBOSE("constructTree() Add hit: Z: "
                    << pos.z() << ", R: " << perp(pos) << ", ProjR: " << projR
                    << ", Phi: " << phi(pos) / 1._degree
@@ -135,6 +151,458 @@ MuonGlobalPatternFinder::SearchTreeData MuonGlobalPatternFinder::constructTree(
              << " hits.");
   return SearchTreeData{std::move(hitPayloads),
                         SearchTree_t{std::move(treeData)}};
+}
+
+MuonGlobalPatternFinder::PatternStateVec
+MuonGlobalPatternFinder::findPatternsInEta(
+    const SearchTree_t& orderedSpacepoints) const {
+  using enum LayerOrdering;
+  const unsigned minLayers =
+      m_cfg.minTriggerLayers + m_cfg.minPrecisionLayers;
+
+  std::vector<CandidateHit> candidateHits{};
+  candidateHits.reserve(100);
+  // Two buffers of active patterns to avoid reallocations
+  PatternStateVec startPatternBuff{};
+  PatternStateVec endPatternBuff{};
+  startPatternBuff.reserve(10);
+  endPatternBuff.reserve(10);
+
+  /// @todo Retrieve the beamspot if desired
+  const Acts::Vector3 beamSpot{Acts::Vector3::Zero()};
+
+  PatternStateVec outPatterns{};
+  outPatterns.reserve(10);
+
+  /// @brief Count the existing patterns containing a hit
+  auto countPatterns = [this](const PatternStateVec& patterns,
+                              const HitPayload& hit,
+                              const SearchTree_t::coordinate_t& coords) {
+    const MuonExpandedSector hitSector{
+        static_cast<std::int8_t>(coords[s_sectorIdx])};
+    return static_cast<std::size_t>(
+        std::ranges::count_if(patterns, [&](const PatternState& pattern) {
+          if (std::abs(pattern.patTheta - coords[s_thetaIdx]) >
+                  2. * m_cfg.thetaSearchWindow ||
+              !pattern.expSect.isNeighbour(hitSector)) {
+            return false;
+          }
+          return pattern.isInPattern(hit);
+        }));
+  };
+
+  for (const MuonLayerIndex seedingLayer : m_cfg.layerSeedings) {
+    // Try to build a pattern starting from every hit in the tree
+    for (const auto& [seedCoords, seedPtr] : orderedSpacepoints) {
+      const HitPayload& seed = *seedPtr;
+      // Check that the seed is in the current seeding layer and whether
+      // seeding from MDT hits is enabled
+      const MuonLayerIndex seedLayer = layerIndex(seed.station);
+      if (seedLayer != seedingLayer || (seed.isStraw && !m_cfg.seedFromMdt)) {
+        continue;
+      }
+      ACTS_VERBOSE("findPatternsInEta() New seed hit "
+                   << *seed.sp << ", sector: " << seedCoords[s_sectorIdx]
+                   << ", theta: " << seedCoords[s_thetaIdx]);
+
+      // Check how many existing patterns contain this hit
+      std::size_t nExistingPatterns =
+          countPatterns(outPatterns, seed, seedCoords);
+      if (nExistingPatterns >= m_cfg.maxSeedAttempts) {
+        // Try first to resolve overlaps and recount
+        outPatterns = resolveOverlaps(outPatterns);
+        nExistingPatterns = countPatterns(outPatterns, seed, seedCoords);
+        if (nExistingPatterns >= m_cfg.maxSeedAttempts) {
+          ACTS_VERBOSE("findPatternsInEta() Seed has already been used in "
+                       << nExistingPatterns
+                       << " patterns, which is above the limit - skip.");
+          continue;
+        }
+      }
+
+      // Search hits in the same **expanded** sector
+      SearchTree_t::range_t selectRange{};
+      selectRange[s_sectorIdx].shrink(seedCoords[s_sectorIdx] - 0.1,
+                                      seedCoords[s_sectorIdx] + 0.1);
+      // A middle-layer seed already constrains the track direction more
+      // tightly, as the line must connect to hits on both sides. Inner- and
+      // outer-layer seeds need a window of double size to achieve the same
+      // angular acceptance.
+      const double thetaHalfWindow =
+          (seedLayer == MuonLayerIndex::Inner ||
+           seedLayer == MuonLayerIndex::Outer)
+              ? m_cfg.thetaSearchWindow
+              : 0.5 * m_cfg.thetaSearchWindow;
+      selectRange[s_thetaIdx].shrink(seedCoords[s_thetaIdx] - thetaHalfWindow,
+                                     seedCoords[s_thetaIdx] + thetaHalfWindow);
+
+      candidateHits.clear();
+      orderedSpacepoints.rangeSearchMapDiscard(
+          selectRange, [&candidateHits](const SearchTree_t::coordinate_t&,
+                                        const HitPayload* hit) {
+            candidateHits.push_back(CandidateHit{hit, hit->station, 0u});
+          });
+      if (candidateHits.size() < minLayers) {
+        ACTS_VERBOSE("findPatternsInEta() Found "
+                     << candidateHits.size()
+                     << " candidate hits, below the minimum - skip seed.");
+        continue;
+      }
+      // The candidate hits must extend over at least two station layers
+      if (std::ranges::none_of(candidateHits,
+                               [seedLayer](const CandidateHit& c) {
+                                 return layerIndex(c.station) != seedLayer;
+                               })) {
+        ACTS_VERBOSE("findPatternsInEta() All candidates in the same station "
+                     "layer - skip seed.");
+        continue;
+      }
+      // Sort the candidates by global logical layer
+      std::ranges::sort(candidateHits, [](const CandidateHit& c1,
+                                          const CandidateHit& c2) {
+        const LayerOrdering ordering = checkLayerOrdering(*c1, *c2);
+        if (ordering == eSameLayer) {
+          // Hits on the same layer are sorted by the local precision coordinate
+          return c1.sp()->localPosition().y() < c2.sp()->localPosition().y();
+        }
+        return ordering == eLowerLayer;
+      });
+      // Assign the global layer number to avoid recomputing it later
+      for (std::size_t i = 1u; i < candidateHits.size(); ++i) {
+        const bool newLayer = checkLayerOrdering(*candidateHits[i - 1],
+                                                 *candidateHits[i]) !=
+                              eSameLayer;
+        candidateHits[i].globLayer = static_cast<std::uint8_t>(
+            candidateHits[i - 1].globLayer + (newLayer ? 1u : 0u));
+      }
+      if (candidateHits.back().globLayer + 1u < minLayers) {
+        ACTS_VERBOSE("findPatternsInEta() Found "
+                     << candidateHits.size() << " candidate hits on "
+                     << candidateHits.back().globLayer + 1u
+                     << " layers, below the minimum - skip seed.");
+        continue;
+      }
+      if (logger().doPrint(Acts::Logging::VERBOSE)) {
+        ACTS_VERBOSE("findPatternsInEta() Found " << candidateHits.size()
+                                                  << " candidate hits: ");
+        for (const CandidateHit& c : candidateHits) {
+          ACTS_VERBOSE("findPatternsInEta() \t**" << c);
+        }
+      }
+
+      // Start the pattern building from the seed
+      const auto seedItr = std::ranges::find_if(
+          candidateHits, [&seed](const CandidateHit& c) { return c == seed; });
+      if (seedItr == candidateHits.end()) {
+        ACTS_ERROR("findPatternsInEta() The seed is not among its candidates");
+        continue;
+      }
+      const CandidateHit& seedCand = *seedItr;
+      PatternState patternSeed{seedCand,
+                               static_cast<std::int8_t>(seedCoords[s_sectorIdx]),
+                               &m_cfg, m_logger.get()};
+
+      /// @brief Extend a pattern with a range of hits. Patterns are branched
+      ///        when compatible with multiple hits on the same layer. For each
+      ///        new hit, extendPatterns tries to extend every active pattern
+      ///        and removes the ones not meeting the continuation criteria.
+      /// @param begin: Iterator to the first hit to process
+      /// @param end: Iterator to the end of the hit range
+      /// @param toExtend: Pattern to extend
+      auto processHitRange = [&](const auto begin, const auto end,
+                                 PatternState&& toExtend) -> PatternStateVec {
+        startPatternBuff.clear();
+        startPatternBuff.push_back(std::move(toExtend));
+        for (auto testItr = begin; testItr != end; ++testItr) {
+          const CandidateHit& testHit = *testItr;
+          if (testHit.globLayer == seedCand.globLayer) {
+            continue;  // skip hits on the same layer as the seed
+          }
+          extendPatterns(startPatternBuff, endPatternBuff, testHit, beamSpot);
+          std::swap(startPatternBuff, endPatternBuff);
+        }
+        if (startPatternBuff.size() > 1u) {
+          return resolveOverlaps(startPatternBuff);
+        }
+        PatternStateVec extended{};
+        if (!startPatternBuff.empty()) {
+          extended.push_back(std::move(startPatternBuff.back()));
+        }
+        return extended;
+      };
+
+      // First search for compatible hits from the seed layer outwards
+      PatternStateVec forwardExtended = processHitRange(
+          std::next(seedItr), candidateHits.end(), std::move(patternSeed));
+      ACTS_VERBOSE("findPatternsInEta() Finished forward search, found "
+                   << forwardExtended.size()
+                   << " patterns, start backward search.");
+
+      PatternStateVec backwardExtended{};
+      backwardExtended.reserve(2u * forwardExtended.size());
+      for (PatternState& pat : forwardExtended) {
+        ACTS_VERBOSE("findPatternsInEta() Start backward search for pattern "
+                     << detailed(pat));
+        // When inverting the search direction, update the last inserted hit
+        // and the line anchor
+        pat.moveLineAnchorHit(seedCand);
+        pat.lastInsertedHit = seedCand;
+        std::ranges::move(processHitRange(std::reverse_iterator{seedItr},
+                                          candidateHits.rend(), std::move(pat)),
+                          std::back_inserter(backwardExtended));
+      }
+      if (backwardExtended.size() > 1u) {
+        backwardExtended = resolveOverlaps(backwardExtended);
+      }
+
+      for (PatternState& pat : backwardExtended) {
+        pat.meanNormResidual2 /= pat.nBendingLayers();
+        if (!passPatternCuts(pat)) {
+          continue;
+        }
+        ACTS_VERBOSE("findPatternsInEta() Add new pattern " << detailed(pat));
+        pat.isFinalized = true;
+        outPatterns.push_back(std::move(pat));
+      }
+    }
+  }
+  ACTS_VERBOSE("findPatternsInEta() Found in total "
+               << outPatterns.size()
+               << " patterns in eta before overlap removal");
+  return resolveOverlaps(outPatterns);
+}
+
+void MuonGlobalPatternFinder::extendPatterns(PatternStateVec& startPatterns,
+                                             PatternStateVec& endPatterns,
+                                             const CandidateHit& testHit,
+                                             const Acts::Vector3& beamSpot) const {
+  endPatterns.clear();
+  ACTS_VERBOSE("extendPatterns() *** Test " << testHit << " against "
+                                            << startPatterns.size()
+                                            << " active patterns.");
+
+  // Number of layers between the last inserted hit and the test hit
+  auto missedLayers = [&testHit](const PatternState& pat) {
+    return static_cast<unsigned>(
+        std::abs(pat.lastInsertedHit.globLayer - testHit.globLayer));
+  };
+  // The minimum number of missed layers among the active patterns is the
+  // reference to prune patterns with too many missed layers
+  unsigned minMissedLayers{std::numeric_limits<unsigned>::max()};
+  for (const PatternState& pat : startPatterns) {
+    minMissedLayers = std::min(minMissedLayers, missedLayers(pat));
+  }
+  const bool shouldPrune =
+      startPatterns.size() > 1u &&
+      std::ranges::any_of(startPatterns, [](const PatternState& p) {
+        return p.nBendingLayers() > 2u;
+      });
+
+  for (std::size_t i = 0u; i < startPatterns.size(); ++i) {
+    PatternState& pat = startPatterns[i];
+    if (pat.isOverlap) {
+      continue;
+    }
+    // Check the pattern has not already missed too many layers compared to
+    // the other patterns
+    if (pat.lastInsertedHit.station == testHit.station &&
+        missedLayers(pat) >
+            std::max(m_cfg.maxMissLayersInStation, minMissedLayers)) {
+      ACTS_VERBOSE("extendPatterns() Pattern "
+                   << detailed(pat) << "\nhas missed " << missedLayers(pat)
+                   << " layer hits, above the max allowed - abort pattern.");
+      continue;
+    }
+    // Prune the pattern hypotheses sharing the same last hit, keeping only the
+    // best one. All patterns are kept if their last hit is on the test hit
+    // layer, to allow further branching.
+    if (shouldPrune && pat.lastInsertedHit.globLayer != testHit.globLayer) {
+      bool hasBetter{false};
+      for (std::size_t j = i + 1u; j < startPatterns.size(); ++j) {
+        PatternState& other = startPatterns[j];
+        if (other.isOverlap || other.lastInsertedHit != pat.lastInsertedHit) {
+          continue;
+        }
+        if (isBetter(pat, other)) {
+          ACTS_VERBOSE("extendPatterns() Pruning: "
+                       << detailed(pat) << "\nis BETTER than "
+                       << detailed(other));
+          other.isOverlap = true;
+          continue;
+        }
+        ACTS_VERBOSE("extendPatterns() Pruning: " << detailed(other)
+                                                  << "\nis BETTER than "
+                                                  << detailed(pat));
+        hasBetter = true;
+        break;
+      }
+      if (hasBetter) {
+        continue;
+      }
+    }
+    // Check the line compatibility of the test hit with the pattern
+    const LineTestRes res = pat.checkLineComp(testHit, beamSpot);
+    switch (res.result) {
+      case LineTestDecision::eAddHit: {
+        /// @todo Study the feasibility of loosening the criteria for
+        ///       low-confidence hits
+        const bool lowConfidenceRes =
+            res.sigma > m_cfg.lowConfidenceResSigma &&
+            res.residual / res.sigma > 2.;
+        if (lowConfidenceRes) {
+          ACTS_VERBOSE("extendPatterns() Low-confidence hit: residual pull "
+                       << res.residual / res.sigma);
+          // Keep both the patterns with and without the hit, such that the
+          // hit can still be rejected in the next iterations. Make sure first
+          // that the forked pattern is original.
+          if (std::ranges::any_of(
+                  endPatterns, [&testHit, &pat](const PatternState& p) {
+                    return p.lastInsertedHit == testHit &&
+                           (p.prevLayerHit == pat.lastInsertedHit ||
+                            p.nBendingLayers() > pat.nBendingLayers() + 1u);
+                  })) {
+            ACTS_VERBOSE(
+                "extendPatterns() Forking leads to an existing pattern.");
+            break;
+          }
+          endPatterns.push_back(pat);
+          endPatterns.back().addHit(testHit, res.residual, res.sigma);
+          break;
+        }
+        ACTS_VERBOSE("extendPatterns() Hit compatible - add to pattern. "
+                     "Residual pull "
+                     << res.residual / res.sigma);
+        pat.addHit(testHit, res.residual, res.sigma);
+        break;
+      }
+      case LineTestDecision::eBranchPattern: {
+        // Check first whether the branched pattern already exists
+        if (std::ranges::any_of(endPatterns,
+                                [&testHit, &pat](const PatternState& p) {
+                                  return p.lastInsertedHit == testHit &&
+                                         p.prevLayerHit == pat.prevLayerHit;
+                                })) {
+          ACTS_VERBOSE("extendPatterns() Branched pattern already exists.");
+          break;
+        }
+        // Branch the pattern: clone it and replace its last hit
+        ACTS_VERBOSE("extendPatterns() Hit compatible & on the same layer of "
+                     "the last added hit - branch pattern.");
+        endPatterns.push_back(pat);
+        endPatterns.back().overWriteHit(testHit, res.residual, res.sigma);
+        break;
+      }
+      case LineTestDecision::eRejectHit: {
+        ACTS_VERBOSE("extendPatterns() Hit is not compatible - reject hit.");
+        break;
+      }
+    }
+    endPatterns.push_back(std::move(pat));
+  }
+  startPatterns.clear();
+}
+
+MuonGlobalPatternFinder::PatternStateVec
+MuonGlobalPatternFinder::resolveOverlaps(PatternStateVec& toResolve) const {
+  ACTS_VERBOSE("resolveOverlaps() Resolving overlaps among "
+               << toResolve.size() << " patterns.");
+  PatternStateVec outputPatterns{};
+  outputPatterns.reserve(toResolve.size());
+
+  /// @brief Check whether two patterns overlap
+  auto areOverlapping = [this](const PatternState& a, const PatternState& b) {
+    // Check first the geometrical overlap
+    if (!a.expSect.isNeighbour(b.expSect) ||
+        std::abs(a.patTheta - b.patTheta) > 2. * m_cfg.thetaSearchWindow) {
+      return false;
+    }
+    /// @brief Whether the phi of a pattern is inside both sectors of another
+    auto insideSectors = [](const PatternState& withPhi,
+                            const PatternState& withoutPhi) {
+      return MuonSectorMapping::insideSector(
+                 static_cast<int>(withoutPhi.expSect.msSector()),
+                 withPhi.patPhi) &&
+             MuonSectorMapping::insideSector(
+                 static_cast<int>(withoutPhi.expSect.adjacentMsSector()),
+                 withPhi.patPhi);
+    };
+    if (a.nPhiLayers > 0u && b.nPhiLayers > 0u) {
+      if (std::abs(Acts::detail::radian_sym(a.patPhi - b.patPhi)) >
+          5._degree) {
+        return false;
+      }
+    } else if (a.nPhiLayers > 0u) {
+      if (!insideSectors(a, b)) {
+        return false;
+      }
+    } else if (b.nPhiLayers > 0u) {
+      if (!insideSectors(b, a)) {
+        return false;
+      }
+    }
+    // The patterns can overlap geometrically, so check the hit content
+    std::size_t nSharedHits{0u};
+    std::size_t nSharedStations{0u};
+    for (std::size_t st = 0u; st < s_nStations; ++st) {
+      const std::vector<CandidateHit>& hitsA = a.hitsPerStation[st];
+      const std::vector<CandidateHit>& hitsB = b.hitsPerStation[st];
+      if (hitsA.empty() || hitsB.empty()) {
+        continue;
+      }
+      const auto nSharedInStation = static_cast<std::size_t>(
+          std::ranges::count_if(hitsA, [&hitsB](const CandidateHit& hitA) {
+            return std::ranges::find(hitsB, hitA) != hitsB.end();
+          }));
+      nSharedHits += nSharedInStation;
+      if (nSharedInStation >= m_cfg.minStationLayers) {
+        ++nSharedStations;
+      }
+    }
+    // Overlap if at least 50% of the hits of the smaller pattern are shared
+    const std::size_t minHits =
+        std::min(a.nBendingLayers(), b.nBendingLayers());
+    const std::size_t minStations =
+        std::min(a.nStations(true), b.nStations(true));
+    return 2u * nSharedHits >= minHits &&
+           nSharedStations >= std::min<std::size_t>(2u, minStations);
+  };
+  /// @brief Determine the best pattern, preferring more good stations
+  auto isBetterOverlap = [](const PatternState& a, const PatternState& b) {
+    const int nGoodStationDiff = a.nStations(true) - b.nStations(true);
+    if (nGoodStationDiff != 0) {
+      return nGoodStationDiff > 0;
+    }
+    return isBetter(a, b);
+  };
+
+  for (auto it = toResolve.begin(); it != toResolve.end(); ++it) {
+    if (it->isOverlap) {
+      continue;
+    }
+    for (auto jt = std::next(it); jt != toResolve.end(); ++jt) {
+      if (jt->isOverlap || !areOverlapping(*it, *jt)) {
+        continue;
+      }
+      if (isBetterOverlap(*it, *jt)) {
+        ACTS_VERBOSE("resolveOverlaps() Pattern " << brief(*it)
+                                                  << "\nis BETTER than "
+                                                  << brief(*jt));
+        jt->isOverlap = true;
+      } else {
+        ACTS_VERBOSE("resolveOverlaps() Pattern " << brief(*jt)
+                                                  << "\nis BETTER than "
+                                                  << brief(*it));
+        it->isOverlap = true;
+        break;
+      }
+    }
+    if (!it->isOverlap) {
+      outputPatterns.push_back(std::move(*it));
+    }
+  }
+  ACTS_VERBOSE("resolveOverlaps() Patterns surviving overlap removal: "
+               << outputPatterns.size());
+  return outputPatterns;
 }
 
 bool MuonGlobalPatternFinder::passPatternCuts(const PatternState& pat) const {

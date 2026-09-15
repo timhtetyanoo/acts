@@ -357,6 +357,232 @@ BOOST_AUTO_TEST_CASE(SearchTree) {
   BOOST_CHECK(emptyData.tree.begin() == emptyData.tree.end());
 }
 
+namespace {
+
+/// @brief Barrel chamber frame: the local x-axis points along phi, the local
+///        y-axis along the beam axis & the local z-axis radially outwards
+Acts::Transform3 barrelChamberFrame() {
+  Acts::Transform3 trf{Acts::Transform3::Identity()};
+  trf.linear().col(0) = Acts::Vector3::UnitY();
+  trf.linear().col(1) = Acts::Vector3::UnitZ();
+  trf.linear().col(2) = Acts::Vector3::UnitX();
+  return trf;
+}
+
+constexpr double mdtCovEta = 0.01;
+constexpr double rpcCovEta = 1.;
+
+/// @brief Hit in the xz-plane of sector 1 expressed in the barrel chamber frame
+MuonSpacePoint barrelHit(TechField tech, StationName st, double r, double z,
+                         double covEta) {
+  MuonSpacePoint sp =
+      makeSp(tech, st, true, false, Acts::Vector3{0., z, r},
+             Acts::Vector3::UnitX(), Acts::Vector3::UnitY());
+  sp.setCovariance(4., covEta, 0.);
+  return sp;
+}
+
+/// @brief Straight muon from the origin in the xz-plane of sector 1 with
+///        z = slope * r. The hits are displaced by +-50 um along z.
+void addMuon(MuonSpacePointContainer& container, double slope) {
+  const auto addBucket = [&](StationName st, TechField tech,
+                             const std::vector<double>& radii, double covEta) {
+    MuonSpacePointBucket bucket{};
+    for (std::size_t i = 0u; i < radii.size(); ++i) {
+      const double offset = (i % 2u == 0u ? 1. : -1.) * 50._um;
+      bucket.push_back(barrelHit(tech, st, radii[i],
+                                 slope * radii[i] + offset, covEta));
+    }
+    container.push_back(std::move(bucket));
+  };
+  addBucket(StationName::BIL, TechField::Mdt, {5._m, 5.026_m, 5.052_m, 5.078_m},
+            mdtCovEta);
+  addBucket(StationName::BML, TechField::Mdt, {7._m, 7.026_m, 7.052_m, 7.078_m},
+            mdtCovEta);
+  addBucket(StationName::BML, TechField::Rpc, {7.3_m, 7.31_m}, rpcCovEta);
+  addBucket(StationName::BOL, TechField::Mdt, {9._m, 9.026_m, 9.052_m, 9.078_m},
+            mdtCovEta);
+  addBucket(StationName::BOL, TechField::Rpc, {9.3_m}, rpcCovEta);
+}
+
+std::size_t nStationHits(const PatternState& pat, MuonStationIndex st) {
+  return pat.hitsPerStation[stationIdx(st)].size();
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(EtaPatternSingleMuon) {
+  constexpr double slope = 0.4;
+  MuonSpacePointContainer container{};
+  addMuon(container, slope);
+  /// Noise hit close to the muon on the second BO MDT layer & a distant noise
+  /// hit on the third BM MDT layer
+  container[3].push_back(barrelHit(TechField::Mdt, StationName::BOL, 9.026_m,
+                                   slope * 9.026_m + 300._um, mdtCovEta));
+  container[1].push_back(barrelHit(TechField::Mdt, StationName::BML, 7.052_m,
+                                   slope * 7.052_m + 50._mm, mdtCovEta));
+  const MuonSpacePoint* closeNoise = &container[3].back();
+  const MuonSpacePoint* farNoise = &container[1].back();
+
+  const MuonGlobalPatternFinder finder = makeFinder(barrelChamberFrame());
+  const MuonGlobalPatternFinder::SearchTreeData data =
+      finder.constructTree(gctx, container);
+  const auto patterns = finder.findPatternsInEta(data.tree);
+
+  /// The seeds of all expanded sectors lead to the same pattern
+  BOOST_REQUIRE_EQUAL(patterns.size(), 1u);
+  const PatternState& pat = patterns.front();
+  BOOST_CHECK(pat.isFinalized);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPrecisionLayers), 12);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nTriggerLayers), 3);
+  BOOST_CHECK_EQUAL(nStationHits(pat, MuonStationIndex::BI), 4u);
+  BOOST_CHECK_EQUAL(nStationHits(pat, MuonStationIndex::BM), 6u);
+  BOOST_CHECK_EQUAL(nStationHits(pat, MuonStationIndex::BO), 5u);
+  BOOST_CHECK_LE(pat.meanNormResidual2, finder.config().meanNormRes2Cut);
+  CHECK_CLOSE_ABS(pat.patTheta, std::atan2(1., slope), 1e-3);
+
+  /// The noise hits are not part of the pattern
+  for (const HitPayload& hit : data.hitPayloads) {
+    const bool isNoise = hit.sp == closeNoise || hit.sp == farNoise;
+    BOOST_CHECK_EQUAL(pat.isInPattern(hit), !isNoise);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(EtaPatternTwoMuons) {
+  MuonSpacePointContainer container{};
+  addMuon(container, 0.4);
+  addMuon(container, 0.2);
+
+  const MuonGlobalPatternFinder finder = makeFinder(barrelChamberFrame());
+  const MuonGlobalPatternFinder::SearchTreeData data =
+      finder.constructTree(gctx, container);
+  auto patterns = finder.findPatternsInEta(data.tree);
+
+  BOOST_REQUIRE_EQUAL(patterns.size(), 2u);
+  std::ranges::sort(patterns, {}, &PatternState::patTheta);
+  CHECK_CLOSE_ABS(patterns[0].patTheta, std::atan2(1., 0.4), 1e-3);
+  CHECK_CLOSE_ABS(patterns[1].patTheta, std::atan2(1., 0.2), 1e-3);
+  for (const PatternState& pat : patterns) {
+    BOOST_CHECK_EQUAL(static_cast<int>(pat.nBendingLayers()), 15);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(EtaPatternTooFewLayers) {
+  MuonSpacePointContainer container{};
+  addMuon(container, 0.4);
+  /// Keep only the BM chambers
+  container.erase(container.begin() + 3, container.end());
+  container.erase(container.begin());
+
+  const MuonGlobalPatternFinder finder = makeFinder(barrelChamberFrame());
+  const MuonGlobalPatternFinder::SearchTreeData data =
+      finder.constructTree(gctx, container);
+  BOOST_CHECK(finder.findPatternsInEta(data.tree).empty());
+}
+
+BOOST_AUTO_TEST_CASE(OverlapRemoval) {
+  using PatternStateVec = MuonGlobalPatternFinder::PatternStateVec;
+  const MuonGlobalPatternFinder finder = makeFinder();
+  const auto& cfg = finder.config();
+  MuonSpacePointBucket biBucket{};
+  MuonSpacePointBucket bmBucket{};
+  MuonSpacePointBucket bmOtherBucket{};
+  MuonSpacePointBucket boBucket{};
+  for (unsigned i = 0u; i < 4u; ++i) {
+    biBucket.push_back(makeEta(StationName::BIL, {5._m, 0., 1._m + i * 1._cm}));
+    bmBucket.push_back(makeEta(StationName::BML, {7._m, 0., 2._m + i * 1._cm}));
+    bmOtherBucket.push_back(
+        makeEta(StationName::BML, {7._m, 0., 3._m + i * 1._cm}));
+    boBucket.push_back(makeEta(StationName::BOL, {9._m, 0., 3._m + i * 1._cm}));
+  }
+  std::vector<HitPayload> payloads{};
+  payloads.reserve(16u);
+  for (const MuonSpacePointBucket* bucket :
+       {&biBucket, &bmBucket, &bmOtherBucket, &boBucket}) {
+    for (std::size_t i = 0u; i < bucket->size(); ++i) {
+      payloads.push_back(makePayload(*bucket, i));
+    }
+  }
+  const auto stationHits = [&payloads](std::size_t first) {
+    std::vector<CandidateHit> hits{};
+    for (std::size_t i = first; i < first + 4u; ++i) {
+      hits.push_back(CandidateHit{&payloads[i], payloads[i].station, 0u});
+    }
+    return hits;
+  };
+  /// Pattern with 4 hits in BI and 4 hits in either of the BM chambers
+  const auto pattern = [&](double res, bool otherBm = false) {
+    PatternState pat = makePattern(finder, payloads[0], 8u, 0u, res);
+    pat.hitsPerStation[stationIdx(MuonStationIndex::BI)] = stationHits(0u);
+    pat.hitsPerStation[stationIdx(MuonStationIndex::BM)] =
+        stationHits(otherBm ? 8u : 4u);
+    return pat;
+  };
+  const auto resolve = [&finder](PatternStateVec patterns) {
+    return finder.resolveOverlaps(patterns);
+  };
+
+  /// Identical hit content: the better residual wins
+  PatternStateVec sameHits{};
+  sameHits.push_back(pattern(2.));
+  sameHits.push_back(pattern(1.));
+  const PatternStateVec resolved = resolve(std::move(sameHits));
+  BOOST_REQUIRE_EQUAL(resolved.size(), 1u);
+  CHECK_CLOSE_REL(resolved.front().meanNormResidual2, 1., 1e-12);
+
+  /// Patterns far apart in theta or sector do not overlap
+  PatternStateVec thetaApart{};
+  thetaApart.push_back(pattern(1.));
+  thetaApart.push_back(pattern(1.));
+  thetaApart.back().patTheta += 3. * cfg.thetaSearchWindow;
+  BOOST_CHECK_EQUAL(resolve(std::move(thetaApart)).size(), 2u);
+
+  PatternStateVec sectorApart{};
+  sectorApart.push_back(pattern(1.));
+  sectorApart.push_back(pattern(1.));
+  sectorApart.back().expSect =
+      MuonExpandedSector{5u, SectorProjector::center};
+  BOOST_CHECK_EQUAL(resolve(std::move(sectorApart)).size(), 2u);
+
+  /// Patterns with phi measurements are compared in phi
+  const auto phiPatterns = [&](double phi1, double phi2) {
+    PatternStateVec patterns{};
+    for (const double patPhi : {phi1, phi2}) {
+      patterns.push_back(pattern(1.));
+      patterns.back().nPhiLayers = 1u;
+      patterns.back().patPhi = patPhi;
+    }
+    return patterns;
+  };
+  BOOST_CHECK_EQUAL(resolve(phiPatterns(0., 10._degree)).size(), 2u);
+  BOOST_CHECK_EQUAL(resolve(phiPatterns(0., 2._degree)).size(), 1u);
+  /// A pattern phi outside the sector of the pattern without phi
+  PatternStateVec outsideSector{};
+  outsideSector.push_back(pattern(1.));
+  outsideSector.push_back(pattern(1.));
+  outsideSector.back().nPhiLayers = 1u;
+  outsideSector.back().patPhi = 1.;
+  BOOST_CHECK_EQUAL(resolve(std::move(outsideSector)).size(), 2u);
+
+  /// More good stations win over a better residual
+  PatternStateVec moreStations{};
+  moreStations.push_back(pattern(1.));
+  moreStations.push_back(pattern(3.));
+  moreStations.back().nPrecisionLayers = 12u;
+  moreStations.back().hitsPerStation[stationIdx(MuonStationIndex::BO)] =
+      stationHits(12u);
+  const PatternStateVec resolvedStations = resolve(std::move(moreStations));
+  BOOST_REQUIRE_EQUAL(resolvedStations.size(), 1u);
+  BOOST_CHECK_EQUAL(static_cast<int>(resolvedStations.front().nStations(true)),
+                    3);
+
+  /// Sharing only one good station is not an overlap
+  PatternStateVec oneSharedStation{};
+  oneSharedStation.push_back(pattern(1.));
+  oneSharedStation.push_back(pattern(1., true));
+  BOOST_CHECK_EQUAL(resolve(std::move(oneSharedStation)).size(), 2u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 }  // namespace ActsTests
