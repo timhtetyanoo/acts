@@ -109,6 +109,12 @@ def main():
         action="store_true",
         help="Dump the tracking geometry in an obj format",
     )
+    parser.add_argument(
+        "--globalPatterns",
+        default=False,
+        action="store_true",
+        help="Run the muon global pattern finding on the digitized space points",
+    )
 
     args = parser.parse_args()
 
@@ -207,6 +213,18 @@ def main():
         level=logLevel,
     )
     algSequence.addAlgorithm(digiAlg)
+
+    if args.globalPatterns:
+        from acts.examples import MuonGlobalPatternFinding
+
+        algSequence.addAlgorithm(
+            MuonGlobalPatternFinding(
+                inputSpacePoints="MuonSpacePoints",
+                outputPatterns="MuonGlobalPatterns",
+                trackingGeometry=trackingGeometry,
+                level=logLevel,
+            )
+        )
 
     from acts.examples.root import RootMuonSpacePointWriter
 

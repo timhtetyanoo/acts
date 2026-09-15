@@ -12,6 +12,7 @@
 #include "ActsExamples/TrackFinding/GridTripletSeedingAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/HoughTransformSeeder.hpp"
 #include "ActsExamples/TrackFinding/MeasurementFilterAlgorithm.hpp"
+#include "ActsExamples/TrackFinding/MuonGlobalPatternFinding.hpp"
 #include "ActsExamples/TrackFinding/MuonHoughSeeder.hpp"
 #include "ActsExamples/TrackFinding/OrthogonalTripletSeedingAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/SpacePointMaker.hpp"
@@ -112,6 +113,15 @@ void addTrackFinding(py::module& mex) {
                                 inTruthSegments, inSpacePoints, outHoughMax,
                                 nBinsTanTheta, nBinsY0, nBinsTanPhi, nBinsX0,
                                 dumpVisualization, visualizationFunction);
+
+  ACTS_PYTHON_DECLARE_ALGORITHM(
+      MuonGlobalPatternFinding, mex, "MuonGlobalPatternFinding",
+      inputSpacePoints, outputPatterns, trackingGeometry, seedFromInner,
+      useMdtHits, seedFromMdt, thetaSearchWindow, nResidualSigma,
+      lowConfidenceResSigma, nPhiSigma, minTriggerLayers, minPrecisionLayers,
+      minPhiLayers, minStationLayers, meanNormRes2Cut, maxSeedAttempts,
+      maxMissLayersInStation, minHitDistance4Line, beamSpotRadius,
+      beamSpotLength);
 
   {
     using Alg = TrackParamsEstimationAlgorithm;

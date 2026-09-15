@@ -59,6 +59,7 @@ from helpers import geant4Enabled, hepmc3Enabled
         PropagationAlgorithm,
         HelloRandomAlgorithm,
         HelloWhiteBoardAlgorithm,
+        acts.examples.MuonGlobalPatternFinding,
         # GeantinoRecording,
         # EventRecording,
     ],
