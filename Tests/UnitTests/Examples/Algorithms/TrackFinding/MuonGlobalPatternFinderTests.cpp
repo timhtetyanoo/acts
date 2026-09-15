@@ -583,6 +583,121 @@ BOOST_AUTO_TEST_CASE(OverlapRemoval) {
   BOOST_CHECK_EQUAL(resolve(std::move(oneSharedStation)).size(), 2u);
 }
 
+namespace {
+
+/// @brief Make the RPC hits measure eta & phi
+void enableRpcPhi(MuonSpacePointContainer& container) {
+  for (MuonSpacePointBucket& bucket : container) {
+    for (MuonSpacePoint& sp : bucket) {
+      if (sp.id().technology() == TechField::Rpc) {
+        MuonId id = sp.id();
+        id.setCoordFlags(true, true);
+        sp.setId(id);
+      }
+    }
+  }
+}
+
+/// @brief Phi-only RPC strip in the barrel chamber frame, running along the
+///        beam axis and centred at (x, z) on the layer at radius r
+MuonSpacePoint barrelPhiHit(StationName st, double r, double z, double x,
+                            double halfLength) {
+  MuonSpacePoint sp =
+      makeSp(TechField::Rpc, st, false, true, Acts::Vector3{x, z, r},
+             Acts::Vector3::UnitY(), Acts::Vector3::UnitX());
+  sp.setCovariance(4., halfLength * halfLength, 0.);
+  return sp;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(PhiOnlyHitsAndConversion) {
+  constexpr double slope = 0.4;
+  constexpr double halfLength = 500._mm;
+  MuonSpacePointContainer container{};
+  addMuon(container, slope);
+  enableRpcPhi(container);
+  /// BM RPC chamber: a phi strip crossed by the muon, a second strip on the
+  /// same layer & a strip displaced along the beam axis
+  container[2].push_back(barrelPhiHit(StationName::BML, 7.305_m,
+                                      slope * 7.305_m, 0., halfLength));
+  container[2].push_back(barrelPhiHit(StationName::BML, 7.305_m,
+                                      slope * 7.305_m, 5._mm, halfLength));
+  container[2].push_back(barrelPhiHit(StationName::BML, 7.315_m,
+                                      slope * 7.315_m + 1._m, 0., halfLength));
+  /// BO RPC chamber: a phi strip crossed by the muon & a strip at another phi
+  container[4].push_back(barrelPhiHit(StationName::BOL, 9.305_m,
+                                      slope * 9.305_m, 0., halfLength));
+  container[4].push_back(barrelPhiHit(StationName::BOL, 9.315_m,
+                                      slope * 9.315_m, 3._m, halfLength));
+  const MuonSpacePoint* bmPhi = &container[2][2];
+  const MuonSpacePoint* bmPhiSameLayer = &container[2][3];
+  const MuonSpacePoint* bmPhiDisplaced = &container[2][4];
+  const MuonSpacePoint* boPhi = &container[4][1];
+  const MuonSpacePoint* boPhiOtherPhi = &container[4][2];
+
+  const MuonGlobalPatternFinder finder = makeFinder(barrelChamberFrame());
+  const MuonGlobalPatternContainer patterns =
+      finder.findPatterns(gctx, container);
+  BOOST_REQUIRE_EQUAL(patterns.size(), 1u);
+  const MuonGlobalPattern& pat = patterns.front();
+
+  BOOST_CHECK_EQUAL(pat.nPrecisionLayers(), 12u);
+  BOOST_CHECK_EQUAL(pat.nTriggerLayers(), 3u);
+  /// Three RPC eta-phi layers & two phi-only layers
+  BOOST_CHECK_EQUAL(pat.nPhiLayers(), 5u);
+  BOOST_CHECK_LE(pat.meanNormResidual2(), finder.config().meanNormRes2Cut);
+  CHECK_CLOSE_ABS(pat.theta(), std::atan2(1., slope), 1e-3);
+  CHECK_SMALL(pat.phi(), 1e-3);
+  /// Hits measuring phi are only seeds in the sector centre
+  BOOST_CHECK_EQUAL(pat.sector(), 1u);
+  BOOST_CHECK(!pat.isSectorOverlap());
+
+  BOOST_CHECK_EQUAL(pat.hitsPerStation().size(), 3u);
+  BOOST_CHECK_EQUAL(pat.hitsInStation(MuonStationIndex::BI).size(), 4u);
+  BOOST_CHECK_EQUAL(pat.hitsInStation(MuonStationIndex::BM).size(), 7u);
+  BOOST_CHECK_EQUAL(pat.hitsInStation(MuonStationIndex::BO).size(), 6u);
+  BOOST_CHECK_EQUAL(pat.bucketsInStation(MuonStationIndex::BI).size(), 1u);
+  BOOST_CHECK_EQUAL(pat.bucketsInStation(MuonStationIndex::BM).size(), 2u);
+  BOOST_CHECK_EQUAL(pat.bucketsInStation(MuonStationIndex::BO).size(), 2u);
+
+  const auto contains = [&pat](const MuonSpacePoint* sp) {
+    return std::ranges::any_of(pat.hitsPerStation(), [sp](const auto& entry) {
+      return std::ranges::find(entry.second, sp) != entry.second.end();
+    });
+  };
+  BOOST_CHECK(contains(bmPhi));
+  BOOST_CHECK(contains(boPhi));
+  BOOST_CHECK(!contains(bmPhiSameLayer));
+  BOOST_CHECK(!contains(bmPhiDisplaced));
+  BOOST_CHECK(!contains(boPhiOtherPhi));
+}
+
+BOOST_AUTO_TEST_CASE(PatternsWithoutPhi) {
+  MuonSpacePointContainer container{};
+  addMuon(container, 0.4);
+
+  /// The eta pattern is found, but rejected without phi measurements
+  const MuonGlobalPatternFinder finder = makeFinder(barrelChamberFrame());
+  const MuonGlobalPatternFinder::SearchTreeData data =
+      finder.constructTree(gctx, container);
+  BOOST_CHECK_EQUAL(finder.findPatternsInEta(data.tree).size(), 1u);
+  BOOST_CHECK(finder.findPatterns(gctx, container).empty());
+
+  /// Unless no phi layers are required
+  MuonGlobalPatternFinder::Config cfg = finder.config();
+  cfg.minPhiLayers = 0u;
+  const MuonGlobalPatternFinder noPhiFinder{
+      std::move(cfg),
+      Acts::getDefaultLogger("MuonGlobalPatternFinder", Acts::Logging::INFO)};
+  const MuonGlobalPatternContainer patterns =
+      noPhiFinder.findPatterns(gctx, container);
+  BOOST_REQUIRE_EQUAL(patterns.size(), 1u);
+  BOOST_CHECK_EQUAL(patterns.front().nPhiLayers(), 0u);
+  BOOST_CHECK_EQUAL(patterns.front().nPrecisionLayers(), 12u);
+  BOOST_CHECK_EQUAL(patterns.front().hitsPerStation().size(), 3u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 }  // namespace ActsTests

@@ -10,6 +10,7 @@
 
 #include "Acts/Definitions/Common.hpp"
 #include "Acts/Definitions/Units.hpp"
+#include "Acts/Surfaces/detail/LineHelper.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/StringHelpers.hpp"
 #include "Acts/Utilities/VectorHelpers.hpp"
@@ -34,10 +35,12 @@ using Acts::VectorHelpers::phi;
 namespace ActsExamples {
 
 using MuonGlobalPatternFinderDefs::brief;
+using MuonGlobalPatternFinderDefs::CovIdx;
 using MuonGlobalPatternFinderDefs::detailed;
 using MuonGlobalPatternFinderDefs::LineTestDecision;
 using MuonGlobalPatternFinderDefs::LineTestRes;
 using MuonGlobalPatternFinderDefs::s_nStations;
+using MuonGlobalPatternFinderDefs::stationIdx;
 
 namespace {
 
@@ -47,6 +50,213 @@ constexpr auto s_sectorIdx =
     Acts::toUnderlying(MuonGlobalPatternFinder::SeedCoords::eSector);
 
 }  // namespace
+
+MuonGlobalPatternContainer MuonGlobalPatternFinder::findPatterns(
+    const Acts::GeometryContext& gctx,
+    const MuonSpacePointContainer& spacePoints) const {
+  // The patterns refer to the hit payloads only during the pattern finding
+  const SearchTreeData treeData = constructTree(gctx, spacePoints);
+  PatternStateVec patterns = findPatternsInEta(treeData.tree);
+  addPhiOnlyHits(gctx, patterns);
+  ACTS_DEBUG("findPatterns() Found " << patterns.size() << " patterns.");
+  return convertToPattern(patterns);
+}
+
+void MuonGlobalPatternFinder::addPhiOnlyHits(const Acts::GeometryContext& gctx,
+                                             PatternStateVec& patterns) const {
+  /// @brief Define the pattern line in a station. The two eta hits on the
+  ///        outermost layers of the station define the line. If they are too
+  ///        close, the closest hit in another station is used as anchor.
+  /// @return Whether the line could be defined without the beamspot
+  auto computePatternLineInStation = [](PatternState& pat,
+                                        MuonStationIndex station) {
+    const std::vector<CandidateHit>& stationHits =
+        pat.hitsPerStation[stationIdx(station)];
+    if (stationHits.empty()) {
+      return false;
+    }
+    // useBeamspot flags whether the pattern line could not be determined
+    pat.useBeamspot = true;
+    if (stationHits.size() > 1u) {
+      const auto [minIt, maxIt] =
+          std::ranges::minmax_element(stationHits, {}, &CandidateHit::globLayer);
+      pat.lineAnchorHit = *minIt;
+      pat.lastInsertedHit = *maxIt;
+      // @note Deviation from Athena: the line update is forced. Otherwise, it
+      //       is skipped if the line was already updated after the last
+      //       inserted hit, leaving useBeamspot set.
+      pat.needLineUpdate = true;
+      pat.updateLineParameters(Acts::Vector3::Zero());
+    }
+    if (pat.useBeamspot) {
+      // Only one eta hit or too close hits: anchor the line in another station
+      pat.moveLineAnchorHit(stationHits.front());
+      const Acts::Vector3 anchorPos = pat.projToPhiPlane(*pat.lineAnchorHit);
+      pat.lastInsertedHit = *std::ranges::max_element(
+          stationHits, {}, [&pat, &anchorPos](const CandidateHit& c) {
+            return (pat.projToPhiPlane(*c) - anchorPos).norm();
+          });
+      pat.needLineUpdate = true;
+      pat.updateLineParameters(Acts::Vector3::Zero());
+    }
+    return !pat.useBeamspot;
+  };
+
+  PatternStateVec survivingPatterns{};
+  survivingPatterns.reserve(patterns.size());
+  for (PatternState& pat : patterns) {
+    ACTS_VERBOSE("addPhiOnlyHits() Search for phi-only hits for pattern: "
+                 << brief(pat));
+    std::optional<MuonStationIndex> patternLineStation{};
+
+    const auto projOntoPhiPlane = [&pat](const Acts::Vector3& pos) {
+      return Acts::Vector3{pos - pos.dot(pat.bendPlaneNorm) * pat.bendPlaneNorm};
+    };
+
+    for (const MuonSpacePointBucket* bucket : pat.getParentBuckets()) {
+      const Acts::Transform3 localToGlobal = m_cfg.localToGlobal(gctx, *bucket);
+      const MuonStationIndex station =
+          stationIndex(bucket->front().id().msStation());
+      const std::vector<std::uint8_t> layers =
+          MuonGlobalPatternFinderUtils::layerNumbers(*bucket);
+
+      for (std::size_t i = 0u; i < bucket->size(); ++i) {
+        const MuonSpacePoint& hit = (*bucket)[i];
+        if (hit.id().measuresEta()) {
+          continue;
+        }
+        ACTS_VERBOSE("addPhiOnlyHits() *** Test phi-only hit " << hit);
+
+        // Reject hits from a layer that already contains a phi hit
+        const std::uint8_t layNum = layers[i];
+        const std::vector<CandidateHit>& stationHits =
+            pat.hitsPerStation[stationIdx(station)];
+        const bool layerHasPhi =
+            std::ranges::any_of(stationHits,
+                                [bucket, layNum](const CandidateHit& h) {
+                                  return h->measuresPhi &&
+                                         h->bucket == bucket &&
+                                         h->locLayer == layNum;
+                                }) ||
+            std::ranges::any_of(pat.phiOnlyHits,
+                                [bucket, layNum](const HitPayload& h) {
+                                  return h.bucket == bucket &&
+                                         h.locLayer == layNum;
+                                });
+        if (layerHasPhi) {
+          ACTS_VERBOSE("addPhiOnlyHits() The pattern already has a phi hit in "
+                       "the same layer - skip hit.");
+          continue;
+        }
+
+        HitPayload newHit{&hit, bucket, localToGlobal, layNum, station};
+        if (!pat.isPhiCompatible(newHit)) {
+          ACTS_VERBOSE("addPhiOnlyHits() Phi-only hit not compatible.");
+          continue;
+        }
+        if (!patternLineStation.has_value() || *patternLineStation != station) {
+          if (!computePatternLineInStation(pat, station)) {
+            ACTS_VERBOSE("addPhiOnlyHits() Invalid projection model for station "
+                         << station << " - skip hit.");
+            continue;
+          }
+          patternLineStation = station;
+        }
+
+        // Check that the pattern line crosses the strip along its length
+        // @note Deviation from Athena: the payload of phi-only hits has no
+        //       sensor direction, so the strip direction is taken from the
+        //       space point.
+        const Acts::Vector3 stripDir =
+            localToGlobal.linear() * hit.sensorDirection();
+        const double stripHalfLength =
+            std::sqrt(hit.covariance()[Acts::toUnderlying(CovIdx::etaCov)]);
+        const Acts::Vector3 stripLow =
+            projOntoPhiPlane(newHit.position - stripHalfLength * stripDir);
+        const Acts::Vector3 stripHigh =
+            projOntoPhiPlane(newHit.position + stripHalfLength * stripDir);
+        const double stripProjLength = (stripHigh - stripLow).norm();
+        const double stripIntersect =
+            Acts::detail::LineHelper::lineIntersect<3>(
+                pat.linePos, pat.lineDir, stripLow,
+                Acts::Vector3{(stripHigh - stripLow).normalized()})
+                .pathLength();
+        ACTS_VERBOSE("addPhiOnlyHits() Intersect distance from lower strip "
+                     "edge: "
+                     << stripIntersect
+                     << ", projected strip length: " << stripProjLength);
+
+        constexpr double margin = 10._mm;
+        if (!(stripIntersect >= -margin &&
+              stripIntersect <= stripProjLength + margin)) {
+          ACTS_VERBOSE("addPhiOnlyHits() The pattern falls outside the strip "
+                       "in eta - skip hit.");
+          continue;
+        }
+        pat.phiOnlyHits.push_back(std::move(newHit));
+        ++pat.nPhiLayers;
+        pat.updatePatternPhi();
+      }
+    }
+    if (pat.nPhiLayers < m_cfg.minPhiLayers) {
+      ACTS_VERBOSE("addPhiOnlyHits() Pattern "
+                   << detailed(pat) << " has only "
+                   << static_cast<int>(pat.nPhiLayers)
+                   << " phi layers, below the minimum - reject pattern.");
+      continue;
+    }
+    survivingPatterns.push_back(std::move(pat));
+  }
+  std::swap(patterns, survivingPatterns);
+}
+
+MuonGlobalPattern MuonGlobalPatternFinder::convertToPattern(
+    const PatternState& candidate) const {
+  MuonGlobalPattern::HitCollection hitPerStation{};
+  MuonGlobalPattern::BucketCollection bucketPerStation{};
+  // Add the eta hits
+  for (std::size_t st = 0u; st < s_nStations; ++st) {
+    const std::vector<CandidateHit>& hits = candidate.hitsPerStation[st];
+    if (hits.empty()) {
+      continue;
+    }
+    const auto station =
+        static_cast<MuonStationIndex>(static_cast<std::int8_t>(st));
+    auto& outHits = hitPerStation[station];
+    auto& outBuckets = bucketPerStation[station];
+    outHits.reserve(hits.size());
+    for (const CandidateHit& hit : hits) {
+      outHits.push_back(hit.sp());
+      if (std::ranges::find(outBuckets, hit->bucket) == outBuckets.end()) {
+        outBuckets.push_back(hit->bucket);
+      }
+    }
+  }
+  // Add the phi-only hits
+  for (const HitPayload& hit : candidate.phiOnlyHits) {
+    hitPerStation[hit.station].push_back(hit.sp);
+  }
+  MuonGlobalPattern pattern{std::move(hitPerStation),
+                            std::move(bucketPerStation)};
+  pattern.setTheta(candidate.patTheta);
+  pattern.setPhi(candidate.patPhi);
+  pattern.setSector(candidate.expSect.sector());
+  pattern.setNPrecisionLayers(candidate.nPrecisionLayers);
+  pattern.setNTriggerLayers(candidate.nTriggerLayers);
+  pattern.setNPhiLayers(candidate.nPhiLayers);
+  pattern.setMeanNormResidual2(candidate.getMeanResidual2());
+  return pattern;
+}
+
+MuonGlobalPatternContainer MuonGlobalPatternFinder::convertToPattern(
+    const PatternStateVec& candidates) const {
+  MuonGlobalPatternContainer patterns{};
+  patterns.reserve(candidates.size());
+  std::ranges::transform(
+      candidates, std::back_inserter(patterns),
+      [this](const PatternState& c) { return convertToPattern(c); });
+  return patterns;
+}
 
 MuonGlobalPatternFinder::MuonGlobalPatternFinder(
     Config config, std::unique_ptr<const Acts::Logger> logger)

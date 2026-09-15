@@ -81,6 +81,16 @@ class MuonGlobalPatternFinder {
   /// @brief Return the configuration
   const Config& config() const { return m_cfg; }
 
+  /// @brief Find the global patterns of the event: build the search tree, find
+  ///        the patterns in eta, attach the compatible phi-only hits and
+  ///        convert the patterns.
+  /// @param gctx: Geometry context
+  /// @param spacePoints: Space point buckets of the event. The patterns refer
+  ///        to them, so they must outlive the patterns.
+  MuonGlobalPatternContainer findPatterns(
+      const Acts::GeometryContext& gctx,
+      const MuonSpacePointContainer& spacePoints) const;
+
   /// @note The following building blocks are public for unit testing
 
   /// @brief Construct the search tree from the space point buckets. The hits
@@ -115,6 +125,18 @@ class MuonGlobalPatternFinder {
   ///        out of it
   /// @return Patterns without overlaps
   PatternStateVec resolveOverlaps(PatternStateVec& toResolve) const;
+  /// @brief Add the compatible phi-only hits of the parent buckets to the
+  ///        patterns. Patterns with less than minPhiLayers phi layers are
+  ///        removed.
+  /// @param gctx: Geometry context
+  /// @param patterns: Patterns to which the phi-only hits are added
+  void addPhiOnlyHits(const Acts::GeometryContext& gctx,
+                      PatternStateVec& patterns) const;
+  /// @brief Convert a pattern state into a global pattern
+  MuonGlobalPattern convertToPattern(const PatternState& candidate) const;
+  /// @brief Convert pattern states into global patterns
+  MuonGlobalPatternContainer convertToPattern(
+      const PatternStateVec& candidates) const;
   /// @brief Check whether a pattern passes the quality cuts
   bool passPatternCuts(const PatternState& pat) const;
   /// @brief Return whether pattern a is better than pattern b
