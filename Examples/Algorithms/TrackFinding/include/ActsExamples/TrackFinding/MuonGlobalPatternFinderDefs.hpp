@@ -185,6 +185,27 @@ struct CandidateHit {
   }
 };
 
+/// @brief Possible outcomes of the pattern line compatibility test
+enum class LineTestDecision : std::int8_t {
+  /// @brief Test successful, add the hit to the pattern
+  eAddHit,
+  /// @brief Test successful with a pattern hit on the same layer, branch the
+  ///        pattern
+  eBranchPattern,
+  /// @brief Test failed, discard the hit
+  eRejectHit
+};
+
+/// @brief Result of the line compatibility test
+struct LineTestRes {
+  /// @brief Distance of the test hit to the pattern line
+  double residual{0.};
+  /// @brief Uncertainty of the residual
+  double sigma{0.};
+  /// @brief Decision of the test
+  LineTestDecision result{LineTestDecision::eRejectHit};
+};
+
 /// @brief Pattern state object storing the pattern information during its
 ///        construction
 struct PatternState {
@@ -201,6 +222,30 @@ struct PatternState {
   PatternState(const PatternState& other) = default;
   PatternState& operator=(const PatternState& other) = default;
   ~PatternState() = default;
+
+  /// @brief Add a hit to the pattern and update the internal state
+  /// @param hit: Hit to be added
+  /// @param residual: Residual of the hit
+  /// @param resSigma: Residual uncertainty of the hit
+  void addHit(const CandidateHit& hit, double residual, double resSigma);
+  /// @brief Overwrite the last inserted hit with a new one on the same layer
+  /// @param newHit: New hit to replace the last inserted one
+  /// @param newResidual: Residual of the new hit
+  /// @param newResSigma: Residual uncertainty of the new hit
+  void overWriteHit(const CandidateHit& newHit, double newResidual,
+                    double newResSigma);
+  /// @brief Check the line compatibility of a test hit against the pattern. The
+  ///        line is updated if the test hit is on a new layer.
+  /// @param testHit: Test hit
+  /// @param beamSpot: Beam spot position, needed to update the pattern line
+  /// @return Result of the test holding the residual and its uncertainty
+  LineTestRes checkLineComp(const CandidateHit& testHit,
+                            const Acts::Vector3& beamSpot);
+  /// @brief Compute the residual of a test hit against the pattern line
+  /// @param testHit: Test hit
+  /// @return Test result holding the residual and its uncertainty. The
+  ///         decision is set by checkLineComp.
+  LineTestRes computeLineResidual(const CandidateHit& testHit) const;
 
   /// @brief Project a hit position onto the bending plane where the pattern is
   ///        defined. The hit is moved along its sensor direction.

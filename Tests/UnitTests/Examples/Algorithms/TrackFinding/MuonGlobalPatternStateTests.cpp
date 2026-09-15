@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
@@ -410,6 +411,237 @@ BOOST_AUTO_TEST_CASE(Counters) {
   CHECK_CLOSE_REL(pat.getMeanResidual2(), 2., 1e-12);
   pat.isFinalized = true;
   CHECK_CLOSE_REL(pat.getMeanResidual2(), 12., 1e-12);
+}
+
+BOOST_AUTO_TEST_CASE(LineResidual) {
+  HitFactory factory{};
+  /// All hits lie in the bending plane of sector 1 (xz-plane). Straw hits
+  /// without drift radius have a disc covariance of covEta
+  const double discCov = covEta;
+  const double patPhiCov =
+      Acts::square(MuonSectorMapping::sectorSize(1)) / 3.;
+  const Acts::Vector3 posA{5._m, 0., 2._m};
+  const Acts::Vector3 posB{7._m, 0., 2.8_m};
+  const Acts::Vector3 posC{9._m, 0., 3.6_m + 10._mm};
+
+  /// Line through the hits A & B in different stations
+  const auto makePattern = [&](const Acts::Vector3& sensorDir,
+                               const HitPayload*& testHit) {
+    const HitPayload& a = factory.eta(StationName::BIL, posA, sensorDir);
+    const HitPayload& b = factory.eta(StationName::BML, posB, sensorDir);
+    testHit = &factory.eta(StationName::BOL, posC, sensorDir);
+    PatternState pat{candidate(a, 0u), expSector(1u), &cfg, logger.get()};
+    pat.hitsPerStation[stationIdx(MuonStationIndex::BM)].push_back(
+        candidate(b, 1u));
+    pat.lastInsertedHit = candidate(b, 1u);
+    pat.updateLineParameters(Acts::Vector3::Zero());
+    BOOST_REQUIRE(!pat.useBeamspot);
+    return pat;
+  };
+  const Acts::Vector3 d = posB - posA;
+  const double alpha = (posC - posA).dot(d) / d.squaredNorm();
+  const Acts::Vector3 resDir = (posC - posA - alpha * d).normalized();
+  /// The distance to the line is the z-offset scaled by cos(line angle)
+  const double expResidual = 10._mm * d.x() / d.norm();
+  const double sumPreFactors2 =
+      Acts::square(alpha - 1.) + Acts::square(alpha) + 1.;
+
+  /// Sensors along the bending plane normal: the projection does not depend
+  /// on the plane angle
+  const HitPayload* testHit{nullptr};
+  const PatternState pat = makePattern(Acts::Vector3::UnitY(), testHit);
+  const LineTestRes res = pat.computeLineResidual(candidate(*testHit, 2u));
+  CHECK_CLOSE_REL(res.residual, expResidual, 1e-9);
+  CHECK_CLOSE_REL(res.sigma, std::sqrt(discCov * sumPreFactors2), 1e-9);
+  BOOST_CHECK(res.result == LineTestDecision::eRejectHit);
+
+  /// Inclined sensors: the projection adds (1 + projFactor^2) to the hit
+  /// covariance & the uncertainty of the plane angle
+  const Acts::Vector3 inclined{0., 0.8, 0.6};
+  const PatternState inclPat = makePattern(inclined, testHit);
+  const double projFactor = inclined.dot(resDir) / inclined.y();
+  const double phiDerivative =
+      projFactor * ((alpha - 1.) * posA.x() - alpha * posB.x() + posC.x());
+  const LineTestRes inclRes =
+      inclPat.computeLineResidual(candidate(*testHit, 2u));
+  CHECK_CLOSE_REL(inclRes.residual, expResidual, 1e-9);
+  CHECK_CLOSE_REL(
+      inclRes.sigma,
+      std::sqrt(discCov * (1. + Acts::square(projFactor)) * sumPreFactors2 +
+                Acts::square(phiDerivative) * patPhiCov),
+      1e-9);
+
+  /// A test hit on the line anchor has no residual direction
+  const HitPayload& onAnchor =
+      factory.eta(StationName::BOL, posA, Acts::Vector3::UnitY());
+  const LineTestRes zeroRes = pat.computeLineResidual(candidate(onAnchor, 2u));
+  BOOST_CHECK_EQUAL(zeroRes.residual, std::numeric_limits<double>::max());
+  BOOST_CHECK_EQUAL(zeroRes.sigma, 0.);
+
+  /// Close-by hits in the same station: the line starts at the beamspot
+  const Acts::Vector3 posA2{5._m, 0., 2._m + 20._mm};
+  const HitPayload& a =
+      factory.eta(StationName::BIL, posA, Acts::Vector3::UnitY());
+  const HitPayload& a2 =
+      factory.eta(StationName::BIL, posA2, Acts::Vector3::UnitY());
+  PatternState bsPat{candidate(a, 0u), expSector(1u), &cfg, logger.get()};
+  bsPat.hitsPerStation[stationIdx(MuonStationIndex::BI)].push_back(
+      candidate(a2, 1u));
+  bsPat.lastInsertedHit = candidate(a2, 1u);
+  bsPat.updateLineParameters(Acts::Vector3::Zero());
+  BOOST_REQUIRE(bsPat.useBeamspot);
+
+  const HitPayload& c =
+      factory.eta(StationName::BOL, posC, Acts::Vector3::UnitY());
+  const double bsAlpha = posC.dot(posA2) / posA2.squaredNorm();
+  const Acts::Vector3 bsResVec = posC - bsAlpha * posA2;
+  const double resZ2 = Acts::square(bsResVec.normalized().z());
+  const double covS1 =
+      cfg.beamSpotLength * resZ2 + cfg.beamSpotRadius * (1. - resZ2);
+  const LineTestRes bsRes = bsPat.computeLineResidual(candidate(c, 2u));
+  CHECK_CLOSE_REL(bsRes.residual, bsResVec.norm(), 1e-9);
+  /// The beamspot term replaces the anchor hit term
+  CHECK_CLOSE_REL(bsRes.sigma,
+                  std::sqrt(Acts::square(bsAlpha - 1.) * covS1 +
+                            discCov * (Acts::square(bsAlpha) + 1.)),
+                  1e-9);
+}
+
+BOOST_AUTO_TEST_CASE(LineCompatibility) {
+  HitFactory factory{};
+  const Acts::Vector3 beamSpot{Acts::Vector3::Zero()};
+  const Acts::Vector3 unitY{Acts::Vector3::UnitY()};
+  /// Hits close to a straight line from the origin with z = 0.4 * x
+  const HitPayload& a =
+      factory.eta(StationName::BIL, Acts::Vector3{5._m, 0., 2._m}, unitY);
+  const HitPayload& aSameLayer = factory.eta(
+      StationName::BIL, Acts::Vector3{5._m, 0., 2._m + 1._mm}, unitY);
+  const HitPayload& b = factory.eta(
+      StationName::BML, Acts::Vector3{7._m, 0., 2.8_m + 5._mm}, unitY);
+  const HitPayload& bBranch = factory.eta(
+      StationName::BML, Acts::Vector3{7._m, 0., 2.8_m - 3._mm}, unitY);
+  const HitPayload& phiOff = factory.etaPhi(StationName::BML, 0.5);
+  /// The line A -> B extrapolates to z = 3.61 m at x = 9 m
+  const HitPayload& cGood = factory.eta(
+      StationName::BOL, Acts::Vector3{9._m, 0., 3.61_m + 2._mm}, unitY);
+  const HitPayload& cFar = factory.eta(
+      StationName::BOL, Acts::Vector3{9._m, 0., 3.61_m + 500._mm}, unitY);
+
+  PatternState pat{candidate(a, 0u), expSector(1u), &cfg, logger.get()};
+
+  /// Phi-incompatible hits are rejected before the residual computation
+  const LineTestRes phiRes = pat.checkLineComp(candidate(phiOff, 1u), beamSpot);
+  BOOST_CHECK(phiRes.result == LineTestDecision::eRejectHit);
+  BOOST_CHECK_EQUAL(phiRes.sigma, 0.);
+
+  /// No branching on the seed layer without hits on other layers
+  BOOST_CHECK(pat.checkLineComp(candidate(aSameLayer, 0u), beamSpot).result ==
+              LineTestDecision::eRejectHit);
+
+  /// First hit on a new layer: the line goes from the beamspot through the seed
+  const LineTestRes resB = pat.checkLineComp(candidate(b, 1u), beamSpot);
+  BOOST_CHECK(pat.useBeamspot);
+  BOOST_CHECK(resB.result == LineTestDecision::eAddHit);
+  pat.addHit(candidate(b, 1u), resB.residual, resB.sigma);
+
+  /// The same hit is not added twice
+  BOOST_CHECK(pat.checkLineComp(candidate(b, 1u), beamSpot).result ==
+              LineTestDecision::eRejectHit);
+  /// A compatible hit on the last layer branches the pattern
+  BOOST_CHECK(pat.checkLineComp(candidate(bBranch, 1u), beamSpot).result ==
+              LineTestDecision::eBranchPattern);
+
+  /// Hit in the next station: the line is drawn through the anchor & last hit
+  const LineTestRes resC = pat.checkLineComp(candidate(cGood, 2u), beamSpot);
+  BOOST_CHECK(!pat.useBeamspot);
+  CHECK_CLOSE_ABS(pat.linePos, a.position, 1e-9);
+  BOOST_CHECK(resC.result == LineTestDecision::eAddHit);
+  BOOST_CHECK(pat.checkLineComp(candidate(cFar, 2u), beamSpot).result ==
+              LineTestDecision::eRejectHit);
+
+  /// The acceptance window is doubled for hits in a new station. Place a hit
+  /// at a residual between 3 & 6 sigma
+  const HitPayload& probe = factory.eta(
+      StationName::BOL, Acts::Vector3{9._m, 0., 3.61_m + 36._mm}, unitY);
+  const LineTestRes probeRes = pat.computeLineResidual(candidate(probe, 2u));
+  BOOST_REQUIRE(probeRes.residual > cfg.nResidualSigma * probeRes.sigma);
+  BOOST_REQUIRE(probeRes.residual < 2. * cfg.nResidualSigma * probeRes.sigma);
+  BOOST_CHECK(pat.checkLineComp(candidate(probe, 2u), beamSpot).result ==
+              LineTestDecision::eAddHit);
+  /// The same position in the station of the last hit is rejected
+  const HitPayload& sameStProbe = factory.eta(
+      StationName::BML, Acts::Vector3{9._m, 0., 3.61_m + 36._mm}, unitY);
+  BOOST_CHECK(pat.checkLineComp(candidate(sameStProbe, 2u), beamSpot).result ==
+              LineTestDecision::eRejectHit);
+}
+
+BOOST_AUTO_TEST_CASE(HitUpdates) {
+  HitFactory factory{};
+  const HitPayload& seed = factory.eta(StationName::BIL, 0.);
+  const HitPayload& rpcPhi = factory.etaPhi(StationName::BML, 0.);
+  const HitPayload& rpcEta =
+      factory.add(TechField::Rpc, StationName::BML, true, false, atPhi(0.),
+                  tangent(0.), Acts::Vector3::UnitZ());
+  const HitPayload& mdt = factory.eta(StationName::BML, 0.);
+  const HitPayload& bo = factory.eta(StationName::BOL, 0.);
+
+  PatternState pat{candidate(seed, 0u), expSector(1u), &cfg, logger.get()};
+  pat.addHit(candidate(rpcPhi, 1u), 2., 4.);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPrecisionLayers), 1);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nTriggerLayers), 1);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPhiLayers), 1);
+  CHECK_SMALL(pat.patPhi, 1e-12);
+  CHECK_CLOSE_REL(pat.patPhiCov, hitPhiCov, 1e-9);
+  CHECK_CLOSE_REL(pat.meanNormResidual2, 0.25, 1e-12);
+  CHECK_CLOSE_REL(pat.lastResidual, 2., 1e-12);
+  CHECK_CLOSE_REL(pat.lastResSigma, 4., 1e-12);
+  BOOST_CHECK(pat.lastInsertedHit == rpcPhi);
+  BOOST_CHECK(pat.prevLayerHit == seed);
+  BOOST_CHECK(pat.lineAnchorHit == seed);
+  BOOST_CHECK(pat.needLineUpdate);
+  BOOST_CHECK(pat.isInPattern(rpcPhi));
+
+  /// Precision & trigger hits cannot replace each other
+  BOOST_CHECK_THROW(pat.overWriteHit(candidate(mdt, 1u), 1., 2.),
+                    std::runtime_error);
+  /// Only the hit on the last layer can be replaced
+  BOOST_CHECK_THROW(pat.overWriteHit(candidate(rpcEta, 2u), 1., 1.),
+                    std::runtime_error);
+  BOOST_CHECK_THROW(pat.overWriteHit(candidate(bo, 1u), 1., 1.),
+                    std::runtime_error);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPhiLayers), 1);
+
+  pat.overWriteHit(candidate(rpcEta, 1u), 1., 1.);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPrecisionLayers), 1);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nTriggerLayers), 1);
+  BOOST_CHECK_EQUAL(static_cast<int>(pat.nPhiLayers), 0);
+  /// The replaced residual is removed from the sum
+  CHECK_CLOSE_REL(pat.meanNormResidual2, 1., 1e-12);
+  const auto& bmHits = pat.hitsPerStation[stationIdx(MuonStationIndex::BM)];
+  BOOST_CHECK_EQUAL(bmHits.size(), 1u);
+  BOOST_CHECK(bmHits.back() == rpcEta);
+  BOOST_CHECK(pat.lastInsertedHit == rpcEta);
+  BOOST_CHECK(pat.prevLayerHit == seed);
+  BOOST_CHECK(!pat.isInPattern(rpcPhi));
+  /// Without phi hits, the pattern phi falls back to the sector
+  CHECK_CLOSE_REL(pat.patPhiCov,
+                  Acts::square(MuonSectorMapping::sectorSize(1)) / 3., 1e-12);
+
+  /// sTgc pads can be replaced by strips on the same layer, but not vice versa
+  const HitPayload& pad =
+      factory.add(TechField::sTgc, StationName::BML, true, true, atPhi(0.),
+                  tangent(0.), Acts::Vector3::UnitZ());
+  const HitPayload& strip =
+      factory.add(TechField::sTgc, StationName::BML, true, false, atPhi(0.),
+                  tangent(0.), Acts::Vector3::UnitZ());
+  PatternState padPat{candidate(seed, 0u), expSector(1u), &cfg, logger.get()};
+  padPat.addHit(candidate(pad, 1u), 1., 1.);
+  padPat.overWriteHit(candidate(strip, 1u), 1., 1.);
+  BOOST_CHECK_EQUAL(static_cast<int>(padPat.nPrecisionLayers), 2);
+  BOOST_CHECK_EQUAL(static_cast<int>(padPat.nTriggerLayers), 0);
+  BOOST_CHECK_EQUAL(static_cast<int>(padPat.nPhiLayers), 0);
+  BOOST_CHECK_THROW(padPat.overWriteHit(candidate(pad, 1u), 1., 1.),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

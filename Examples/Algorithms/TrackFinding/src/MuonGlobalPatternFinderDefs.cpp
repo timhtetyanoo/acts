@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -194,6 +195,234 @@ PatternState::PatternState(const CandidateHit& seed, std::int8_t expSector,
     ++nPhiLayers;
   }
   updatePatternPhi();
+  needLineUpdate = true;
+}
+
+LineTestRes PatternState::checkLineComp(const CandidateHit& testHit,
+                                        const Acts::Vector3& beamSpot) {
+  if (testHit->measuresPhi && !isPhiCompatible(*testHit)) {
+    ACTS_VERBOSE("checkLineComp() Test hit phi "
+                 << inDeg(phi(testHit->position)) << " not compatible with "
+                 << brief(*this));
+    return LineTestRes{};
+  }
+  /// @brief Compute the residual and set the decision if the residual is
+  ///        within the acceptance window
+  auto makeResult = [&testHit, this](LineTestDecision decision) {
+    LineTestRes res = computeLineResidual(testHit);
+    double accWindow = cfg->nResidualSigma * res.sigma;
+    // Loosen the window when the beamspot is used or when looking for hits in
+    // a new station, as the straight line approximation becomes less accurate
+    // over large distances
+    if (useBeamspot || testHit.station != lastInsertedHit.station ||
+        (testHit.station != prevLayerHit.station &&
+         testHit.globLayer == lastInsertedHit.globLayer)) {
+      accWindow *= 2.;
+    }
+    if (res.residual < accWindow) {
+      res.result = decision;
+    }
+    return res;
+  };
+
+  if (testHit.globLayer != lastInsertedHit.globLayer) {
+    updateLineParameters(beamSpot);
+    return makeResult(LineTestDecision::eAddHit);
+  }
+  if (testHit == lastInsertedHit) {
+    ACTS_VERBOSE("checkLineComp() Test hit is the last inserted hit - reject.");
+    return LineTestRes{};
+  }
+  if (lineAnchorHit.globLayer == lastInsertedHit.globLayer) {
+    ACTS_VERBOSE("checkLineComp() Test hit on the same layer as the seed with "
+                 "no prior hits - reject.");
+    return LineTestRes{};
+  }
+  // The line is intentionally not updated: the test hit is an alternative to
+  // the last inserted hit, which is not part of the current line
+  return makeResult(LineTestDecision::eBranchPattern);
+}
+
+LineTestRes PatternState::computeLineResidual(
+    const CandidateHit& testHit) const {
+  LineTestRes res{};
+
+  // The test hit is projected onto the phi plane only if it does not measure
+  // phi or if the pattern has no phi layers. Otherwise, the residual includes
+  // the error in the phi direction.
+  const bool projectTestHit = !testHit->measuresPhi || nPhiLayers == 0u;
+  const Acts::Vector3 testPos =
+      projectTestHit ? projToPhiPlane(*testHit) : testHit->position;
+  const Acts::Vector3 K = testPos - linePos;
+  const double KdotD = K.dot(lineDir);
+  const Acts::Vector3 residualVec = K - KdotD * lineDir;
+  res.residual = residualVec.norm();
+  if (res.residual < Acts::s_epsilon) {
+    // A vanishing residual is likely due to a bad topology, reject it
+    res.residual = std::numeric_limits<double>::max();
+    res.sigma = 0.;
+    return res;
+  }
+  const Acts::Vector3 resDir = residualVec / res.residual;
+  // Extrapolation distance along the pattern line in units of the lever arm
+  const double alpha = KdotD / leverArm;
+
+  // Derivative of the residual w.r.t. the common phi-plane angle
+  double phiPlaneDerivativeAcc{0.};
+  // Covariance contributions of the hits to the residual
+  double residualCovAcc{0.};
+
+  /// @brief Accumulate the covariance contributions of one hit. Each hit
+  ///        contributes with its intrinsic covariance and, if projected, with
+  ///        the uncertainty on the phi-plane angle of the pattern.
+  ///        For a projected hit, the residual direction is transformed with
+  ///        the projection Jacobian J^T * dir, such that
+  ///        dir^T * J * cov * J^T * dir = (J^T * dir)^T * cov * (J^T * dir)
+  /// @param hit: Hit for which to compute the covariance
+  /// @param pos: Projected position of the hit
+  /// @param preFactor: Factor, function of alpha, to scale the contributions
+  /// @param isProjected: Whether the hit is projected
+  auto covarianceTerm = [&](const HitPayload& hit, const Acts::Vector3& pos,
+                            double preFactor, bool isProjected) {
+    if (!isProjected) {
+      residualCovAcc +=
+          Acts::square(preFactor) * hit.residualVariance(resDir, false);
+      return;
+    }
+    const double projFactor =
+        hit.sensorDir.dot(resDir) / hit.sensorDir.dot(bendPlaneNorm);
+    const Acts::Vector3 trfDir = resDir - projFactor * bendPlaneNorm;
+    residualCovAcc +=
+        Acts::square(preFactor) * hit.residualVariance(trfDir, true);
+    phiPlaneDerivativeAcc += preFactor * perp(pos) * projFactor;
+  };
+
+  // Contribution of the first line point
+  if (useBeamspot) {
+    // @note Ported from Athena: the beamspot length & radius enter as variances
+    const double covS1 =
+        cfg->beamSpotLength * Acts::square(resDir.z()) +
+        cfg->beamSpotRadius * (1. - Acts::square(resDir.z()));
+    residualCovAcc += Acts::square(alpha - 1.) * covS1;
+  } else {
+    covarianceTerm(*lineAnchorHit, linePos, alpha - 1., true);
+  }
+  // Contribution of the second line point
+  const Acts::Vector3 pos2 = linePos + leverArm * lineDir;
+  covarianceTerm(*lastInsertedHit, pos2, -alpha, true);
+  // Contribution of the test hit
+  covarianceTerm(*testHit, testPos, 1., projectTestHit);
+
+  res.sigma = std::sqrt(residualCovAcc +
+                        Acts::square(phiPlaneDerivativeAcc) * patPhiCov);
+
+  ACTS_VERBOSE("computeLineResidual() "
+               << brief(*this) << "\nUse beamspot: " << useBeamspot
+               << ", alpha: " << alpha << ", Residual: " << res.residual
+               << " +- " << res.sigma << ", linePos R/theta: "
+               << perp(linePos) << " / " << inDeg(theta(linePos))
+               << ", lineDir theta: " << inDeg(theta(lineDir))
+               << ", testPos R/theta/phi: " << perp(testPos) << " / "
+               << inDeg(theta(testPos)) << " / " << inDeg(phi(testPos))
+               << ", hit pos sigma: " << std::sqrt(residualCovAcc)
+               << ", phi plane sigma: "
+               << std::abs(phiPlaneDerivativeAcc) * std::sqrt(patPhiCov));
+  return res;
+}
+
+void PatternState::addHit(const CandidateHit& hit, double residual,
+                          double resSigma) {
+  hitsPerStation[stationIdx(hit.station)].push_back(hit);
+
+  if (hit->isPrecision) {
+    ++nPrecisionLayers;
+  } else {
+    ++nTriggerLayers;
+  }
+  if (hit->measuresPhi) {
+    ++nPhiLayers;
+    updatePatternPhi();
+  }
+
+  const bool isNewStation = hit.station != lastInsertedHit.station;
+  prevLayerHit = lastInsertedHit;
+  lastInsertedHit = hit;
+
+  meanNormResidual2 += Acts::square(residual / resSigma);
+  lastResSigma = resSigma;
+  lastResidual = residual;
+
+  // If the new hit is in a different station, update the line anchor
+  if (isNewStation) {
+    moveLineAnchorHit(hit);
+  }
+  needLineUpdate = true;
+}
+
+void PatternState::overWriteHit(const CandidateHit& newHit, double newResidual,
+                                double newResSigma) {
+  const MuonStationIndex st = newHit.station;
+  if (st != lastInsertedHit.station ||
+      lastInsertedHit.globLayer != newHit.globLayer) {
+    throw std::runtime_error(std::format(
+        "PatternState: trying to overwrite a hit in station/layer {}/{} with "
+        "another one from station/layer {}/{}",
+        toString(lastInsertedHit.station),
+        static_cast<int>(lastInsertedHit.globLayer), toString(st),
+        static_cast<int>(newHit.globLayer)));
+  }
+  // Hits of the same type (precision / trigger) are expected to be replaced,
+  // since patterns are only branched with compatible hits on the same layer.
+  // The exception are sTgc pads replaced by strips on the same layer
+  if (lastInsertedHit->isPrecision != newHit->isPrecision) {
+    const bool isStgcStrip =
+        newHit.sp()->id().technology() ==
+            MuonSpacePoint::MuonId::TechField::sTgc &&
+        newHit->isPrecision;
+    if (!isStgcStrip) {
+      std::ostringstream sstr{};
+      sstr << "PatternState: trying to overwrite a hit with an incompatible "
+              "type\nOld hit: "
+           << *lastInsertedHit.sp()
+           << ", isPrecision: " << lastInsertedHit->isPrecision
+           << "\nNew hit: " << *newHit.sp()
+           << ", isPrecision: " << newHit->isPrecision;
+      throw std::runtime_error(sstr.str());
+    }
+    ++nPrecisionLayers;
+    --nTriggerLayers;
+  }
+  auto& stHits = hitsPerStation[stationIdx(st)];
+  if (stHits.empty() || stHits.back() != lastInsertedHit) {
+    std::ostringstream sstr{};
+    sstr << "PatternState: trying to overwrite a hit that is not the last "
+            "inserted hit in station/layer "
+         << st << "/" << static_cast<int>(lastInsertedHit.globLayer)
+         << "\nLast inserted hit: " << *lastInsertedHit.sp();
+    throw std::runtime_error(sstr.str());
+  }
+
+  bool updatePhi{false};
+  if (lastInsertedHit->measuresPhi) {
+    --nPhiLayers;
+    updatePhi = true;
+  }
+  if (newHit->measuresPhi) {
+    ++nPhiLayers;
+    updatePhi = true;
+  }
+
+  meanNormResidual2 += Acts::square(newResidual / newResSigma) -
+                       Acts::square(lastResidual / lastResSigma);
+  lastResSigma = newResSigma;
+  lastResidual = newResidual;
+
+  stHits.back() = newHit;
+  lastInsertedHit = newHit;
+
+  if (updatePhi) {
+    updatePatternPhi();
+  }
   needLineUpdate = true;
 }
 
