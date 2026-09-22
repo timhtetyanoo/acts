@@ -8,6 +8,7 @@
 
 #include "Acts/Seeding/GraphBasedTrackSeeder.hpp"
 #include "ActsExamples/TrackFinding/AdaptiveHoughTransformSeeder.hpp"
+#include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/GraphBasedSeedingAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/GridTripletSeedingAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/HoughTransformSeeder.hpp"
@@ -112,6 +113,14 @@ void addTrackFinding(py::module& mex) {
                                 inTruthSegments, inSpacePoints, outHoughMax,
                                 nBinsTanTheta, nBinsY0, nBinsTanPhi, nBinsX0,
                                 dumpVisualization, visualizationFunction);
+
+  ACTS_PYTHON_DECLARE_ALGORITHM(
+      GlobalPatternFinderAlgorithm, mex, "GlobalPatternFinderAlgorithm",
+      inSpacePoints, outPatterns, useMdtHits, seedFromMdt, seedFromInner,
+      thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, nPhiSigma,
+      minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
+      meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
+      minHitDistance4Line, beamSpotRadius, beamSpotLength);
 
   {
     using Alg = TrackParamsEstimationAlgorithm;

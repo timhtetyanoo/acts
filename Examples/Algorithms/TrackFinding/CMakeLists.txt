@@ -8,6 +8,8 @@ acts_add_library(
     src/AdaptiveHoughTransformSeeder.cpp
     src/TrackParamsEstimationAlgorithm.cpp
     src/MuonHoughSeeder.cpp
+    src/GlobalPatternFinderAlgorithm.cpp
+    src/GlobalPatternFinderDefs.cpp
     src/GraphBasedSeedingAlgorithm.cpp
     src/TrackParamsLookupEstimation.cpp
     src/GridTripletSeedingAlgorithm.cpp
