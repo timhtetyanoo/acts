@@ -64,7 +64,8 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
       std::move(patCfg), this->logger().clone("GlobalPatternFinder"));
 
   // Print Configuration
-  ACTS_DEBUG(
+  ACTS_LOG_WITH_LOGGER(
+      this->logger(), Acts::Logging::DEBUG,
       "Global Pattern Finder Configuration:\n"
       << " Theta search window [rad]: " << m_cfg.thetaSearchWindow << "\n"
       << " Number of residual standard deviations: " << m_cfg.nResidualSigma
@@ -96,7 +97,7 @@ ProcessCode GlobalPatternFinderAlgorithm::execute(
                         << " SP buckets from collection: "
                         << m_cfg.inSpacePoints);
 
-  const Acts::GeometryContext& gctx{ctx.geoContext};
+  const Acts::GeometryContext& gctx{ctx.recoGeoContext};
 
   SearchTreeData treeData{constructTree(gctx, inSpacePoints)};
 
