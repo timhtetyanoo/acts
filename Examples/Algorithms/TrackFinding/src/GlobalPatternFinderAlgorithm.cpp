@@ -15,6 +15,7 @@
 #include "Acts/Utilities/VectorHelpers.hpp"
 
 #include <algorithm>
+#include <format>
 #include <array>
 #include <cmath>
 #include <iterator>
@@ -38,6 +39,11 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
     throw std::invalid_argument(
         "GlobalPatternFinderAlgorithm: Missing output pattern collection");
   }
+  if (!m_cfg.trackingGeometry) {
+    throw std::invalid_argument(
+        "GlobalPatternFinderAlgorithm: Missing tracking geometry");
+  }
+  m_onlyPhiProvider.trackingGeometry = m_cfg.trackingGeometry.get();
   m_inSpacePoints.initialize(m_cfg.inSpacePoints);
   m_outPatterns.initialize(m_cfg.outPatterns);
 
@@ -150,7 +156,8 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
     if (bucket.empty()) {
       continue;
     }
-    const Acts::Transform3 localToGlobal{localToGlobalTransform(gctx, bucket)};
+    const Acts::Transform3 localToGlobal{
+        localToGlobalTransform(gctx, *m_cfg.trackingGeometry, bucket)};
 
     for (const MuonSpacePoint& hit : bucket) {
       // Ignore only-phi hits and MDT hits if desired
@@ -158,7 +165,14 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
         continue;
       }
 
-      hitPayloads.emplace_back(gctx, &hit, &bucket, localToGlobal);
+      const Acts::Surface* surface{
+          m_cfg.trackingGeometry->findSurface(hit.geometryId())};
+      if (surface == nullptr) {
+        throw std::runtime_error(std::format(
+            "GlobalPatternFinderAlgorithm: no surface for geometry id {}",
+            hit.geometryId().value()));
+      }
+      hitPayloads.emplace_back(gctx, &hit, &bucket, localToGlobal, surface);
 
       if (logger().doPrint(Acts::Logging::VERBOSE)) {
         const HitPayload& newHit{hitPayloads.back()};

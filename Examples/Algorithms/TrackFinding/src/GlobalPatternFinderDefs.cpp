@@ -192,37 +192,29 @@ constexpr int z{2};
  * covT = timeCov) */
 enum class CovIdx : std::uint8_t { etaCov = 0, phiCov = 1, timeCov = 2 };
 
-/** @brief Axes of the measurement surface in the global frame. Athena takes them from
- *         xAOD::muonSurface(sp->primaryMeasurement()). The example EDM has no
- * surface, so they are rebuilt from the space point, which Athena defines from
- * that surface: y = strip direction (sensorDirection), z = plane normal, x = y
- * cross z (measuring direction). Signs may differ from the surface axes; every
- * use is squared or a line direction. */
-Acts::RotationMatrix3 measurementAxes(const ActsExamples::MuonSpacePoint& sp,
-                                      const Acts::RotationMatrix3& toGlobal) {
-  const Acts::Vector3 y{sp.sensorDirection().normalized()};
-  const Acts::Vector3 z{sp.planeNormal()};
-  Acts::RotationMatrix3 axes{};
-  axes.col(Amg::x) = toGlobal * y.cross(z);
-  axes.col(Amg::y) = toGlobal * y;
-  axes.col(Amg::z) = toGlobal * z;
-  return axes;
-}
-
 }  // namespace
 
 namespace ActsExamples {
 
-/** @brief Transformation from the bucket (sector) frame into the global frame.
- *         Replaces Athena's bucket->msSector()->localToGlobalTransform(gctx).
- *  TODO: return the transform carried by the bucket once MuonSpacePointBucket
- * provides it. */
 Acts::Transform3 localToGlobalTransform(
-    const Acts::GeometryContext& /*gctx*/,
-    const MuonSpacePointBucket& /*bucket*/) {
-  throw std::runtime_error(
-      "GlobalPatternFinderAlgorithm: the MuonSpacePointBucket does not carry "
-      "its local to global transform yet");
+    const Acts::GeometryContext& gctx,
+    const Acts::TrackingGeometry& trackingGeometry,
+    const MuonSpacePointBucket& bucket) {
+  if (bucket.empty()) {
+    return Acts::Transform3::Identity();
+  }
+  /** The reader takes the bucket's transform from its first space point, so the
+   *  surface of that very space point has to be used to leave the sector frame */
+  const MuonSpacePoint& refSp{bucket.front()};
+  const Acts::Surface* refSurface{
+      trackingGeometry.findSurface(refSp.geometryId())};
+  if (refSurface == nullptr) {
+    throw std::runtime_error(
+        std::format("GlobalPatternFinderAlgorithm: no surface for geometry id {}",
+                    refSp.geometryId().value()));
+  }
+  return refSurface->localToGlobalTransform(gctx) *
+         bucket.toSectorFrameTransform().inverse();
 }
 
 ExpandedSector::ExpandedSector(const std::int8_t expSector)
@@ -426,10 +418,12 @@ using MuonId = MuonSpacePoint::MuonId;
 HitPayload::HitPayload(const Acts::GeometryContext& gctx,
                        const MuonSpacePoint* sp,
                        const MuonSpacePointBucket* parentBucket,
-                       const Acts::Transform3& localToGlobal)
+                       const Acts::Transform3& localToGlobal,
+                       const Acts::Surface* measSurface)
     : position{localToGlobal * sp->localPosition()},
       underlyingSp{sp},
-      bucket{parentBucket} {
+      bucket{parentBucket},
+      surface{measSurface} {
   if (!sp->id().measuresEta()) {
     // Phi-only measurements
     const Acts::Vector3 phiMeasDir{localToGlobal.rotation() *
@@ -439,8 +433,8 @@ HitPayload::HitPayload(const Acts::GeometryContext& gctx,
              Acts::square(phiMeasDir.dot(phiGradient(position)));
     return;
   }
-  const Acts::RotationMatrix3 surfLinearTrf{
-      measurementAxes(*sp, localToGlobal.rotation())};
+  const auto& surfLinearTrf =
+      measSurface->localToGlobalTransform(gctx).linear();
 
   if (sp->isStraw()) {
     // Remember that for straw hits, the x component of secondaryMeasDir is
@@ -491,14 +485,11 @@ const Acts::Vector3& HitPayload::globalPosition(
 }
 Acts::Vector3 HitPayload::globalSensorDirection(
     const Acts::GeometryContext& gctx) const {
-  const Acts::RotationMatrix3 toGlobal{
-      localToGlobalTransform(gctx, *bucket).linear()};
+  const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
 
   if (spacePoint()->isStraw()) {
-    return toGlobal * spacePoint()->sensorDirection();
+    return surfLinearTrf.col(Amg::z);
   } else {
-    const Acts::RotationMatrix3 surfLinearTrf{
-        measurementAxes(*spacePoint(), toGlobal)};
     if (nonOrthogonalStrips) {
       return -std::sin(stripAngle) * surfLinearTrf.col(Amg::y) +
              std::cos(stripAngle) * surfLinearTrf.col(Amg::x);
@@ -523,8 +514,7 @@ double HitPayload::intrinsicVariance(
       return etaTerm;
     }
   } else if (spacePoint()->id().measuresEta()) {
-    const Acts::RotationMatrix3 surfLinearTrf{measurementAxes(
-        *spacePoint(), localToGlobalTransform(gctx, *bucket).linear())};
+    const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
     /** @brief Helper method to compute the contribution of a 1D measurement to the residual variance */
     auto oneDimContribution = [&](CovIdx idx,
                                   const Acts::Vector3& measDir) -> double {
@@ -643,7 +633,7 @@ PatternTopology::GroupIdx PatternTopology::groupIndex(const HitPayload& hit) {
 }
 
 OnlyPhiHitsProvider::PhiHitsPerGroup OnlyPhiHitsProvider::getPhiOnlyHits(
-    const PatternState& pattern, const Acts::GeometryContext& gctx) {
+    const PatternState& pattern, const Acts::GeometryContext& gctx) const {
   PhiHitsPerGroup phiOnlyHits{};
   for (const auto& [group, hits] : Acts::enumerate(pattern.hitsPerGroup)) {
     std::vector<const MuonSpacePointBucket*> parentBuckets{};
@@ -655,10 +645,12 @@ OnlyPhiHitsProvider::PhiHitsPerGroup OnlyPhiHitsProvider::getPhiOnlyHits(
     }
     for (const MuonSpacePointBucket* bucket : parentBuckets) {
       const Acts::Transform3 localToGlobal{
-          localToGlobalTransform(gctx, *bucket)};
+          localToGlobalTransform(gctx, *trackingGeometry, *bucket)};
       for (const MuonSpacePoint& h : *bucket) {
         if (!h.id().measuresEta()) {
-          phiOnlyHits[group].emplace_back(gctx, &h, bucket, localToGlobal);
+          phiOnlyHits[group].emplace_back(
+              gctx, &h, bucket, localToGlobal,
+              trackingGeometry->findSurface(h.geometryId()));
         }
       }
     }

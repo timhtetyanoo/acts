@@ -10,6 +10,8 @@
 
 #include "Acts/Definitions/Algebra.hpp"
 #include "Acts/Geometry/GeometryContext.hpp"
+#include "Acts/Geometry/TrackingGeometry.hpp"
+#include "Acts/Surfaces/Surface.hpp"
 #include "Acts/Seeding/GlobalPatternFinder.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/OstreamFormatter.hpp"
@@ -166,7 +168,8 @@ struct HitPayload {
   explicit HitPayload(const Acts::GeometryContext& gctx,
                       const MuonSpacePoint* sp,
                       const MuonSpacePointBucket* bucket,
-                      const Acts::Transform3& localToGlobal);
+                      const Acts::Transform3& localToGlobal,
+                      const Acts::Surface* measSurface);
   /** @brief Retrieve the space point */
   const MuonSpacePoint* spacePoint() const { return underlyingSp; }
   /** @brief Retrieve the global position */
@@ -191,6 +194,9 @@ struct HitPayload {
   const MuonSpacePoint* underlyingSp{nullptr};
   /** @brief Pointer to the parent bucket */
   const MuonSpacePointBucket* bucket{nullptr};
+  /** @brief Measurement surface of the hit. Athena fetches it from
+   *         xAOD::muonSurface(spacePoint()->primaryMeasurement()) */
+  const Acts::Surface* surface{nullptr};
   /** @brief Cached angular covariance [rad^2] of the hit in the phi angle */
   double phiCov{0.};
   /** @brief Strip angle when the strips are non-orthogonal */
@@ -267,19 +273,27 @@ struct OnlyPhiHitsProvider {
   using PhiHitsPerGroup =
       std::array<std::vector<HitPayload>, PatternTopology::nGroups>;
   /** @brief Get the phi-only hits compatible with the pattern */
-  static PhiHitsPerGroup getPhiOnlyHits(const PatternState& pattern,
-                                        const Acts::GeometryContext& gctx);
+  PhiHitsPerGroup getPhiOnlyHits(const PatternState& pattern,
+                                 const Acts::GeometryContext& gctx) const;
+  /** @brief Tracking geometry to look up the measurement surfaces. Athena reaches
+   *         them through the space point's primary measurement */
+  const Acts::TrackingGeometry* trackingGeometry{nullptr};
 };
 static_assert(Acts::Experimental::detail::OnlyPhiHitsProvider<
               OnlyPhiHitsProvider, HitPayload, PatternTopology,
               GlobalPatternFinder_t::PatternState>);
 
 /** @brief Transformation from the bucket (sector) frame into the global frame.
- *         Replaces Athena's bucket->msSector()->localToGlobalTransform(gctx).
- *  TODO: return the transform carried by the bucket once MuonSpacePointBucket
- * provides it. */
-Acts::Transform3 localToGlobalTransform(const Acts::GeometryContext& gctx,
-                                        const MuonSpacePointBucket& bucket);
+ *         Replaces Athena's bucket->msSector()->localToGlobalTransform(gctx). The bucket
+ *         carries the transform of its first space point's surface into the sector frame,
+ *         so the global frame is reached as surfaceToGlobal * surfaceToSector^-1.
+ *  @param gctx: Geometry context
+ *  @param trackingGeometry: Geometry holding the measurement surfaces
+ *  @param bucket: Non-empty space point bucket */
+Acts::Transform3 localToGlobalTransform(
+    const Acts::GeometryContext& gctx,
+    const Acts::TrackingGeometry& trackingGeometry,
+    const MuonSpacePointBucket& bucket);
 
 }  // namespace ActsExamples
 

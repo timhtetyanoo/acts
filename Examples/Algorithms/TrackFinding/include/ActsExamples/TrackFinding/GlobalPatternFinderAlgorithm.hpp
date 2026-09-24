@@ -65,6 +65,8 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
     std::string inSpacePoints{};
     /** @brief Write handle key for the output global patterns */
     std::string outPatterns{};
+    /** @brief Tracking geometry holding the muon measurement surfaces */
+    std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
 
     /** @brief Toggle the utilization of MDT hits to build patterns */
     bool useMdtHits{true};
@@ -137,7 +139,7 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
 
   /** @brief Seed selector */
   std::unique_ptr<SeedSelector> m_seedSelector{};
-  static constexpr OnlyPhiHitsProvider m_onlyPhiProvider{};
+  OnlyPhiHitsProvider m_onlyPhiProvider{};
   /** @brief Pointer to the actual global pattern finder */
   std::unique_ptr<GlobalPatternFinder_t> m_globPatFinder{};
 };

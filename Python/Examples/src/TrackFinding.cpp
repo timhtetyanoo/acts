@@ -116,7 +116,7 @@ void addTrackFinding(py::module& mex) {
 
   ACTS_PYTHON_DECLARE_ALGORITHM(
       GlobalPatternFinderAlgorithm, mex, "GlobalPatternFinderAlgorithm",
-      inSpacePoints, outPatterns, useMdtHits, seedFromMdt, seedFromInner,
+      inSpacePoints, outPatterns, trackingGeometry, useMdtHits, seedFromMdt, seedFromInner,
       thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, nPhiSigma,
       minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
       meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
