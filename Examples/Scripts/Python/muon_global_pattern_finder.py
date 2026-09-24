@@ -3,12 +3,19 @@ import argparse
 
 import acts
 import acts.examples
-from acts.examples.root import RootMuonSpacePointReader
+from acts.examples.root import (
+    RootMuonSpacePointReader,
+    RootMuonGlobalPatternWriter,
+)
 from acts.json import TrackingGeometryJsonConverter
 
 
 def runGlobalPatternFinder(
-    inFile: str, geoFile: str, nEvents: int, logLevel: acts.logging.Level
+    inFile: str,
+    geoFile: str,
+    nEvents: int,
+    logLevel: acts.logging.Level,
+    outFile: str = "",
 ):
     # The muon space points are stored in the frame of their spectrometer sector.
     # Reaching the global frame needs the measurement surfaces, which are read
@@ -44,6 +51,19 @@ def runGlobalPatternFinder(
     )
     s.addAlgorithm(patternFinder)
 
+    # Writes one entry per event holding the parameters of every pattern and,
+    # for each of its hits, the identifiers needed to match it against the truth
+    # or against another run of the pattern recognition.
+    if outFile:
+        s.addWriter(
+            RootMuonGlobalPatternWriter(
+                inputPatterns=patternFinder.config.outPatterns,
+                inputSpacePoints=spReader.config.outputSpacePoints,
+                filePath=outFile,
+                level=logLevel,
+            )
+        )
+
     s.run()
 
 
@@ -61,6 +81,11 @@ if "__main__" == __name__:
         required=True,
         help="Path to the tracking geometry JSON matching the n-tuple",
     )
+    p.add_argument(
+        "--output",
+        default="",
+        help="Path of the ROOT file the found patterns are written to",
+    )
     p.add_argument("--nEvents", default=100, type=int, help="Number of events to run")
     p.add_argument(
         "--logLevel",
@@ -75,4 +100,5 @@ if "__main__" == __name__:
         geoFile=args.geometry,
         nEvents=args.nEvents,
         logLevel=getattr(acts.logging, args.logLevel),
+        outFile=args.output,
     )
