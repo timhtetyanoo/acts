@@ -11,8 +11,10 @@
 ///        shipped with the repository, so both paths are taken from the
 ///        environment and the test is skipped when they are unset or missing:
 ///
-///          ACTS_GPF_NTUPLE    ROOT file holding the MuonSpacePoints tree
-///          ACTS_GPF_GEOMETRY  matching tracking geometry json file
+///          ACTS_GPF_NTUPLE      space point n-tuple
+///          ACTS_GPF_GEOMETRY    tracking geometry json
+///          ACTS_GPF_OUTPUT      pattern output file, optional
+///          ACTS_GPF_MAX_EVENTS  event cap, optional
 ///
 /// @note This file is a development aid and is not meant to be part of an
 ///       upstream pull request: a unit test does not read external data files.
@@ -24,12 +26,15 @@
 #include "ActsExamples/Framework/AlgorithmContext.hpp"
 #include "ActsExamples/Framework/DataHandle.hpp"
 #include "ActsExamples/Framework/WhiteBoard.hpp"
+#include "ActsExamples/Io/Root/RootMuonGlobalPatternWriter.hpp"
 #include "ActsExamples/Io/Root/RootMuonSpacePointReader.hpp"
 #include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
 #include "ActsPlugins/Json/TrackingGeometryJsonConverter.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace ActsTests {
@@ -51,6 +56,22 @@ std::filesystem::path pathFromEnv(const char* variable) {
     return {};
   }
   return path;
+}
+
+/// @brief Returns the value of the environment variable or an empty string
+std::string stringFromEnv(const char* variable) {
+  const char* value = std::getenv(variable);
+  return value != nullptr ? std::string{value} : std::string{};
+}
+
+/// @brief Returns the number stored in the environment variable or the fallback
+///        if the variable is unset
+std::size_t countFromEnv(const char* variable, std::size_t fallback) {
+  const std::string value{stringFromEnv(variable)};
+  if (value.empty()) {
+    return fallback;
+  }
+  return static_cast<std::size_t>(std::stoul(value));
 }
 
 }  // namespace
@@ -92,8 +113,24 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
       patternHandle{&finder, "TestOutputPatterns"};
   patternHandle.initialize(finderCfg.outPatterns);
 
-  const auto [firstEvent, lastEvent] = reader.availableEvents();
-  BOOST_REQUIRE_GT(lastEvent, firstEvent);
+  /// The patterns are written out for the offline validation, if asked for
+  std::unique_ptr<ActsExamples::RootMuonGlobalPatternWriter> writer{};
+  const std::string outFile{stringFromEnv("ACTS_GPF_OUTPUT")};
+  if (!outFile.empty()) {
+    ActsExamples::RootMuonGlobalPatternWriter::Config writerCfg{};
+    writerCfg.inputPatterns = finderCfg.outPatterns;
+    writerCfg.inputSpacePoints = readerCfg.outputSpacePoints;
+    writerCfg.filePath = outFile;
+    writer = std::make_unique<ActsExamples::RootMuonGlobalPatternWriter>(
+        writerCfg, Acts::Logging::INFO);
+  }
+
+  const auto [firstEvent, availableEvents] = reader.availableEvents();
+  BOOST_REQUIRE_GT(availableEvents, firstEvent);
+  const std::size_t lastEvent{std::min(
+      availableEvents,
+      firstEvent +
+          countFromEnv("ACTS_GPF_MAX_EVENTS", availableEvents - firstEvent))};
   BOOST_TEST_MESSAGE("Reading the events [" << firstEvent << ", " << lastEvent
                                             << ") from " << ntuple.string());
 
@@ -109,6 +146,9 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
 
     const ActsExamples::MuonGlobalPatternContainer& patterns{
         patternHandle(ctx)};
+    if (writer) {
+      BOOST_REQUIRE(writer->write(ctx) == ActsExamples::ProcessCode::SUCCESS);
+    }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);
 
@@ -129,6 +169,11 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
       BOOST_CHECK_GE(pattern.nPrecisionLayers, finderCfg.minPrecisionLayers);
       BOOST_CHECK_GT(nHits, 0u);
     }
+  }
+
+  if (writer) {
+    BOOST_REQUIRE(writer->finalize() == ActsExamples::ProcessCode::SUCCESS);
+    BOOST_TEST_MESSAGE("Wrote the patterns to " << outFile);
   }
 
   BOOST_TEST_MESSAGE("Found " << totalPatterns << " patterns in "
