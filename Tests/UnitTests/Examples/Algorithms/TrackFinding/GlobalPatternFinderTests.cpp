@@ -35,9 +35,8 @@ using ActsExamples::PatternTopology;
 using ActsExamples::SeedSelector;
 using ActsExamples::StIndex;
 
-/// @brief Surface every synthetic hit is placed on. The pattern finder reaches the
-///        measurement axes through it, as Athena does through the primary
-///        measurement.
+/// @brief Surface every synthetic hit is placed on. The pattern finder takes the
+///        local measurement axes from it.
 std::shared_ptr<Acts::Surface> testSurface() {
   return Acts::Surface::makeShared<Acts::PlaneSurface>(
       Acts::Transform3::Identity(),
@@ -66,7 +65,7 @@ ActsExamples::MuonSpacePoint makeSpacePoint(MuonId::StationName station,
   sp.setGeometryId(Acts::GeometryIdentifier{layer + 1u});
   sp.defineCoordinates(Acts::Vector3{pos}, Acts::Vector3::UnitX(),
                        Acts::Vector3::UnitY());
-  /// The covariance is filled as the Athena exporter writes it: eta, phi, time
+  /// The covariance is ordered as precision, non-precision & time
   sp.setCovariance(0.09, 0., 0.);
   return sp;
 }

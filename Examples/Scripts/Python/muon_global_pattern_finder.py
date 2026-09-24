@@ -21,10 +21,10 @@ def runGlobalPatternFinder(
     # passed between them through the event store under string keys.
     s = acts.examples.Sequencer(events=nEvents, numThreads=1, logLevel=logLevel)
 
-    # Reads the Athena-exported space points (MuonActsDump/SpacePointWriter)
-    # and writes them into the event store as a MuonSpacePointContainer under
-    # the key given by outputSpacePoints. The exporter's tree is called
-    # "MuonSpacePoints", which differs from the reader's default.
+    # Reads the space points and writes them into the event store as a
+    # MuonSpacePointContainer under the key given by outputSpacePoints. The tree
+    # holding them is called "MuonSpacePoints", which differs from the reader's
+    # default.
     spReader = RootMuonSpacePointReader(
         filePath=inFile,
         treeName="MuonSpacePoints",
@@ -34,8 +34,8 @@ def runGlobalPatternFinder(
     s.addReader(spReader)
 
     # Reads the space points back via inSpacePoints and writes the found
-    # patterns under outPatterns. Every Config field not set here keeps the
-    # Athena default from the C++ header.
+    # patterns under outPatterns. Every Config field not set here keeps its
+    # default from the C++ header.
     patternFinder = acts.examples.GlobalPatternFinderAlgorithm(
         inSpacePoints=spReader.config.outputSpacePoints,
         outPatterns="MuonGlobalPatterns",
@@ -49,7 +49,7 @@ def runGlobalPatternFinder(
 
 if "__main__" == __name__:
     p = argparse.ArgumentParser(
-        description="Run the muon global pattern finder on Athena-exported space points",
+        description="Run the muon global pattern finder on muon space points",
     )
     p.add_argument(
         "--input",

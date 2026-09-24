@@ -135,7 +135,7 @@ ProcessCode GlobalPatternFinderAlgorithm::execute(
                  << ", hits per station:" << hitsPerStation.str());
     }
   }
-  /** Write out the global patterns. */
+  // Write out the global patterns.
   m_outPatterns(ctx, std::move(patterns));
   return ProcessCode::SUCCESS;
 }
@@ -145,7 +145,7 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
     const MuonSpacePointContainer& spacepoints) const {
   std::vector<HitPayload> hitPayloads{};
   using enum ExpandedSector::SectorProjector;
-  /** First estimate the number of hits */
+  // First estimate the number of hits
   std::size_t totalHits = 0;
   for (const MuonSpacePointBucket& bucket : spacepoints) {
     totalHits += bucket.size();
@@ -156,9 +156,6 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
     if (bucket.empty()) {
       continue;
     }
-    const Acts::Transform3 localToGlobal{
-        localToGlobalTransform(gctx, *m_cfg.trackingGeometry, bucket)};
-
     for (const MuonSpacePoint& hit : bucket) {
       // Ignore only-phi hits and MDT hits if desired
       if (!hit.id().measuresEta() || (!m_cfg.useMdtHits && hit.isStraw())) {
@@ -172,7 +169,11 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
             "GlobalPatternFinderAlgorithm: no surface for geometry id {}",
             hit.geometryId().value()));
       }
-      hitPayloads.emplace_back(gctx, &hit, &bucket, localToGlobal, surface);
+      // Every space point carries the transform of its own surface into the
+      //  sector frame, so the global frame is reached hit by hit
+      hitPayloads.emplace_back(gctx, &hit, &bucket,
+                               localToGlobalTransform(gctx, *surface, hit),
+                               surface);
 
       if (logger().doPrint(Acts::Logging::VERBOSE)) {
         const HitPayload& newHit{hitPayloads.back()};
@@ -192,8 +193,7 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
   }
 
   SearchTree_t::vector_t treeData{};
-  /** Athena dereferences hitPayloads.front() below, which is undefined for an
-   * empty event */
+  // An event without any precision hit leaves nothing to order below
   if (hitPayloads.empty()) {
     return SearchTreeData{std::move(hitPayloads),
                           SearchTree_t{std::move(treeData)}};
@@ -211,9 +211,9 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
       msSector = hit.spacePoint()->id().sector();
     }
 
-    /** Try to duplicate the hit in the neighboring sectors if it is close to
-     * the sector border. This ensures that we can find patterns crossing the
-     * sector borders. */
+    // Try to duplicate the hit in the neighboring sectors if it is close to
+    // the sector border. This ensures that we can find patterns crossing the
+    // sector borders.
     for (const ExpandedSector::SectorProjector proj :
          {leftOverlap, center, rightOverlap}) {
       /// Check whether the hit belongs to the left or right sector as well
@@ -258,7 +258,7 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
 MuonGlobalPattern GlobalPatternFinderAlgorithm::convertToPattern(
     const PatternResult& candidate) const {
   MuonGlobalPattern pattern{};
-  /** Add eta hits */
+  // Add eta hits
   for (PatternTopology::GroupIdx g = 0u; g < PatternTopology::nGroups; ++g) {
     const auto& hits{candidate.hitsPerGroup[g]};
     if (hits.empty())
@@ -272,7 +272,7 @@ MuonGlobalPattern GlobalPatternFinderAlgorithm::convertToPattern(
     });
   }
 
-  /** Add phi-only hits */
+  // Add phi-only hits
   for (const HitPayload& hit : candidate.phiOnlyHits) {
     pattern.hitsPerStation[Acts::toUnderlying(hit.station)].push_back(
         hit.spacePoint());

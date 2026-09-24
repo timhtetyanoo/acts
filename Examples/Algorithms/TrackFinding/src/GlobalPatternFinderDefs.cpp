@@ -45,26 +45,26 @@ constexpr double s_sectorOverlap{
     0.1 *
     s_oneEightsOfPi};  // size of the overlap between small and large sectors
 
-/** sector size (exclusive) in radians */
+/// sector size (exclusive) in radians
 double sectorSize(int sector) {
   const int idx = sector % 2;
   return s_sectorSize[idx];
 }
 
-/** sector width (with overlap) in radians */
+/// sector width (with overlap) in radians
 double sectorWidth(int sector) {
   return sectorSize(sector) + s_sectorOverlap;
 }
 
-/** returns the centeral phi position of a sector in radians */
+/// returns the centeral phi position of a sector in radians
 double sectorPhi(int sector) {
   if (sector < 10)
     return std::numbers::pi * (sector - 1) / 8.;
   return -std::numbers::pi * (2 - (sector - 1) / 8.);
 }
 
-/** transforms a phi position from and to the sector coordinate system in
- * radians */
+/// transforms a phi position from and to the sector coordinate system in
+/// radians
 double transformPhiToSector(double phi, int sector, bool toSector = true) {
   double sign = toSector ? -1 : 1;
   double dphi = phi + sign * sectorPhi(sector);
@@ -75,7 +75,7 @@ double transformPhiToSector(double phi, int sector, bool toSector = true) {
   return dphi;
 }
 
-/** checks whether the phi position is consistent with sector */
+/// checks whether the phi position is consistent with sector
 bool insideSector(int sector, double phi) {
   double phiInSec = transformPhiToSector(phi, sector);
   if (phiInSec < -sectorWidth(sector))
@@ -85,7 +85,7 @@ bool insideSector(int sector, double phi) {
   return true;
 }
 
-/** returns the sector corresponding to the phi position */
+/// returns the sector corresponding to the phi position
 int getSector(double phi) {
   // remap phi onto sector structure
   double val = (phi + sectorSize(1)) *
@@ -101,8 +101,8 @@ int getSector(double phi) {
   return sector;
 }
 
-/** returns the main sector plus neighboring if the phi position is in an
- * overlap region */
+/// returns the main sector plus neighboring if the phi position is in an
+/// overlap region
 void getSectors(double phi, std::vector<int>& sectors) {
   int sector = getSector(phi);
   int sectorNext = sector != 16 ? sector + 1 : 1;
@@ -115,8 +115,8 @@ void getSectors(double phi, std::vector<int>& sectors) {
     sectors.push_back(sectorNext);
 }
 
-/** returns the phi position of the overlap between the two sectors (which have
- * to be neighboring) in radians */
+/// returns the phi position of the overlap between the two sectors (which have
+/// to be neighboring) in radians
 double sectorOverlapPhi(int sector1, int sector2) {
   if (sector1 == sector2)
     return sectorPhi(sector1);
@@ -140,7 +140,7 @@ double sectorOverlapPhi(int sector1, int sector2) {
 
 }  // namespace sectorMap
 
-/** @brief Number of sectors in the muon spectrometer (MuonStationIndex) */
+/// @brief Number of sectors in the muon spectrometer (MuonStationIndex)
 constexpr unsigned numberOfSectors() {
   return 16;
 }
@@ -172,50 +172,27 @@ inline std::tuple<unsigned, SectorProjector> msSectorAndProj(
   // all cases have been addressed
 }
 
-/** @brief Helper function to construct the gradient of the azimuthal coordinate
- *  @param pos The position vector where the gradient is to be computed
- *  @return The gradient of the azimuthal coordinate */
+/// @brief Helper function to construct the gradient of the azimuthal coordinate
+/// @param pos The position vector where the gradient is to be computed
+/// @return The gradient of the azimuthal coordinate
 Acts::Vector3 phiGradient(const Acts::Vector3& pos) {
   return Acts::Vector3{-pos.y(), pos.x(), 0.} /
          Acts::square(Acts::VectorHelpers::perp(pos));
 }
 
-/** @brief Column indices of the surface axes, named as in Athena (Amg::x, Amg::y, Amg::z) */
-namespace Amg {
-constexpr int x{0};
-constexpr int y{1};
-constexpr int z{2};
-}  // namespace Amg
-
-/** @brief Indices of the space point covariance as written by the Athena exporter
- *         (MuonActsDump/SpacePointWriter: covLoc0 = etaCov, covLoc1 = phiCov,
- * covT = timeCov) */
+/// @brief Indices into the space point covariance: precision (eta), non-precision
+///        (phi) and time
 enum class CovIdx : std::uint8_t { etaCov = 0, phiCov = 1, timeCov = 2 };
 
 }  // namespace
 
 namespace ActsExamples {
 
-Acts::Transform3 localToGlobalTransform(
-    const Acts::GeometryContext& gctx,
-    const Acts::TrackingGeometry& trackingGeometry,
-    const MuonSpacePointBucket& bucket) {
-  if (bucket.empty()) {
-    return Acts::Transform3::Identity();
-  }
-  /** The reader takes the bucket's transform from its first space point, so the
-   *  surface of that very space point has to be used to leave the sector frame
-   */
-  const MuonSpacePoint& refSp{bucket.front()};
-  const Acts::Surface* refSurface{
-      trackingGeometry.findSurface(refSp.geometryId())};
-  if (refSurface == nullptr) {
-    throw std::runtime_error(std::format(
-        "GlobalPatternFinderAlgorithm: no surface for geometry id {}",
-        refSp.geometryId().value()));
-  }
-  return refSurface->localToGlobalTransform(gctx) *
-         bucket.toSectorFrameTransform().inverse();
+Acts::Transform3 localToGlobalTransform(const Acts::GeometryContext& gctx,
+                                        const Acts::Surface& surface,
+                                        const MuonSpacePoint& sp) {
+  return surface.localToGlobalTransform(gctx) *
+         sp.toSectorTransform().inverse();
 }
 
 ExpandedSector::ExpandedSector(const std::int8_t expSector)
@@ -266,7 +243,7 @@ double ExpandedSector::sectorSize() const {
   if (sector1 == sector2) {
     return sectorMap::sectorSize(sector1);
   }
-  /** The overlap size is the same for small and large sectors */
+  // The overlap size is the same for small and large sectors
   return sectorMap::sectorWidth(sector1) - sectorMap::sectorSize(sector1);
 }
 bool ExpandedSector::operator<(const ExpandedSector& other) const {
@@ -385,9 +362,9 @@ bool isBarrel(const StIndex index) {
 
 bool isPrecisionHit(const MuonSpacePoint& hit) {
   using enum MuonSpacePoint::MuonId::TechField;
-  /** Athena requires the primary sTgc measurement to be a strip. The channel
-   * type is not exported, so only strip-only space points (eta without phi) are
-   * taken as precision. */
+  // Mdt & micromega measurements are precision hits. An sTgc space point is
+  //  one if it stems from a strip, which can only be told apart from a pad if
+  //  the space point measures the precision coordinate alone.
   return hit.id().technology() == Mdt || hit.id().technology() == Mm ||
          (hit.id().technology() == sTgc && hit.id().measuresEta() &&
           !hit.id().measuresPhi());
@@ -451,9 +428,9 @@ HitPayload::HitPayload(const Acts::GeometryContext& gctx,
               (sp->covariance()[Acts::toUnderlying(CovIdx::phiCov)] - discCov);
     }
   } else if (sp->id().measuresPhi()) {
-    const Acts::Vector3 phiMeasDir = surfLinearTrf.col(Amg::y);
+    const Acts::Vector3 phiMeasDir = surfLinearTrf.col(Acts::eY);
     const Acts::Vector3 gradPhi{phiGradient(position)};
-    /** @brief Helper method to compute the contribution of a 1D measurement to the residual variance */
+    /// @brief Helper method to compute the contribution of a 1D measurement to the residual variance
     auto oneDimContribution = [&](CovIdx idx,
                                   const Acts::Vector3& measDir) -> double {
       return sp->covariance()[Acts::toUnderlying(idx)] *
@@ -464,7 +441,7 @@ HitPayload::HitPayload(const Acts::GeometryContext& gctx,
     if (sp->id().technology() == MuonId::TechField::Tgc) {
       const Acts::Vector3 etaMeasDir =
           localToGlobal.rotation() * sp->toNextSensor();
-      const Acts::Vector3 phiSensorDir = surfLinearTrf.col(Amg::x);
+      const Acts::Vector3 phiSensorDir = surfLinearTrf.col(Acts::eX);
 
       const double c{etaMeasDir.dot(phiMeasDir)};
       if (std::abs(c) > Acts::s_epsilon) {
@@ -474,7 +451,7 @@ HitPayload::HitPayload(const Acts::GeometryContext& gctx,
       phiCov = oneDimContribution(CovIdx::etaCov, etaMeasDir) +
                oneDimContribution(CovIdx::phiCov, phiMeasDir);
     } else {
-      const Acts::Vector3 etaMeasDir = surfLinearTrf.col(Amg::x);
+      const Acts::Vector3 etaMeasDir = surfLinearTrf.col(Acts::eX);
       phiCov = oneDimContribution(CovIdx::etaCov, etaMeasDir) +
                oneDimContribution(CovIdx::phiCov, phiMeasDir);
     }
@@ -489,13 +466,13 @@ Acts::Vector3 HitPayload::globalSensorDirection(
   const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
 
   if (spacePoint()->isStraw()) {
-    return surfLinearTrf.col(Amg::z);
+    return surfLinearTrf.col(Acts::eZ);
   } else {
     if (nonOrthogonalStrips) {
-      return -std::sin(stripAngle) * surfLinearTrf.col(Amg::y) +
-             std::cos(stripAngle) * surfLinearTrf.col(Amg::x);
+      return -std::sin(stripAngle) * surfLinearTrf.col(Acts::eY) +
+             std::cos(stripAngle) * surfLinearTrf.col(Acts::eX);
     }
-    return surfLinearTrf.col(Amg::y);
+    return surfLinearTrf.col(Acts::eY);
   }
 }
 double HitPayload::intrinsicVariance(
@@ -516,7 +493,7 @@ double HitPayload::intrinsicVariance(
     }
   } else if (spacePoint()->id().measuresEta()) {
     const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
-    /** @brief Helper method to compute the contribution of a 1D measurement to the residual variance */
+    /// @brief Helper method to compute the contribution of a 1D measurement to the residual variance
     auto oneDimContribution = [&](CovIdx idx,
                                   const Acts::Vector3& measDir) -> double {
       return spacePoint()->covariance()[Acts::toUnderlying(idx)] *
@@ -525,13 +502,13 @@ double HitPayload::intrinsicVariance(
     if (spacePoint()->id().measuresPhi()) {
       const Acts::Vector3 etaMeasDir{
           nonOrthogonalStrips ? Acts::Vector3{globalSensorDirection(gctx).cross(
-                                    surfLinearTrf.col(Amg::z))}
-                              : Acts::Vector3{surfLinearTrf.col(Amg::x)}};
-      const Acts::Vector3 phiMeasDir{surfLinearTrf.col(Amg::y)};
+                                    surfLinearTrf.col(Acts::eZ))}
+                              : Acts::Vector3{surfLinearTrf.col(Acts::eX)}};
+      const Acts::Vector3 phiMeasDir{surfLinearTrf.col(Acts::eY)};
       return oneDimContribution(CovIdx::etaCov, etaMeasDir) +
              oneDimContribution(CovIdx::phiCov, phiMeasDir);
     }
-    const Acts::Vector3 etaMeasDir{surfLinearTrf.col(Amg::x)};
+    const Acts::Vector3 etaMeasDir{surfLinearTrf.col(Acts::eX)};
     return oneDimContribution(CovIdx::etaCov, etaMeasDir);
   } else {
     throw std::runtime_error(
@@ -550,7 +527,7 @@ bool PatternTopology::layerSorter(const HitPayload& hit1,
   StIndex st1{hit1.station};
   StIndex st2{hit2.station};
   if (st1 == st2) {
-    /** Hits in the same spectrometer sector */
+    // Hits in the same spectrometer sector
     if (hit1.spacePoint()->id().sameStation(hit2.spacePoint()->id())) {
       if (hit1.locLayer == hit2.locLayer) {
         return hit1.spacePoint()->localPosition().y() <
@@ -558,8 +535,8 @@ bool PatternTopology::layerSorter(const HitPayload& hit1,
       }
       return hit1.locLayer < hit2.locLayer;
     }
-    /** Hits in the same station and different sectors. We can have this case
-     * for hits in the overlap region of two adjacent sectors. */
+    // Hits in the same station and different sectors. We can have this case
+    // for hits in the overlap region of two adjacent sectors.
     const double delta{isBarrel(st1)
                            ? Acts::VectorHelpers::perp(hit1.position) -
                                  Acts::VectorHelpers::perp(hit2.position)
@@ -575,16 +552,16 @@ bool PatternTopology::layerSorter(const HitPayload& hit1,
   LayerIndex layer2{toLayerIndex(st2)};
   using enum LayerIndex;
   if (layer1 == layer2) {
-    /** Hit in different stations but same station layer. Expected to happen
-     * only for Inner and Middle*/
+    // Hit in different stations but same station layer. Expected to happen
+    // only for Inner and Middle
     if (layer1 == Middle) {
-      /** If both hits are in the middle layer, the one in the barrel comes
-       * first */
+      // If both hits are in the middle layer, the one in the barrel comes
+      // first
       return st1 == StIndex::BM;
     }
     if (layer1 == Inner) {
-      /** If both hits are in the inner layer, we use the global R, since in
-       * large sector BI comes first, while in small sector EI comes first. */
+      // If both hits are in the inner layer, we use the global R, since in
+      // large sector BI comes first, while in small sector EI comes first.
       return Acts::VectorHelpers::perp(hit1.position) <
              Acts::VectorHelpers::perp(hit2.position);
     }
@@ -593,20 +570,20 @@ bool PatternTopology::layerSorter(const HitPayload& hit1,
         "other in EO.");
   }
   if (layer1 == Inner || layer2 == Inner) {
-    /** If we have one hit in Inner layer for sure it comes first */
+    // If we have one hit in Inner layer for sure it comes first
     return layer1 == Inner;
   }
   if (layer1 == Outer || layer2 == Outer) {
-    /** If we have one hit in Outer layer for sure it comes last */
+    // If we have one hit in Outer layer for sure it comes last
     return layer2 == Outer;
   }
   if (layer1 == BarrelExtended || layer2 == BarrelExtended) {
-    /** If we have one hit in BarrelExtended and the other in the Middle layer,
-     * the former comes first */
+    // If we have one hit in BarrelExtended and the other in the Middle layer,
+    // the former comes first
     return layer1 == BarrelExtended;
   }
-  /** If we have one hit in Extended (EE) layer and the other in the Middle
-   * layer, it depends if the latter is endcap or barrel */
+  // If we have one hit in Extended (EE) layer and the other in the Middle
+  // layer, it depends if the latter is endcap or barrel
   if (layer1 == Extended) {
     return st2 == StIndex::EM;
   }
@@ -645,13 +622,18 @@ OnlyPhiHitsProvider::PhiHitsPerGroup OnlyPhiHitsProvider::getPhiOnlyHits(
       }
     }
     for (const MuonSpacePointBucket* bucket : parentBuckets) {
-      const Acts::Transform3 localToGlobal{
-          localToGlobalTransform(gctx, *trackingGeometry, *bucket)};
       for (const MuonSpacePoint& h : *bucket) {
         if (!h.id().measuresEta()) {
+          const Acts::Surface* surface{
+              trackingGeometry->findSurface(h.geometryId())};
+          if (surface == nullptr) {
+            throw std::runtime_error(std::format(
+                "OnlyPhiHitsProvider: no surface for geometry id {}",
+                h.geometryId().value()));
+          }
           phiOnlyHits[group].emplace_back(
-              gctx, &h, bucket, localToGlobal,
-              trackingGeometry->findSurface(h.geometryId()));
+              gctx, &h, bucket, localToGlobalTransform(gctx, *surface, h),
+              surface);
         }
       }
     }

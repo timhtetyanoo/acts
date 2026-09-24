@@ -24,30 +24,30 @@
 
 namespace ActsExamples {
 
-/** @brief Output global pattern. Slim version of the Athena GlobalPattern: it refers to the
- *         space points in the event store instead of the hit payloads, which
- * only live during the execution of the algorithm. */
+/// @brief Result of the global pattern recognition: the space points forming one
+///        pattern, grouped by station, together with the pattern's direction,
+///        sector and quality estimates
 struct MuonGlobalPattern {
-  /** Hits of the pattern organized per station */
+  // Hits of the pattern organized per station
   std::array<std::vector<const MuonSpacePoint*>, PatternTopology::nGroups>
       hitsPerStation{};
-  /** average global theta of the pattern */
+  // average global theta of the pattern
   double theta{0.};
-  /** average global phi of the pattern */
+  // average global phi of the pattern
   double phi{0.};
-  /** Expanded sector of the pattern */
+  // Expanded sector of the pattern
   ExpandedSector::Index_t sector{0};
-  /** Number of precision layers */
+  // Number of precision layers
   unsigned nPrecisionLayers{0};
-  /** Number of trigger layers */
+  // Number of trigger layers
   unsigned nTriggerLayers{0};
-  /** Number of phi layers */
+  // Number of phi layers
   unsigned nPhiLayers{0};
-  /** Mean over eta hits of the square of their residual divided by acceptance
-   * window from pattern finding */
+  // Mean over eta hits of the square of their residual divided by acceptance
+  // window from pattern finding
   double meanNormResidual2{0.};
 };
-/** @brief Abrivation of the MuonGlobalPattern container type */
+/// @brief Abrivation of the MuonGlobalPattern container type
 using MuonGlobalPatternContainer = std::vector<MuonGlobalPattern>;
 
 /// @brief Algorithm performing global pattern recognition.
@@ -57,50 +57,50 @@ using MuonGlobalPatternContainer = std::vector<MuonGlobalPattern>;
 /// of precision and non-precision hits using space-points created in
 /// upstream algorithms. It first builds patterns in eta and then adds
 /// compatible phi-only hits to the patterns. The resulting patterns are
-/// written into store gate.
+/// written into the event store.
 class GlobalPatternFinderAlgorithm final : public IAlgorithm {
  public:
   struct Config {
-    /** @brief Keys of SpacePoint containers to read */
+    /// @brief Keys of SpacePoint containers to read
     std::string inSpacePoints{};
-    /** @brief Write handle key for the output global patterns */
+    /// @brief Write handle key for the output global patterns
     std::string outPatterns{};
-    /** @brief Tracking geometry holding the muon measurement surfaces */
+    /// @brief Tracking geometry holding the muon measurement surfaces
     std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
 
-    /** @brief Toggle the utilization of MDT hits to build patterns */
+    /// @brief Toggle the utilization of MDT hits to build patterns
     bool useMdtHits{true};
-    /** @brief Toggle the seeding from MDT hits */
+    /// @brief Toggle the seeding from MDT hits
     bool seedFromMdt{false};
-    /** @brief Activate the seeding from Inner station */
+    /// @brief Activate the seeding from Inner station
     bool seedFromInner{false};
-    /** @brief Size of theta window [rad] to search for compatible hits with a seed, tailored to the target pt cutoff */
+    /// @brief Size of theta window [rad] to search for compatible hits with a seed, tailored to the target pt cutoff
     double thetaSearchWindow{0.06};
-    /** @brief Number of standard deviations to consider for residual acceptance */
+    /// @brief Number of standard deviations to consider for residual acceptance
     double nResidualSigma{3.};
-    /** @brief Residual uncertainty to consider the hit as low confidence */
+    /// @brief Residual uncertainty to consider the hit as low confidence
     double lowConfidenceResSigma{50.0};
-    /** @brief Number of standard deviations to consider for phi compatibility veto. The residual will be used to determine the acceptance. */
+    /// @brief Number of standard deviations to consider for phi compatibility veto. The residual will be used to determine the acceptance.
     double nPhiSigma{5.};
-    /** @brief Requirement on trigger layers in the bending direction to accept a pattern  */
+    /// @brief Requirement on trigger layers in the bending direction to accept a pattern
     unsigned minTriggerLayers{2};
-    /** @brief Requirement on precision layers in the bending direction to accept a pattern  */
+    /// @brief Requirement on precision layers in the bending direction to accept a pattern
     unsigned minPrecisionLayers{8};
-    /** @brief Minimum number of phi layers required to accept a pattern */
+    /// @brief Minimum number of phi layers required to accept a pattern
     unsigned minPhiLayers{1};
-    /** @brief Minimum number of layers in a station to be considered a good station */
+    /// @brief Minimum number of layers in a station to be considered a good station
     unsigned minStationLayers{4};
-    /** @brief Quality cut on pattern'mean squared normalized residual. Set to a large value to disable the cut, e.g. 10. */
+    /// @brief Quality cut on pattern'mean squared normalized residual. Set to a large value to disable the cut, e.g. 10.
     double meanNormRes2Cut{3.5};
-    /** @brief Maximum number of attempts to build a pattern from hits already used in existing patterns */
+    /// @brief Maximum number of attempts to build a pattern from hits already used in existing patterns
     unsigned maxSeedAttempts{3};
-    /** @brief Maximum number of missed candidate hits in different measurement layers during pattern building allowed for a pattern branch before it is discarded */
+    /// @brief Maximum number of missed candidate hits in different measurement layers during pattern building allowed for a pattern branch before it is discarded
     unsigned maxMissLayersInStation{3};
-    /** @brief Minimum distance [mm] between two hits for being used to compute a reliable pattern line. Use the beamspot otherwise. */
+    /// @brief Minimum distance [mm] between two hits for being used to compute a reliable pattern line. Use the beamspot otherwise.
     double minHitDistance4Line{200};
-    /** @brief Beam spot radius */
+    /// @brief Beam spot radius
     double beamSpotRadius{30. * Acts::UnitConstants::cm};
-    /** @brief Beam spot length */
+    /// @brief Beam spot length
     double beamSpotLength{2. * Acts::UnitConstants::m};
   };
 
@@ -109,7 +109,7 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
 
   ProcessCode execute(const AlgorithmContext& ctx) const override;
 
-  /** @brief Const access to the config */
+  /// @brief Const access to the config
   const Config& config() const { return m_cfg; }
 
  private:
@@ -118,29 +118,29 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
   SearchTreeData constructTree(
       const Acts::GeometryContext& gctx,
       const MuonSpacePointContainer& spacepoints) const;
-  /** @brief Method to convert a PatternState into a GlobalPattern object
-   *  @param candidate: PatternState to be converted
-   *  @return: Converted GlobalPattern */
+  /// @brief Method to convert a PatternState into a GlobalPattern object
+  /// @param candidate: PatternState to be converted
+  /// @return: Converted GlobalPattern
   MuonGlobalPattern convertToPattern(const PatternResult& candidate) const;
-  /** @brief Method to convert a vector of PatternStates into GlobalPattern objects
-   *  @param candidates: PatternStates to be converted
-   *  @return: Vector of converted GlobalPatterns */
+  /// @brief Method to convert a vector of PatternStates into GlobalPattern objects
+  /// @param candidates: PatternStates to be converted
+  /// @return: Vector of converted GlobalPatterns
   MuonGlobalPatternContainer convertToPattern(
       const std::vector<PatternResult>& candidates) const;
 
   Config m_cfg;
 
-  /** @brief Keys of SpacePoint containers to read */
+  /// @brief Keys of SpacePoint containers to read
   ReadDataHandle<MuonSpacePointContainer> m_inSpacePoints{this,
                                                           "InSpacePoints"};
-  /** @brief Write handle key for the output global patterns */
+  /// @brief Write handle key for the output global patterns
   WriteDataHandle<MuonGlobalPatternContainer> m_outPatterns{this,
                                                             "OutPatterns"};
 
-  /** @brief Seed selector */
+  /// @brief Seed selector
   std::unique_ptr<SeedSelector> m_seedSelector{};
   OnlyPhiHitsProvider m_onlyPhiProvider{};
-  /** @brief Pointer to the actual global pattern finder */
+  /// @brief Pointer to the actual global pattern finder
   std::unique_ptr<GlobalPatternFinder_t> m_globPatFinder{};
 };
 

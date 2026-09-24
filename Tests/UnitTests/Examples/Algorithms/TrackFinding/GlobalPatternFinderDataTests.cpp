@@ -6,18 +6,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// @brief Local end-to-end check of the muon global pattern finder on
-///        Athena-exported input. It needs a space point n-tuple and the
-///        matching tracking geometry, which are not shipped with the
-///        repository, so the paths are taken from the environment and the test
-///        is skipped when they are unset or missing:
+/// @brief Local end-to-end check of the muon global pattern finder. It needs a
+///        space point n-tuple and the matching tracking geometry, which are not
+///        shipped with the repository, so both paths are taken from the
+///        environment and the test is skipped when they are unset or missing:
 ///
-///          ACTS_GPF_NTUPLE    path to the ROOT file holding the
-///          MuonSpacePoints tree ACTS_GPF_GEOMETRY  path to the matching
-///          ActsTrackingGeometry.json
+///          ACTS_GPF_NTUPLE    ROOT file holding the MuonSpacePoints tree
+///          ACTS_GPF_GEOMETRY  matching tracking geometry json file
 ///
-/// @note This file is a development aid and is not meant to be part of an upstream
-///       pull request: a unit test in Acts does not read external data files.
+/// @note This file is a development aid and is not meant to be part of an
+///       upstream pull request: a unit test does not read external data files.
 
 #include <boost/test/unit_test.hpp>
 
