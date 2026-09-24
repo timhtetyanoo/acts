@@ -204,14 +204,15 @@ Acts::Transform3 localToGlobalTransform(
     return Acts::Transform3::Identity();
   }
   /** The reader takes the bucket's transform from its first space point, so the
-   *  surface of that very space point has to be used to leave the sector frame */
+   *  surface of that very space point has to be used to leave the sector frame
+   */
   const MuonSpacePoint& refSp{bucket.front()};
   const Acts::Surface* refSurface{
       trackingGeometry.findSurface(refSp.geometryId())};
   if (refSurface == nullptr) {
-    throw std::runtime_error(
-        std::format("GlobalPatternFinderAlgorithm: no surface for geometry id {}",
-                    refSp.geometryId().value()));
+    throw std::runtime_error(std::format(
+        "GlobalPatternFinderAlgorithm: no surface for geometry id {}",
+        refSp.geometryId().value()));
   }
   return refSurface->localToGlobalTransform(gctx) *
          bucket.toSectorFrameTransform().inverse();

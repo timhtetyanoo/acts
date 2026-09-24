@@ -109,18 +109,19 @@ void addTrackFinding(py::module& mex) {
       inverseA, doSecondPhase, zRange, cotThetaRange, cotThetaMinBinSize,
       zMinBinSize);
 
-  ACTS_PYTHON_DECLARE_ALGORITHM(MuonHoughSeeder, mex, "MuonHoughSeeder",
-                                inTruthSegments, inSpacePoints, outHoughMax,
-                                nBinsTanTheta, nBinsY0, nBinsTanPhi, nBinsX0,
-                                dumpVisualization, extendWithPhi, visualizationFunction);
+  ACTS_PYTHON_DECLARE_ALGORITHM(
+      MuonHoughSeeder, mex, "MuonHoughSeeder", inTruthSegments, inSpacePoints,
+      outHoughMax, nBinsTanTheta, nBinsY0, nBinsTanPhi, nBinsX0,
+      dumpVisualization, extendWithPhi, visualizationFunction);
 
   ACTS_PYTHON_DECLARE_ALGORITHM(
       GlobalPatternFinderAlgorithm, mex, "GlobalPatternFinderAlgorithm",
-      inSpacePoints, outPatterns, trackingGeometry, useMdtHits, seedFromMdt, seedFromInner,
-      thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, nPhiSigma,
-      minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
-      meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
-      minHitDistance4Line, beamSpotRadius, beamSpotLength);
+      inSpacePoints, outPatterns, trackingGeometry, useMdtHits, seedFromMdt,
+      seedFromInner, thetaSearchWindow, nResidualSigma, lowConfidenceResSigma,
+      nPhiSigma, minTriggerLayers, minPrecisionLayers, minPhiLayers,
+      minStationLayers, meanNormRes2Cut, maxSeedAttempts,
+      maxMissLayersInStation, minHitDistance4Line, beamSpotRadius,
+      beamSpotLength);
 
   {
     using Alg = TrackParamsEstimationAlgorithm;

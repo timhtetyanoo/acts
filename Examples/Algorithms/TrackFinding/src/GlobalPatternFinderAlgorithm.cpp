@@ -15,9 +15,9 @@
 #include "Acts/Utilities/VectorHelpers.hpp"
 
 #include <algorithm>
-#include <format>
 #include <array>
 #include <cmath>
+#include <format>
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
@@ -73,27 +73,27 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
   ACTS_LOG_WITH_LOGGER(
       this->logger(), Acts::Logging::DEBUG,
       "Global Pattern Finder Configuration:\n"
-      << " Theta search window [rad]: " << m_cfg.thetaSearchWindow << "\n"
-      << " Number of residual standard deviations: " << m_cfg.nResidualSigma
-      << "\n"
-      << " Low confidence residual sigma [mm]: " << m_cfg.lowConfidenceResSigma
-      << "\n"
-      << " Max missed layer hits in station: " << m_cfg.maxMissLayersInStation
-      << "\n"
-      << " Min hit distance for line [mm]: " << m_cfg.minHitDistance4Line
-      << "\n"
-      << " Number of phi standard deviations: " << m_cfg.nPhiSigma << "\n"
-      << " Min trigger layers: " << m_cfg.minTriggerLayers << "\n"
-      << " Min precision layers: " << m_cfg.minPrecisionLayers << "\n"
-      << " Min phi layers: " << m_cfg.minPhiLayers << "\n"
-      << " Min station layers: " << m_cfg.minStationLayers << "\n"
-      << " Mean norm residual^2 cut: " << m_cfg.meanNormRes2Cut << "\n"
-      << " Seed from inner: " << m_cfg.seedFromInner << "\n"
-      << " Use MDT hits: " << m_cfg.useMdtHits << "\n"
-      << " Seed from MDT: " << m_cfg.seedFromMdt << "\n"
-      << " Max seed attempts: " << m_cfg.maxSeedAttempts << "\n"
-      << " Beam spot radius: " << m_cfg.beamSpotRadius << "\n"
-      << " Beam spot length: " << m_cfg.beamSpotLength << "\n");
+          << " Theta search window [rad]: " << m_cfg.thetaSearchWindow << "\n"
+          << " Number of residual standard deviations: " << m_cfg.nResidualSigma
+          << "\n"
+          << " Low confidence residual sigma [mm]: "
+          << m_cfg.lowConfidenceResSigma << "\n"
+          << " Max missed layer hits in station: "
+          << m_cfg.maxMissLayersInStation << "\n"
+          << " Min hit distance for line [mm]: " << m_cfg.minHitDistance4Line
+          << "\n"
+          << " Number of phi standard deviations: " << m_cfg.nPhiSigma << "\n"
+          << " Min trigger layers: " << m_cfg.minTriggerLayers << "\n"
+          << " Min precision layers: " << m_cfg.minPrecisionLayers << "\n"
+          << " Min phi layers: " << m_cfg.minPhiLayers << "\n"
+          << " Min station layers: " << m_cfg.minStationLayers << "\n"
+          << " Mean norm residual^2 cut: " << m_cfg.meanNormRes2Cut << "\n"
+          << " Seed from inner: " << m_cfg.seedFromInner << "\n"
+          << " Use MDT hits: " << m_cfg.useMdtHits << "\n"
+          << " Seed from MDT: " << m_cfg.seedFromMdt << "\n"
+          << " Max seed attempts: " << m_cfg.maxSeedAttempts << "\n"
+          << " Beam spot radius: " << m_cfg.beamSpotRadius << "\n"
+          << " Beam spot length: " << m_cfg.beamSpotLength << "\n");
 }
 
 ProcessCode GlobalPatternFinderAlgorithm::execute(

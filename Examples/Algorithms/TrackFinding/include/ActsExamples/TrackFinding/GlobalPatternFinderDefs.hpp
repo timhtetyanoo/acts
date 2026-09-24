@@ -11,8 +11,8 @@
 #include "Acts/Definitions/Algebra.hpp"
 #include "Acts/Geometry/GeometryContext.hpp"
 #include "Acts/Geometry/TrackingGeometry.hpp"
-#include "Acts/Surfaces/Surface.hpp"
 #include "Acts/Seeding/GlobalPatternFinder.hpp"
+#include "Acts/Surfaces/Surface.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 #include "Acts/Utilities/OstreamFormatter.hpp"
 #include "ActsExamples/EventData/MuonSpacePoint.hpp"
@@ -284,9 +284,10 @@ static_assert(Acts::Experimental::detail::OnlyPhiHitsProvider<
               GlobalPatternFinder_t::PatternState>);
 
 /** @brief Transformation from the bucket (sector) frame into the global frame.
- *         Replaces Athena's bucket->msSector()->localToGlobalTransform(gctx). The bucket
- *         carries the transform of its first space point's surface into the sector frame,
- *         so the global frame is reached as surfaceToGlobal * surfaceToSector^-1.
+ *         Replaces Athena's bucket->msSector()->localToGlobalTransform(gctx).
+ * The bucket carries the transform of its first space point's surface into the
+ * sector frame, so the global frame is reached as surfaceToGlobal *
+ * surfaceToSector^-1.
  *  @param gctx: Geometry context
  *  @param trackingGeometry: Geometry holding the measurement surfaces
  *  @param bucket: Non-empty space point bucket */
