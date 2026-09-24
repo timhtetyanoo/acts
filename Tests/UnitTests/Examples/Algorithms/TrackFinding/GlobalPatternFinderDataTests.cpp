@@ -74,15 +74,11 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
       geoConverter.fromFile(gctx, geometry)};
   BOOST_REQUIRE(trackingGeometry != nullptr);
 
-  ActsExamples::WhiteBoard eventStore{};
-  ActsExamples::AlgorithmContext ctx{0, 0, eventStore, 0};
-
   ActsExamples::RootMuonSpacePointReader::Config readerCfg{};
   readerCfg.filePath = ntuple.string();
   readerCfg.treeName = "MuonSpacePoints";
   readerCfg.outputSpacePoints = "MuonSpacePoints";
   ActsExamples::RootMuonSpacePointReader reader{readerCfg, Acts::Logging::INFO};
-  BOOST_REQUIRE(reader.read(ctx) == ActsExamples::ProcessCode::SUCCESS);
 
   ActsExamples::GlobalPatternFinderAlgorithm::Config finderCfg{};
   finderCfg.inSpacePoints = readerCfg.outputSpacePoints;
@@ -91,29 +87,54 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
   ActsExamples::GlobalPatternFinderAlgorithm finder{
       finderCfg, Acts::getDefaultLogger("GlobalPatternFinderAlgorithm",
                                         Acts::Logging::DEBUG)};
-  BOOST_REQUIRE(finder.execute(ctx) == ActsExamples::ProcessCode::SUCCESS);
 
   ActsExamples::ReadDataHandle<ActsExamples::MuonGlobalPatternContainer>
       patternHandle{&finder, "TestOutputPatterns"};
   patternHandle.initialize(finderCfg.outPatterns);
-  const ActsExamples::MuonGlobalPatternContainer& patterns{patternHandle(ctx)};
 
-  BOOST_TEST_MESSAGE("Found " << patterns.size() << " global patterns.");
-  for (const ActsExamples::MuonGlobalPattern& pattern : patterns) {
-    std::size_t nHits{0};
-    for (const auto& hits : pattern.hitsPerStation) {
-      nHits += hits.size();
+  const auto [firstEvent, lastEvent] = reader.availableEvents();
+  BOOST_REQUIRE_GT(lastEvent, firstEvent);
+  BOOST_TEST_MESSAGE("Reading the events [" << firstEvent << ", " << lastEvent
+                                            << ") from " << ntuple.string());
+
+  std::size_t totalPatterns{0};
+  std::size_t eventsWithPatterns{0};
+  for (std::size_t event = firstEvent; event < lastEvent; ++event) {
+    /// Each event starts from an empty store, as the sequencer would do
+    ActsExamples::WhiteBoard eventStore{};
+    ActsExamples::AlgorithmContext ctx{0, event, eventStore, 0};
+
+    BOOST_REQUIRE(reader.read(ctx) == ActsExamples::ProcessCode::SUCCESS);
+    BOOST_REQUIRE(finder.execute(ctx) == ActsExamples::ProcessCode::SUCCESS);
+
+    const ActsExamples::MuonGlobalPatternContainer& patterns{
+        patternHandle(ctx)};
+    totalPatterns += patterns.size();
+    eventsWithPatterns += (patterns.empty() ? 0u : 1u);
+
+    BOOST_TEST_MESSAGE("Event " << event << ": found " << patterns.size()
+                                << " global patterns.");
+    for (const ActsExamples::MuonGlobalPattern& pattern : patterns) {
+      std::size_t nHits{0};
+      for (const auto& hits : pattern.hitsPerStation) {
+        nHits += hits.size();
+      }
+      BOOST_TEST_MESSAGE(
+          "  Pattern in sector "
+          << static_cast<int>(pattern.sector) << ", theta: " << pattern.theta
+          << ", phi: " << pattern.phi << ", hits: " << nHits
+          << ", precision/trigger/phi layers: " << pattern.nPrecisionLayers
+          << "/" << pattern.nTriggerLayers << "/" << pattern.nPhiLayers);
+      /// Every pattern has to satisfy the cuts it was selected with
+      BOOST_CHECK_GE(pattern.nPrecisionLayers, finderCfg.minPrecisionLayers);
+      BOOST_CHECK_GT(nHits, 0u);
     }
-    BOOST_TEST_MESSAGE(
-        "Pattern in sector "
-        << static_cast<int>(pattern.sector) << ", theta: " << pattern.theta
-        << ", phi: " << pattern.phi << ", hits: " << nHits
-        << ", precision/trigger/phi layers: " << pattern.nPrecisionLayers << "/"
-        << pattern.nTriggerLayers << "/" << pattern.nPhiLayers);
-    /// Every pattern has to satisfy the cuts it was selected with
-    BOOST_CHECK_GE(pattern.nPrecisionLayers, finderCfg.minPrecisionLayers);
-    BOOST_CHECK_GT(nHits, 0u);
   }
+
+  BOOST_TEST_MESSAGE("Found " << totalPatterns << " patterns in "
+                              << eventsWithPatterns << " of "
+                              << (lastEvent - firstEvent) << " events.");
+  BOOST_CHECK_GT(totalPatterns, 0u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
