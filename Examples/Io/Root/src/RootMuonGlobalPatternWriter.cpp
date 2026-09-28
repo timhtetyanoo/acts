@@ -111,7 +111,7 @@ ProcessCode RootMuonGlobalPatternWriter::writeT(
       }
     }
 
-    m_sector.push_back(pattern.sector);
+    m_sector.push_back(static_cast<std::int16_t>(pattern.sector));
     m_theta.push_back(static_cast<float>(pattern.theta));
     m_phi.push_back(static_cast<float>(pattern.phi));
     m_nPrecisionLayers.push_back(

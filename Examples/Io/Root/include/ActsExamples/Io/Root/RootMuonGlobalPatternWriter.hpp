@@ -78,8 +78,10 @@ class RootMuonGlobalPatternWriter : public WriterT<MuonGlobalPatternContainer> {
   mutable std::mutex m_mutex{};
   /// @brief Event identifier.
   std::uint32_t m_eventId{0};
-  /// @brief Expanded sector the pattern was built in
-  std::vector<std::int8_t> m_sector{};
+  /// @brief Expanded sector the pattern was built in.
+  ///        Stored as int16_t so ROOT can write the branch without a custom
+  ///        dictionary (vector<int8_t> / vector<signed char> has none).
+  std::vector<std::int16_t> m_sector{};
   /// @brief Direction of the pattern
   std::vector<float> m_theta{};
   std::vector<float> m_phi{};
