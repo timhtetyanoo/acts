@@ -46,20 +46,26 @@ PatternState<Hit_t, Sector_t, Topology_t>::moveLineAnchorHit(
         return;
     }
     // Find first the closest group to the reference group among the pattern groups
+    // LayerIdx is unsigned; cast before subtracting so distance is signed and
+    // std::abs is unambiguous (uint32_t subtraction would wrap otherwise).
+    auto layerDist = [](typename Topology_t::LayerIdx a,
+                        typename Topology_t::LayerIdx b) {
+      return std::abs(static_cast<int>(a) - static_cast<int>(b));
+    };
     const auto& closestGroupIt = std::ranges::min_element(hitsPerGroup, std::ranges::less{},
-        [&refHit](const auto& hits){
+        [&refHit, &layerDist](const auto& hits){
             if (hits.empty() || 
                     Topology_t::groupIndex(*hits.front()) == Topology_t::groupIndex(*refHit)) {
                 return std::numeric_limits<int>::max();
             }
-            return std::abs(hits.front().globLayer - refHit.globLayer);
+            return layerDist(hits.front().globLayer, refHit.globLayer);
         });
 
     // Then find the closest hit in that group to the reference hit
     const auto& hits {*closestGroupIt};
     lineAnchorHit = *std::ranges::min_element(hits, std::ranges::less{},
-        [&refHit](const OrderedHit& hit){
-            return std::abs(hit.globLayer - refHit.globLayer); });
+        [&refHit, &layerDist](const OrderedHit& hit){
+            return layerDist(hit.globLayer, refHit.globLayer); });
 }
 
 template <GlobPatFinderHit Hit_t, 

@@ -256,7 +256,9 @@ void GlobalPatternFinder<Hit_t, Sector_t, Topology_t>::extendPatterns(
     // Compute the minimum number of missed layer hits among the active patterns, 
     // to use as reference for pruning patterns with too many missed layers. 
     auto missedLayers = [&testHit](const PatternState& pat) -> unsigned {
-        return std::abs(pat.lastInsertedHit.globLayer - testHit.globLayer);
+        return static_cast<unsigned>(
+            std::abs(static_cast<int>(pat.lastInsertedHit.globLayer) -
+                     static_cast<int>(testHit.globLayer)));
     };
 
     unsigned minMissedLayers {std::numeric_limits<unsigned>::max()};
@@ -441,8 +443,10 @@ GlobalPatternFinder<Hit_t, Sector_t, Topology_t>::isBetter(
     const double resDiff {
         std::abs(resA - resB) / std::max(resA, resB)
     };
-    const int nLayerDiff {a.nBendingLayers() - b.nBendingLayers()};
-    const int nPrecLayDiff {a.nPrecisionLayers - b.nPrecisionLayers};
+    const int nLayerDiff {static_cast<int>(a.nBendingLayers()) -
+                          static_cast<int>(b.nBendingLayers())};
+    const int nPrecLayDiff {static_cast<int>(a.nPrecisionLayers) -
+                            static_cast<int>(b.nPrecisionLayers)};
 
     /** For patterns that differ by 1–2 layers, don't sacrifice fit quality  
      *  unless the extra layers are genuinely comparable. For a ≥3-layer difference,  
