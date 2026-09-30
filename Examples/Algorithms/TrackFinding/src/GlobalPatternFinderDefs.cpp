@@ -195,6 +195,27 @@ Acts::Transform3 localToGlobalTransform(const Acts::GeometryContext& gctx,
          sp.toSectorTransform().inverse();
 }
 
+const Acts::Surface& measurementSurface(
+    const Acts::TrackingGeometry& trackingGeometry, const MuonSpacePoint& sp) {
+  const Acts::Surface* surface{trackingGeometry.findSurface(sp.geometryId())};
+  if (surface == nullptr) {
+    throw std::runtime_error(
+        std::format("measurementSurface() No surface for geometry id {}",
+                    sp.geometryId().value()));
+  }
+  return *surface;
+}
+
+Acts::Transform3 bucketToGlobalTransform(
+    const Acts::GeometryContext& gctx,
+    const Acts::TrackingGeometry& trackingGeometry,
+    const MuonSpacePointBucket& bucket) {
+  assert(!bucket.empty());
+  const MuonSpacePoint& first{bucket.front()};
+  return localToGlobalTransform(
+      gctx, measurementSurface(trackingGeometry, first), first);
+}
+
 ExpandedSector::ExpandedSector(const std::int8_t expSector)
     : m_sector{expSector} {}
 ExpandedSector::ExpandedSector(const unsigned msSector,
@@ -622,18 +643,14 @@ OnlyPhiHitsProvider::PhiHitsPerGroup OnlyPhiHitsProvider::getPhiOnlyHits(
       }
     }
     for (const MuonSpacePointBucket* bucket : parentBuckets) {
+      const Acts::Transform3 localToGlobal{
+          bucketToGlobalTransform(gctx, *trackingGeometry, *bucket)};
+
       for (const MuonSpacePoint& h : *bucket) {
         if (!h.id().measuresEta()) {
-          const Acts::Surface* surface{
-              trackingGeometry->findSurface(h.geometryId())};
-          if (surface == nullptr) {
-            throw std::runtime_error(std::format(
-                "OnlyPhiHitsProvider: no surface for geometry id {}",
-                h.geometryId().value()));
-          }
           phiOnlyHits[group].emplace_back(
-              gctx, &h, bucket, localToGlobalTransform(gctx, *surface, h),
-              surface);
+              gctx, &h, bucket, localToGlobal,
+              &measurementSurface(*trackingGeometry, h));
         }
       }
     }

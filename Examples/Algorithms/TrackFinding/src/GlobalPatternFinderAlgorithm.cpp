@@ -17,7 +17,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <format>
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
@@ -156,24 +155,18 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
     if (bucket.empty()) {
       continue;
     }
+    const Acts::Transform3 localToGlobal{
+        bucketToGlobalTransform(gctx, *m_cfg.trackingGeometry, bucket)};
+
     for (const MuonSpacePoint& hit : bucket) {
       // Ignore only-phi hits and MDT hits if desired
       if (!hit.id().measuresEta() || (!m_cfg.useMdtHits && hit.isStraw())) {
         continue;
       }
 
-      const Acts::Surface* surface{
-          m_cfg.trackingGeometry->findSurface(hit.geometryId())};
-      if (surface == nullptr) {
-        throw std::runtime_error(std::format(
-            "GlobalPatternFinderAlgorithm: no surface for geometry id {}",
-            hit.geometryId().value()));
-      }
-      // Every space point carries the transform of its own surface into the
-      //  sector frame, so the global frame is reached hit by hit
-      hitPayloads.emplace_back(gctx, &hit, &bucket,
-                               localToGlobalTransform(gctx, *surface, hit),
-                               surface);
+      const Acts::Surface& surface{
+          measurementSurface(*m_cfg.trackingGeometry, hit)};
+      hitPayloads.emplace_back(gctx, &hit, &bucket, localToGlobal, &surface);
 
       if (logger().doPrint(Acts::Logging::VERBOSE)) {
         const HitPayload& newHit{hitPayloads.back()};

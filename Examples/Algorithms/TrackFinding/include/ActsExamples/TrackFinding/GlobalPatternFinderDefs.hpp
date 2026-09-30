@@ -35,8 +35,8 @@ namespace ActsExamples {
 ///         The regular msSector is multiplied by 2 and then the sectorProjector
 /// is added which can be either -1 to indicate that the overlap between the
 /// current sector and the left sector is of interest, or 0 to indicate that the
-/// sector center is of interest and finally 1 to indicate that the sector to the
-/// right is of interest.
+/// sector center is of interest and finally 1 to indicate that the sector to
+/// the right is of interest.
 /// /
 class ExpandedSector {
  public:
@@ -194,7 +194,8 @@ struct HitPayload {
   /// @brief Pointer to the parent bucket
   const MuonSpacePointBucket* bucket{nullptr};
   /// @brief Surface the measurement was recorded on. It defines the local axes
-  ///         of the hit, i.e. the measuring, the sensor and the normal direction
+  ///         of the hit, i.e. the measuring, the sensor and the normal
+  ///         direction
   const Acts::Surface* surface{nullptr};
   /// @brief Cached angular covariance [rad^2] of the hit in the phi angle
   double phiCov{0.};
@@ -283,15 +284,34 @@ static_assert(Acts::Experimental::detail::OnlyPhiHitsProvider<
               GlobalPatternFinder_t::PatternState>);
 
 /// @brief Transformation from the sector frame, in which the space points are
-///        expressed, into the global frame. The space point carries the transform
-///        of its own measurement surface into the sector frame, hence the global
-///        frame is reached as surfaceToGlobal * surfaceToSector^-1.
+///        expressed, into the global frame. The space point carries the
+///        transform of its own measurement surface into the sector frame, hence
+///        the global frame is reached as surfaceToGlobal * surfaceToSector^-1.
 /// @param gctx: Geometry context
 /// @param surface: Measurement surface of the space point
 /// @param sp: Space point of interest
 Acts::Transform3 localToGlobalTransform(const Acts::GeometryContext& gctx,
                                         const Acts::Surface& surface,
                                         const MuonSpacePoint& sp);
+
+/// @brief Measurement surface of a space point, looked up by its geometry
+///        identifier. The surface defines the local axes of the hit
+/// @param trackingGeometry: Geometry holding the muon measurement surfaces
+/// @param sp: Space point of interest
+const Acts::Surface& measurementSurface(
+    const Acts::TrackingGeometry& trackingGeometry, const MuonSpacePoint& sp);
+
+/// @brief Transformation from the sector frame of a bucket into the global frame.
+///        The space points of a bucket are all expressed in the frame of the
+///        sector of the first one, hence the transform is determined once per
+///        bucket and shared by its hits.
+/// @param gctx: Geometry context
+/// @param trackingGeometry: Geometry holding the muon measurement surfaces
+/// @param bucket: Bucket of interest, which must not be empty
+Acts::Transform3 bucketToGlobalTransform(
+    const Acts::GeometryContext& gctx,
+    const Acts::TrackingGeometry& trackingGeometry,
+    const MuonSpacePointBucket& bucket);
 
 }  // namespace ActsExamples
 
