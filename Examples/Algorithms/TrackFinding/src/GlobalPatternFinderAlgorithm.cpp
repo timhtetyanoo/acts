@@ -289,8 +289,8 @@ Acts::Vector3 ExpandedSector::normalDir() const {
   return Acts::makeDirectionFromPhiTheta(phi() + 90._degree, 90._degree);
 }
 bool ExpandedSector::isNeighbour(const ExpandedSector& other) const {
-  const int dS = (other.sector() - sector()) % nExpanded;
-  return std::abs(dS) <= 1;
+  const int dS = std::abs(other.sector() - sector());
+  return std::min(dS, nExpanded - dS) <= 1;
 }
 bool ExpandedSector::insideSector(const double phi) const {
   if (sectorMap::insideSector(msSector(), phi) &&

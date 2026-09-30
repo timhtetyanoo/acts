@@ -101,6 +101,15 @@ BOOST_AUTO_TEST_CASE(expanded_sector) {
       ExpandedSector{static_cast<ExpandedSector::Index_t>(3)}));
   BOOST_CHECK(!centreOfOne.isNeighbour(centreOfThree));
 
+  /// The expanded-sector index wraps at nExpanded (= 32). Sectors 0 and 31
+  /// meet at the MS boundary and must count as neighbours.
+  const ExpandedSector wrapLo{static_cast<ExpandedSector::Index_t>(0)};
+  const ExpandedSector wrapHi{static_cast<ExpandedSector::Index_t>(31)};
+  BOOST_CHECK(wrapLo.isNeighbour(wrapHi));
+  BOOST_CHECK(wrapHi.isNeighbour(wrapLo));
+  BOOST_CHECK(!wrapLo.isNeighbour(
+      ExpandedSector{static_cast<ExpandedSector::Index_t>(2)}));
+
   /// The overlap between two sectors is expressed as the right overlap of the
   /// lower one, which is why the left overlap maps onto the sector below
   const ExpandedSector leftOfTwo{2u, SectorProjector::leftOverlap};
