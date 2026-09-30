@@ -218,6 +218,10 @@ struct HitPayload {
   bool nonOrthogonalStrips{false};
   /// @brief Equal operator: it compares the underlying hit
   bool operator==(const HitPayload& other) const;
+  /// @brief Returns whether the two hits stem from the same measurement, which
+  ///         is weaker than the equal operator: one measurement is held by
+  ///         several space points
+  bool overlaps(const HitPayload& other) const;
 };
 static_assert(Acts::Experimental::detail::GlobPatFinderHit<HitPayload>);
 

@@ -545,6 +545,15 @@ double HitPayload::phiVariance(const Acts::GeometryContext& /*gctx*/) const {
 bool HitPayload::operator==(const HitPayload& other) const {
   return spacePoint() == other.spacePoint();
 }
+bool HitPayload::overlaps(const HitPayload& other) const {
+  // A measurement enters a space point for every non-precision hit it was
+  // combined with and for every bucket it was sorted into. Those space points
+  // share the surface and the precision coordinate and differ only along the
+  // sensor, where the non-precision hit placed them
+  return spacePoint()->geometryId() == other.spacePoint()->geometryId() &&
+         std::abs(spacePoint()->localPosition().y() -
+                  other.spacePoint()->localPosition().y()) < Acts::s_epsilon;
+}
 
 bool PatternTopology::layerSorter(const HitPayload& hit1,
                                   const HitPayload& hit2) {
