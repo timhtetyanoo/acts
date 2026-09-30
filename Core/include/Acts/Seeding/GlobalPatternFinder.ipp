@@ -145,7 +145,7 @@ GlobalPatternFinder<Hit_t, Sector_t, Topology_t>::findPatternsInEta(
             return Topology_t::layerSorter(*c1, *c2);
         });
         /** Assign global layer number. This will avoid re-computing it many times later */
-        for (std::size_t i = 1; i < OrderedHits.size(); ++i) {
+        for (typename Topology_t::LayerIdx i = 1; i < OrderedHits.size(); ++i) {
             OrderedHits[i].globLayer = OrderedHits[i - 1].globLayer + 
                 !Topology_t::sameLayer(*OrderedHits[i - 1], *OrderedHits[i]);
         }

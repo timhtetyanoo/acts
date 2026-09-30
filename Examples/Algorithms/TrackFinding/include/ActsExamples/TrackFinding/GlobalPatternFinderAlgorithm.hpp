@@ -223,8 +223,10 @@ static_assert(Acts::Experimental::detail::GlobPatFinderHit<HitPayload>);
 
 class PatternTopology {
  public:
-  /// @brief Type of the index of the station layer
-  using LayerIdx = std::uint8_t;
+  /// @brief Type of the index of the station layer. The pattern finder also
+  ///         counts the candidate hits of a seed with it, of which there are
+  ///         far more than there are layers, hence the wider type
+  using LayerIdx = std::uint32_t;
   /// @brief Type of the index of the group
   using GroupIdx = std::uint8_t;
   /// @brief Number of groups in a pattern
