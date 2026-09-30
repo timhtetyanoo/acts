@@ -15,7 +15,7 @@
 #include "Acts/Surfaces/RectangleBounds.hpp"
 #include "Acts/Utilities/Helpers.hpp"
 #include "ActsExamples/EventData/MuonSpacePoint.hpp"
-#include "ActsExamples/TrackFinding/GlobalPatternFinderDefs.hpp"
+#include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
 
 #include <cstdint>
 #include <memory>
