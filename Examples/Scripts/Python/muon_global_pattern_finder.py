@@ -16,6 +16,10 @@ def runGlobalPatternFinder(
     nEvents: int,
     logLevel: acts.logging.Level,
     outFile: str = "",
+    numThreads: int = 1,
+    skip: int = 0,
+    timingDir: str = "",
+    timingFile: str = "timing.csv",
 ):
     # The muon space points are stored in the frame of their spectrometer sector.
     # Reaching the global frame needs the measurement surfaces, which are read
@@ -26,7 +30,20 @@ def runGlobalPatternFinder(
     # The sequencer drives the event loop: for every event it calls each
     # reader, then each algorithm, in the order they were added. Data is
     # passed between them through the event store under string keys.
-    s = acts.examples.Sequencer(events=nEvents, numThreads=1, logLevel=logLevel)
+    #
+    # It writes the per algorithm wall time to timingFile on its own. That
+    # measurement only means anything on a single thread, which is why one
+    # thread is the default: more of them measure the throughput of the machine
+    # instead of the cost of the algorithm. Events then also finish out of
+    # order, so the entries of the pattern file are no longer in event order.
+    s = acts.examples.Sequencer(
+        events=nEvents if nEvents > 0 else None,
+        skip=skip,
+        numThreads=numThreads,
+        outputDir=timingDir,
+        outputTimingFile=timingFile,
+        logLevel=logLevel,
+    )
 
     # Reads the space points and writes them into the event store as a
     # MuonSpacePointContainer under the key given by outputSpacePoints. The tree
@@ -86,7 +103,26 @@ if "__main__" == __name__:
         default="",
         help="Path of the ROOT file the found patterns are written to",
     )
-    p.add_argument("--nEvents", default=100, type=int, help="Number of events to run")
+    p.add_argument(
+        "--nEvents", default=100, type=int,
+        help="Number of events to run, 0 for all of them",
+    )
+    p.add_argument(
+        "--threads", default=1, type=int,
+        help="Parallel threads, -1 for one per core. Leave at 1 to time the "
+             "algorithm rather than the machine",
+    )
+    p.add_argument(
+        "--skip", default=0, type=int, help="Events to skip before the first one"
+    )
+    p.add_argument(
+        "--timingDir", default="",
+        help="Directory of the timing file, empty for the working directory",
+    )
+    p.add_argument(
+        "--timingFile", default="timing.csv",
+        help="Name of the file the per algorithm wall time is written to",
+    )
     p.add_argument(
         "--logLevel",
         default="INFO",
@@ -101,4 +137,8 @@ if "__main__" == __name__:
         nEvents=args.nEvents,
         logLevel=getattr(acts.logging, args.logLevel),
         outFile=args.output,
+        numThreads=args.threads,
+        skip=args.skip,
+        timingDir=args.timingDir,
+        timingFile=args.timingFile,
     )
