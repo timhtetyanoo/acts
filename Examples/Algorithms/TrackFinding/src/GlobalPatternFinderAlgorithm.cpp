@@ -24,7 +24,6 @@
 #include <cstdlib>
 #include <format>
 #include <iterator>
-#include <map>
 #include <numbers>
 #include <sstream>
 #include <stdexcept>
@@ -796,18 +795,6 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
   }
   hitPayloads.reserve(totalHits);
 
-  // A space point in the overlap of two buckets is stored in both of them. The
-  // copies are mapped onto the first one, so that the payloads built from them
-  // share a pointer and compare equal
-  using MeasurementKey = std::tuple<std::uint64_t, double, double, double>;
-  std::map<MeasurementKey, const MuonSpacePoint*> firstCopy{};
-  auto canonical = [&firstCopy](const MuonSpacePoint& sp) {
-    const Acts::Vector3& pos{sp.localPosition()};
-    const MeasurementKey key{sp.geometryId().value(), pos.x(), pos.y(),
-                             pos.z()};
-    return firstCopy.try_emplace(key, &sp).first->second;
-  };
-
   for (const MuonSpacePointBucket& bucket : spacepoints) {
     if (bucket.empty()) {
       continue;
@@ -823,8 +810,7 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
 
       const Acts::Surface& surface{
           measurementSurface(*m_cfg.trackingGeometry, hit)};
-      hitPayloads.emplace_back(gctx, canonical(hit), &bucket, localToGlobal,
-                               &surface);
+      hitPayloads.emplace_back(gctx, &hit, &bucket, localToGlobal, &surface);
 
       if (logger().doPrint(Acts::Logging::VERBOSE)) {
         const HitPayload& newHit{hitPayloads.back()};
