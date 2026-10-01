@@ -14,6 +14,7 @@
 ///          ACTS_GPF_NTUPLE      space point n-tuple
 ///          ACTS_GPF_GEOMETRY    tracking geometry json
 ///          ACTS_GPF_OUTPUT      pattern output file, optional
+///          ACTS_GPF_TIMING      per event timing csv, optional
 ///          ACTS_GPF_MAX_EVENTS  event cap, optional
 ///
 /// @note This file is a development aid and is not meant to be part of an
@@ -32,7 +33,9 @@
 #include "ActsPlugins/Json/TrackingGeometryJsonConverter.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -113,6 +116,21 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
       patternHandle{&finder, "TestOutputPatterns"};
   patternHandle.initialize(finderCfg.outPatterns);
 
+  /// The wall time of the pattern finding, one row per event. The reader and
+  ///  the writer are separate calls, so the measurement covers the algorithm
+  ///  alone. `steady_clock` is monotonic, so a change of the system time leaves
+  ///  the durations intact. The hit counts belong on the row because they tell
+  ///  a busier event apart from a slower one.
+  ActsExamples::ReadDataHandle<ActsExamples::MuonSpacePointContainer>
+      spacePointHandle{&finder, "TestInputSpacePoints"};
+  spacePointHandle.initialize(readerCfg.outputSpacePoints);
+  std::ofstream timingFile{};
+  if (const std::string timingPath{stringFromEnv("ACTS_GPF_TIMING")};
+      !timingPath.empty()) {
+    timingFile.open(timingPath);
+    timingFile << "event,nSpacePoints,nBuckets,nPatterns,execute_us\n";
+  }
+
   /// The patterns are written out for the offline validation, if asked for
   std::unique_ptr<ActsExamples::RootMuonGlobalPatternWriter> writer{};
   const std::string outFile{stringFromEnv("ACTS_GPF_OUTPUT")};
@@ -142,12 +160,29 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
     ActsExamples::AlgorithmContext ctx{0, event, eventStore, 0};
 
     BOOST_REQUIRE(reader.read(ctx) == ActsExamples::ProcessCode::SUCCESS);
+
+    const auto startedAt = std::chrono::steady_clock::now();
     BOOST_REQUIRE(finder.execute(ctx) == ActsExamples::ProcessCode::SUCCESS);
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
 
     const ActsExamples::MuonGlobalPatternContainer& patterns{
         patternHandle(ctx)};
     if (writer) {
       BOOST_REQUIRE(writer->write(ctx) == ActsExamples::ProcessCode::SUCCESS);
+    }
+    if (timingFile.is_open()) {
+      const ActsExamples::MuonSpacePointContainer& spacePoints{
+          spacePointHandle(ctx)};
+      std::size_t nSpacePoints{0};
+      for (const ActsExamples::MuonSpacePointBucket& bucket : spacePoints) {
+        nSpacePoints += bucket.size();
+      }
+      timingFile
+          << event << ',' << nSpacePoints << ',' << spacePoints.size() << ','
+          << patterns.size() << ','
+          << std::chrono::duration_cast<std::chrono::microseconds>(elapsed)
+                 .count()
+          << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);
