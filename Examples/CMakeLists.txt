@@ -7,3 +7,7 @@ add_subdirectory_if(
     CudaMuonSegmentFitting
     ACTS_BUILD_EXAMPLES_CUDA_MUON_SEGMENT_FITTING
 )
+add_subdirectory_if(
+    CudaGlobalPatternFinder
+    ACTS_BUILD_EXAMPLES_CUDA_GLOBAL_PATTERN_FINDER
+)

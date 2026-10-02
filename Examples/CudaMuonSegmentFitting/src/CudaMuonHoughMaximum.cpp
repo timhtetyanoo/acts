@@ -14,7 +14,7 @@
 
 #include <cuda_runtime_api.h>
 
-#include "CudaUtilities.hpp"
+#include "ActsExamples/Utilities/CudaUtilities.hpp"
 
 namespace ActsExamples {
 

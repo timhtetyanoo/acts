@@ -13,7 +13,7 @@
 
 #include <cuda_runtime.h>
 
-#include "CudaUtilities.hpp"
+#include "ActsExamples/Utilities/CudaUtilities.hpp"
 
 namespace {
 

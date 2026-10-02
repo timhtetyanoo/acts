@@ -1,0 +1,2 @@
+set(unittest_extra_libraries ActsExamplesCudaGlobalPatternFinder)
+add_unittest(CudaHitPayload CudaHitPayloadTests.cpp)
