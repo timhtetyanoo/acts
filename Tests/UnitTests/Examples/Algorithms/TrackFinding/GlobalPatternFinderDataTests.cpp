@@ -128,7 +128,7 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
   if (const std::string timingPath{stringFromEnv("ACTS_GPF_TIMING")};
       !timingPath.empty()) {
     timingFile.open(timingPath);
-    timingFile << "event,nSpacePoints,nBuckets,nPatterns,execute_us\n";
+    timingFile << "event,nSpacePoints,nBuckets,nPatterns,totalTime_us\n";
   }
 
   /// The patterns are written out for the offline validation, if asked for
