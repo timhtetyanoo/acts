@@ -1,2 +1,6 @@
-set(unittest_extra_libraries ActsExamplesCudaGlobalPatternFinder)
-add_unittest(CudaHitPayload CudaHitPayloadTests.cpp)
+set(
+    unittest_extra_libraries
+    ActsExamplesCudaGlobalPatternFinder
+    ActsExamplesTrackFinding
+)
+add_unittest(CudaPatternFinderData CudaPatternFinderDataTests.cpp)

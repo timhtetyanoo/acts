@@ -1,6 +1,6 @@
 acts_add_library(
     ExamplesCudaGlobalPatternFinder
-    src/CudaHitPayload.cpp
+    src/CudaPatternFinderData.cpp
     ACTS_INCLUDE_FOLDER include/ActsExamples
 )
 
