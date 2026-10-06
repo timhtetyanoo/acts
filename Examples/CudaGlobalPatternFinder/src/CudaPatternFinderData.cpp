@@ -63,6 +63,57 @@ constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.candidateIndices, device.candidateIndices);
 };
 
+constexpr auto patternHeaderColumns = [](auto& host, auto& device,
+                                         auto&& visit) {
+  visit(host.seedIndex, device.seedIndex);
+  visit(host.sector, device.sector);
+
+  visit(host.patPhi, device.patPhi);
+  visit(host.patTheta, device.patTheta);
+  visit(host.patPhiCov, device.patPhiCov);
+
+  visit(host.meanNormResidual2, device.meanNormResidual2);
+  visit(host.lastResidual, device.lastResidual);
+  visit(host.lastResSigma, device.lastResSigma);
+
+  visit(host.linePosX, device.linePosX);
+  visit(host.linePosY, device.linePosY);
+  visit(host.linePosZ, device.linePosZ);
+
+  visit(host.lineDirX, device.lineDirX);
+  visit(host.lineDirY, device.lineDirY);
+  visit(host.lineDirZ, device.lineDirZ);
+
+  visit(host.leverArm, device.leverArm);
+
+  visit(host.bendPlaneNormX, device.bendPlaneNormX);
+  visit(host.bendPlaneNormY, device.bendPlaneNormY);
+  visit(host.bendPlaneNormZ, device.bendPlaneNormZ);
+
+  visit(host.nPrecisionLayers, device.nPrecisionLayers);
+  visit(host.nTriggerLayers, device.nTriggerLayers);
+  visit(host.nPhiLayers, device.nPhiLayers);
+
+  visit(host.nHits, device.nHits);
+
+  visit(host.lastInsertedHit, device.lastInsertedHit);
+  visit(host.prevLayerHit, device.prevLayerHit);
+  visit(host.lineAnchorHit, device.lineAnchorHit);
+
+  visit(host.flags, device.flags);
+  visit(host.status, device.status);
+};
+
+constexpr auto patternHitColumns = [](auto& host, auto& device, auto&& visit) {
+  visit(host.hitIndex, device.hitIndex);
+  visit(host.globLayer, device.globLayer);
+};
+
+constexpr auto patternColumns = [](auto& host, auto& device, auto&& visit) {
+  patternHeaderColumns(host, device, visit);
+  patternHitColumns(host, device, visit);
+};
+
 /// The column functions of CudaUtilities.hpp applied to every column of a
 /// list
 template <typename Columns, typename Host, typename Device>
@@ -436,6 +487,244 @@ void CudaCandidateListContainer::checkCandidate(size_type index) const {
     std::stringstream ss;
     ss << "CudaCandidateListContainer: candidate " << index
        << " is out of range for " << nCandidates() << " candidates";
+    throw std::out_of_range(ss.str());
+  }
+}
+
+CudaPatternRecordContainer::CudaPatternRecordContainer(
+    size_type nPatterns, size_type maxHitsPerPattern)
+    : m_nPatterns{nPatterns}, m_maxHitsPerPattern{maxHitsPerPattern} {
+  const size_type nHitSlots{nPatterns * maxHitsPerPattern};
+
+  patternHeaderColumns(m_host, m_device,
+                       [nPatterns](auto& hostColumn, auto& /*deviceColumn*/) {
+                         hostColumn.resize(nPatterns);
+                       });
+  patternHitColumns(m_host, m_device,
+                    [nHitSlots](auto& hostColumn, auto& /*deviceColumn*/) {
+                      hostColumn.resize(nHitSlots);
+                    });
+
+  m_host.lastInsertedHit.assign(nPatterns, cudaInvalidHitIndex);
+  m_host.prevLayerHit.assign(nPatterns, cudaInvalidHitIndex);
+  m_host.lineAnchorHit.assign(nPatterns, cudaInvalidHitIndex);
+}
+
+CudaPatternRecordContainer::CudaPatternRecordContainer(
+    CudaPatternRecordContainer&& other) noexcept
+    : m_nPatterns{std::exchange(other.m_nPatterns, 0)},
+      m_maxHitsPerPattern{std::exchange(other.m_maxHitsPerPattern, 0)},
+      m_host{std::move(other.m_host)},
+      m_device{std::exchange(other.m_device, {})},
+      m_onDevice{std::exchange(other.m_onDevice, false)} {}
+
+CudaPatternRecordContainer& CudaPatternRecordContainer::operator=(
+    CudaPatternRecordContainer&& other) noexcept {
+  if (this != &other) {
+    clearDevice();
+
+    m_nPatterns = std::exchange(other.m_nPatterns, 0);
+    m_maxHitsPerPattern = std::exchange(other.m_maxHitsPerPattern, 0);
+    m_host = std::move(other.m_host);
+    m_device = std::exchange(other.m_device, {});
+    m_onDevice = std::exchange(other.m_onDevice, false);
+  }
+
+  return *this;
+}
+
+CudaPatternRecordContainer::~CudaPatternRecordContainer() noexcept {
+  clearDevice();
+}
+
+void CudaPatternRecordContainer::setPattern(size_type pattern,
+                                            const CudaPatternRecordRow& row) {
+  checkPattern(pattern);
+  if (row.nHits > m_maxHitsPerPattern) {
+    std::stringstream ss;
+    ss << "CudaPatternRecordContainer: nHits " << row.nHits
+       << " exceeds maxHitsPerPattern " << m_maxHitsPerPattern;
+    throw std::out_of_range(ss.str());
+  }
+
+  m_host.seedIndex[pattern] = row.seedIndex;
+  m_host.sector[pattern] = row.sector;
+
+  m_host.patPhi[pattern] = row.patPhi;
+  m_host.patTheta[pattern] = row.patTheta;
+  m_host.patPhiCov[pattern] = row.patPhiCov;
+
+  m_host.meanNormResidual2[pattern] = row.meanNormResidual2;
+  m_host.lastResidual[pattern] = row.lastResidual;
+  m_host.lastResSigma[pattern] = row.lastResSigma;
+
+  m_host.linePosX[pattern] = row.linePos.x();
+  m_host.linePosY[pattern] = row.linePos.y();
+  m_host.linePosZ[pattern] = row.linePos.z();
+
+  m_host.lineDirX[pattern] = row.lineDir.x();
+  m_host.lineDirY[pattern] = row.lineDir.y();
+  m_host.lineDirZ[pattern] = row.lineDir.z();
+
+  m_host.leverArm[pattern] = row.leverArm;
+
+  m_host.bendPlaneNormX[pattern] = row.bendPlaneNorm.x();
+  m_host.bendPlaneNormY[pattern] = row.bendPlaneNorm.y();
+  m_host.bendPlaneNormZ[pattern] = row.bendPlaneNorm.z();
+
+  m_host.nPrecisionLayers[pattern] = row.nPrecisionLayers;
+  m_host.nTriggerLayers[pattern] = row.nTriggerLayers;
+  m_host.nPhiLayers[pattern] = row.nPhiLayers;
+
+  m_host.nHits[pattern] = row.nHits;
+
+  m_host.lastInsertedHit[pattern] = row.lastInsertedHit;
+  m_host.prevLayerHit[pattern] = row.prevLayerHit;
+  m_host.lineAnchorHit[pattern] = row.lineAnchorHit;
+
+  m_host.flags[pattern] = row.flags;
+  m_host.status[pattern] = row.status;
+}
+
+CudaPatternRecordRow CudaPatternRecordContainer::pattern(
+    size_type pattern) const {
+  checkPattern(pattern);
+
+  CudaPatternRecordRow row{};
+  row.seedIndex = m_host.seedIndex[pattern];
+  row.sector = m_host.sector[pattern];
+
+  row.patPhi = m_host.patPhi[pattern];
+  row.patTheta = m_host.patTheta[pattern];
+  row.patPhiCov = m_host.patPhiCov[pattern];
+
+  row.meanNormResidual2 = m_host.meanNormResidual2[pattern];
+  row.lastResidual = m_host.lastResidual[pattern];
+  row.lastResSigma = m_host.lastResSigma[pattern];
+
+  row.linePos = {m_host.linePosX[pattern], m_host.linePosY[pattern],
+                 m_host.linePosZ[pattern]};
+  row.lineDir = {m_host.lineDirX[pattern], m_host.lineDirY[pattern],
+                 m_host.lineDirZ[pattern]};
+  row.leverArm = m_host.leverArm[pattern];
+  row.bendPlaneNorm = {m_host.bendPlaneNormX[pattern],
+                       m_host.bendPlaneNormY[pattern],
+                       m_host.bendPlaneNormZ[pattern]};
+
+  row.nPrecisionLayers = m_host.nPrecisionLayers[pattern];
+  row.nTriggerLayers = m_host.nTriggerLayers[pattern];
+  row.nPhiLayers = m_host.nPhiLayers[pattern];
+
+  row.nHits = m_host.nHits[pattern];
+
+  row.lastInsertedHit = m_host.lastInsertedHit[pattern];
+  row.prevLayerHit = m_host.prevLayerHit[pattern];
+  row.lineAnchorHit = m_host.lineAnchorHit[pattern];
+
+  row.flags = m_host.flags[pattern];
+  row.status = m_host.status[pattern];
+
+  return row;
+}
+
+void CudaPatternRecordContainer::setHit(size_type pattern, size_type local,
+                                        std::uint32_t hitIndex,
+                                        std::uint32_t globLayer) {
+  const size_type slot{hitSlot(pattern, local)};
+
+  m_host.hitIndex[slot] = hitIndex;
+  m_host.globLayer[slot] = globLayer;
+}
+
+void CudaPatternRecordContainer::setNHits(size_type pattern,
+                                          std::uint32_t nHits) {
+  checkPattern(pattern);
+  if (nHits > m_maxHitsPerPattern) {
+    std::stringstream ss;
+    ss << "CudaPatternRecordContainer: nHits " << nHits
+       << " exceeds maxHitsPerPattern " << m_maxHitsPerPattern;
+    throw std::out_of_range(ss.str());
+  }
+
+  m_host.nHits[pattern] = nHits;
+}
+
+std::uint32_t CudaPatternRecordContainer::nHits(size_type pattern) const {
+  checkPattern(pattern);
+
+  return m_host.nHits[pattern];
+}
+
+std::uint32_t CudaPatternRecordContainer::hitIndex(size_type pattern,
+                                                   size_type local) const {
+  return m_host.hitIndex[hitSlot(pattern, local)];
+}
+
+std::uint32_t CudaPatternRecordContainer::globLayer(size_type pattern,
+                                                    size_type local) const {
+  return m_host.globLayer[hitSlot(pattern, local)];
+}
+
+std::span<const std::uint32_t> CudaPatternRecordContainer::hitIndices(
+    size_type pattern) const {
+  const std::uint32_t used{nHits(pattern)};
+  if (used == 0u) {
+    return {};
+  }
+
+  const size_type slot{hitSlot(pattern, 0)};
+  return std::span<const std::uint32_t>{m_host.hitIndex.data() + slot, used};
+}
+
+void CudaPatternRecordContainer::moveToDevice(cudaStream_t stream) {
+  clearDevice();
+
+  allocateColumns(patternColumns, m_host, m_device);
+  copyColumnsToDevice(patternColumns, m_host, m_device, stream);
+
+  m_device.nPatterns = static_cast<std::uint32_t>(m_nPatterns);
+  m_device.maxHitsPerPattern = static_cast<std::uint32_t>(m_maxHitsPerPattern);
+  m_onDevice = true;
+}
+
+void CudaPatternRecordContainer::moveToHost(cudaStream_t stream) {
+  if (!m_onDevice) {
+    return;
+  }
+
+  copyColumnsToHost(patternColumns, m_host, m_device, stream);
+}
+
+void CudaPatternRecordContainer::clearDevice() noexcept {
+  freeColumns(patternColumns, m_host, m_device);
+
+  m_device = {};
+  m_onDevice = false;
+}
+
+CudaPatternRecordContainer::size_type CudaPatternRecordContainer::hitSlot(
+    size_type pattern, size_type local) const {
+  checkHit(pattern, local);
+
+  return pattern * m_maxHitsPerPattern + local;
+}
+
+void CudaPatternRecordContainer::checkPattern(size_type pattern) const {
+  if (pattern >= m_nPatterns) {
+    std::stringstream ss;
+    ss << "CudaPatternRecordContainer: pattern " << pattern
+       << " is out of range for " << m_nPatterns << " patterns";
+    throw std::out_of_range(ss.str());
+  }
+}
+
+void CudaPatternRecordContainer::checkHit(size_type pattern,
+                                          size_type local) const {
+  checkPattern(pattern);
+  if (local >= m_maxHitsPerPattern) {
+    std::stringstream ss;
+    ss << "CudaPatternRecordContainer: hit slot " << local
+       << " is out of range for maxHitsPerPattern " << m_maxHitsPerPattern;
     throw std::out_of_range(ss.str());
   }
 }

@@ -405,6 +405,139 @@ BOOST_AUTO_TEST_CASE(CudaCandidateListDeviceRoundTrip) {
   BOOST_CHECK(lists.deviceArrays().candidateIndices == nullptr);
 }
 
+BOOST_AUTO_TEST_CASE(CudaPatternRecordHostConstruction) {
+  ActsExamples::CudaPatternRecordContainer patterns{2, 3};
+
+  BOOST_CHECK_EQUAL(patterns.nPatterns(), 2u);
+  BOOST_CHECK_EQUAL(patterns.maxHitsPerPattern(), 3u);
+  BOOST_CHECK(!patterns.empty());
+  BOOST_CHECK(!patterns.isOnDevice());
+  BOOST_CHECK_EQUAL(patterns.nHits(0), 0u);
+  BOOST_CHECK_EQUAL(patterns.pattern(0).lastInsertedHit,
+                    ActsExamples::cudaInvalidHitIndex);
+  BOOST_CHECK_EQUAL(patterns.pattern(0).status,
+                    ActsExamples::CudaPatternStatus::empty);
+
+  ActsExamples::CudaPatternRecordRow row{};
+  row.seedIndex = 4u;
+  row.sector = 3;
+  row.patPhi = 0.12;
+  row.patTheta = 0.40;
+  row.patPhiCov = 1.e-4;
+  row.meanNormResidual2 = 0.05;
+  row.lastResidual = 2.0;
+  row.lastResSigma = 0.5;
+  row.linePos = Vector3{1.0, 2.0, 3.0};
+  row.lineDir = Vector3{0.0, 0.0, 1.0};
+  row.leverArm = 40.0;
+  row.bendPlaneNorm = Vector3{0.0, 1.0, 0.0};
+  row.nPrecisionLayers = 5u;
+  row.nTriggerLayers = 2u;
+  row.nPhiLayers = 1u;
+  row.nHits = 2u;
+  row.lastInsertedHit = 11u;
+  row.prevLayerHit = 10u;
+  row.lineAnchorHit = 10u;
+  row.flags = ActsExamples::CudaPatternFlags::needLineUpdate;
+  row.status = ActsExamples::CudaPatternStatus::ok;
+
+  patterns.setPattern(0, row);
+  patterns.setHit(0, 0, 10u, 1u);
+  patterns.setHit(0, 1, 11u, 2u);
+
+  const ActsExamples::CudaPatternRecordRow back{patterns.pattern(0)};
+  BOOST_CHECK_EQUAL(back.seedIndex, 4u);
+  BOOST_CHECK_EQUAL(back.sector, 3);
+  BOOST_CHECK_EQUAL(back.patTheta, 0.40);
+  BOOST_CHECK(back.linePos == row.linePos);
+  BOOST_CHECK(back.lineDir == row.lineDir);
+  BOOST_CHECK(back.bendPlaneNorm == row.bendPlaneNorm);
+  BOOST_CHECK_EQUAL(back.nPrecisionLayers, 5u);
+  BOOST_CHECK_EQUAL(back.lastInsertedHit, 11u);
+  BOOST_CHECK_EQUAL(back.flags, row.flags);
+  BOOST_CHECK_EQUAL(back.status, ActsExamples::CudaPatternStatus::ok);
+  BOOST_CHECK_EQUAL(patterns.nHits(0), 2u);
+  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 1), 11u);
+  BOOST_CHECK_EQUAL(patterns.globLayer(0, 1), 2u);
+  BOOST_CHECK_EQUAL(patterns.hitIndices(0).size(), 2u);
+  BOOST_CHECK_EQUAL(patterns.hitIndices(0)[0], 10u);
+
+  BOOST_CHECK_EQUAL(patterns.nHits(1), 0u);
+  BOOST_CHECK_EQUAL(patterns.pattern(1).status,
+                    ActsExamples::CudaPatternStatus::empty);
+
+  BOOST_CHECK_THROW(patterns.pattern(2), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.setHit(0, 3, 0u), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.setNHits(0, 4u), std::out_of_range);
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternRecordDeviceRoundTrip) {
+  int deviceCount = 0;
+  if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+
+  ActsExamples::CudaPatternRecordContainer patterns{2, 3};
+
+  ActsExamples::CudaPatternRecordRow row{};
+  row.seedIndex = 4u;
+  row.sector = -2;
+  row.patTheta = 0.40;
+  row.linePos = Vector3{1.0, 2.0, 3.0};
+  row.leverArm = 40.0;
+  row.nHits = 2u;
+  row.lastInsertedHit = 11u;
+  row.flags = ActsExamples::CudaPatternFlags::useBeamspot;
+  row.status = ActsExamples::CudaPatternStatus::overflow;
+
+  patterns.setPattern(0, row);
+  patterns.setHit(0, 0, 10u, 1u);
+  patterns.setHit(0, 1, 11u, 2u);
+
+  ActsExamples::CudaStream stream;
+  patterns.moveToDevice(stream.get());
+  stream.synchronize();
+
+  BOOST_CHECK(patterns.isOnDevice());
+  BOOST_CHECK(patterns.deviceArrays().patTheta != nullptr);
+  BOOST_CHECK(patterns.deviceArrays().hitIndex != nullptr);
+  BOOST_CHECK_EQUAL(patterns.deviceArrays().nPatterns, 2u);
+  BOOST_CHECK_EQUAL(patterns.deviceArrays().maxHitsPerPattern, 3u);
+  BOOST_CHECK_EQUAL(patterns.deviceArrays().hitSlot(1, 2), 5u);
+
+  // Overwrite the host columns, so the copy back is the only source of the
+  // values checked below
+  patterns.setPattern(0, ActsExamples::CudaPatternRecordRow{});
+  patterns.setHit(0, 0, 0u, 0u);
+  patterns.setHit(0, 1, 0u, 0u);
+
+  patterns.moveToHost(stream.get());
+  stream.synchronize();
+
+  const ActsExamples::CudaPatternRecordRow back{patterns.pattern(0)};
+  BOOST_CHECK_EQUAL(back.seedIndex, 4u);
+  BOOST_CHECK_EQUAL(back.sector, -2);
+  BOOST_CHECK_EQUAL(back.patTheta, 0.40);
+  BOOST_CHECK(back.linePos == row.linePos);
+  BOOST_CHECK_EQUAL(back.leverArm, 40.0);
+  BOOST_CHECK_EQUAL(back.nHits, 2u);
+  BOOST_CHECK_EQUAL(back.lastInsertedHit, 11u);
+  BOOST_CHECK_EQUAL(back.flags, row.flags);
+  BOOST_CHECK_EQUAL(back.status, ActsExamples::CudaPatternStatus::overflow);
+  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 0), 10u);
+  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 1), 11u);
+  BOOST_CHECK_EQUAL(patterns.globLayer(0, 1), 2u);
+  BOOST_CHECK_EQUAL(patterns.nHits(1), 0u);
+  BOOST_CHECK_EQUAL(patterns.pattern(1).lastInsertedHit,
+                    ActsExamples::cudaInvalidHitIndex);
+
+  patterns.clearDevice();
+
+  BOOST_CHECK(!patterns.isOnDevice());
+  BOOST_CHECK(patterns.deviceArrays().hitIndex == nullptr);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 }  // namespace ActsTests
