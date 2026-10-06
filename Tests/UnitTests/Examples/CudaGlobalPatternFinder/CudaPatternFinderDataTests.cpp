@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -300,6 +301,108 @@ BOOST_AUTO_TEST_CASE(CudaHitPayloadRowFromHitPayload) {
                                strip.intrinsicVariance(gctx, direction),
                                1.e-12);
   }
+}
+
+BOOST_AUTO_TEST_CASE(CudaCandidateListHostConstruction) {
+  ActsExamples::CudaCandidateListContainer lists;
+
+  BOOST_CHECK(lists.empty());
+  BOOST_CHECK_EQUAL(lists.nSeeds(), 0u);
+  BOOST_CHECK_EQUAL(lists.nCandidates(), 0u);
+  BOOST_CHECK(!lists.isOnDevice());
+
+  lists.addSeed(7u, 3.0, 0.40, {10u, 11u, 12u});
+  lists.addSeed(11u, 3.0, 0.41, {11u, 20u});
+  lists.addSeed(20u, 4.0, 0.90, {});
+
+  BOOST_CHECK(!lists.empty());
+  BOOST_CHECK_EQUAL(lists.nSeeds(), 3u);
+  BOOST_CHECK_EQUAL(lists.nCandidates(), 5u);
+
+  BOOST_CHECK_EQUAL(lists.seedHitIndex(0), 7u);
+  BOOST_CHECK_EQUAL(lists.seedSector(0), 3.0);
+  BOOST_CHECK_EQUAL(lists.seedTheta(0), 0.40);
+  BOOST_CHECK_EQUAL(lists.nCandidates(0), 3u);
+  BOOST_CHECK_EQUAL(lists.candidateBegin(0), 0u);
+  BOOST_CHECK_EQUAL(lists.candidateEnd(0), 3u);
+  BOOST_CHECK_EQUAL(lists.candidateHitIndex(0, 1), 11u);
+
+  // Two seeds can own the same payload row, as overlapping tree searches do
+  BOOST_CHECK_EQUAL(lists.candidateHitIndex(0, 1),
+                    lists.candidateHitIndex(1, 0));
+  BOOST_CHECK_EQUAL(lists.nCandidates(1), 2u);
+  BOOST_CHECK_EQUAL(lists.candidateBegin(1), 3u);
+  BOOST_CHECK_EQUAL(lists.candidateEnd(1), 5u);
+  BOOST_CHECK_EQUAL(lists.seedHitIndex(1), 11u);
+
+  BOOST_CHECK_EQUAL(lists.nCandidates(2), 0u);
+  BOOST_CHECK_EQUAL(lists.candidateBegin(2), 5u);
+  BOOST_CHECK_EQUAL(lists.candidateEnd(2), 5u);
+  BOOST_CHECK(lists.candidateHitIndices(2).empty());
+
+  const std::span<const std::uint32_t> first{lists.candidateHitIndices(0)};
+  BOOST_CHECK_EQUAL(first.size(), 3u);
+  BOOST_CHECK_EQUAL(first[0], 10u);
+  BOOST_CHECK_EQUAL(first[2], 12u);
+
+  BOOST_CHECK_THROW(lists.seedHitIndex(3), std::out_of_range);
+  BOOST_CHECK_THROW(lists.candidateHitIndex(0, 3), std::out_of_range);
+  BOOST_CHECK_THROW(lists.setCandidate(5, 0u), std::out_of_range);
+}
+
+BOOST_AUTO_TEST_CASE(CudaCandidateListDeviceRoundTrip) {
+  int deviceCount = 0;
+  if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+
+  ActsExamples::CudaCandidateListContainer lists;
+  lists.addSeed(7u, 3.0, 0.40, {10u, 11u, 12u});
+  lists.addSeed(11u, 4.0, 0.50, {11u, 20u});
+
+  ActsExamples::CudaStream stream;
+  lists.moveToDevice(stream.get());
+  stream.synchronize();
+
+  BOOST_CHECK(lists.isOnDevice());
+  BOOST_CHECK(lists.deviceArrays().seedHitIndex != nullptr);
+  BOOST_CHECK(lists.deviceArrays().candidateOffsets != nullptr);
+  BOOST_CHECK(lists.deviceArrays().candidateIndices != nullptr);
+  BOOST_CHECK_EQUAL(lists.deviceArrays().nSeeds, 2u);
+  BOOST_CHECK_EQUAL(lists.deviceArrays().nCandidates, 5u);
+
+  const std::uint32_t seedHit{lists.seedHitIndex(0)};
+  const double sector{lists.seedSector(1)};
+  const double theta{lists.seedTheta(1)};
+  const std::uint32_t sharedHit{lists.candidateHitIndex(0, 1)};
+
+  // Overwrite the host columns, so the copy back is the only source of the
+  // values checked below
+  lists.setSeed(0, 0u, 0.0, 0.0);
+  lists.setSeed(1, 0u, 0.0, 0.0);
+  for (std::size_t i = 0; i < lists.nCandidates(); ++i) {
+    lists.setCandidate(i, 0u);
+  }
+
+  lists.moveToHost(stream.get());
+  stream.synchronize();
+
+  BOOST_CHECK_EQUAL(lists.nSeeds(), 2u);
+  BOOST_CHECK_EQUAL(lists.nCandidates(), 5u);
+  BOOST_CHECK_EQUAL(lists.seedHitIndex(0), seedHit);
+  BOOST_CHECK_EQUAL(lists.seedSector(1), sector);
+  BOOST_CHECK_EQUAL(lists.seedTheta(1), theta);
+  BOOST_CHECK_EQUAL(lists.candidateBegin(1), 3u);
+  BOOST_CHECK_EQUAL(lists.candidateEnd(1), 5u);
+  BOOST_CHECK_EQUAL(lists.candidateHitIndex(0, 1), sharedHit);
+  BOOST_CHECK_EQUAL(lists.candidateHitIndex(1, 0), sharedHit);
+  BOOST_CHECK_EQUAL(lists.candidateHitIndex(1, 1), 20u);
+
+  lists.clearDevice();
+
+  BOOST_CHECK(!lists.isOnDevice());
+  BOOST_CHECK(lists.deviceArrays().candidateIndices == nullptr);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

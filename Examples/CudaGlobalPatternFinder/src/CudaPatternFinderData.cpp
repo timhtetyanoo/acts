@@ -10,6 +10,7 @@
 
 #include "ActsExamples/Utilities/CudaUtilities.hpp"
 
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -51,39 +52,48 @@ constexpr auto hitPayloadColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.flags, device.flags);
 };
 
-/// The column functions of CudaUtilities.hpp applied to every column of the
+/// The host column and the device column of every field of the candidate
+/// lists. Offsets are one longer than the per-seed columns; the visit uses
+/// each vector's own size.
+constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
+  visit(host.seedHitIndex, device.seedHitIndex);
+  visit(host.seedSector, device.seedSector);
+  visit(host.seedTheta, device.seedTheta);
+  visit(host.candidateOffsets, device.candidateOffsets);
+  visit(host.candidateIndices, device.candidateIndices);
+};
+
+/// The column functions of CudaUtilities.hpp applied to every column of a
 /// list
-template <typename Host, typename Device>
-void allocateColumns(const Host& host, Device& device) {
-  hitPayloadColumns(
-      host, device, [](const auto& hostColumn, auto& deviceColumn) {
-        ActsExamples::allocateDeviceColumn(deviceColumn, hostColumn.size());
-      });
+template <typename Columns, typename Host, typename Device>
+void allocateColumns(Columns&& columns, const Host& host, Device& device) {
+  columns(host, device, [](const auto& hostColumn, auto& deviceColumn) {
+    ActsExamples::allocateDeviceColumn(deviceColumn, hostColumn.size());
+  });
 }
 
-template <typename Host, typename Device>
-void freeColumns(const Host& host, Device& device) noexcept {
-  hitPayloadColumns(host, device,
-                    [](const auto& /*hostColumn*/, auto& deviceColumn) {
-                      ActsExamples::freeDeviceColumn(deviceColumn);
-                    });
+template <typename Columns, typename Host, typename Device>
+void freeColumns(Columns&& columns, const Host& host, Device& device) noexcept {
+  columns(host, device, [](const auto& /*hostColumn*/, auto& deviceColumn) {
+    ActsExamples::freeDeviceColumn(deviceColumn);
+  });
 }
 
-template <typename Host, typename Device>
-void copyColumnsToDevice(const Host& host, const Device& device,
-                         cudaStream_t stream) {
-  hitPayloadColumns(
-      host, device, [stream](const auto& hostColumn, const auto& deviceColumn) {
-        ActsExamples::copyColumnToDevice(deviceColumn, hostColumn, stream);
-      });
+template <typename Columns, typename Host, typename Device>
+void copyColumnsToDevice(Columns&& columns, const Host& host,
+                         const Device& device, cudaStream_t stream) {
+  columns(host, device,
+          [stream](const auto& hostColumn, const auto& deviceColumn) {
+            ActsExamples::copyColumnToDevice(deviceColumn, hostColumn, stream);
+          });
 }
 
-template <typename Host, typename Device>
-void copyColumnsToHost(Host& host, const Device& device, cudaStream_t stream) {
-  hitPayloadColumns(
-      host, device, [stream](auto& hostColumn, const auto& deviceColumn) {
-        ActsExamples::copyColumnToHost(hostColumn, deviceColumn, stream);
-      });
+template <typename Columns, typename Host, typename Device>
+void copyColumnsToHost(Columns&& columns, Host& host, const Device& device,
+                       cudaStream_t stream) {
+  columns(host, device, [stream](auto& hostColumn, const auto& deviceColumn) {
+    ActsExamples::copyColumnToHost(hostColumn, deviceColumn, stream);
+  });
 }
 
 }  // namespace
@@ -238,8 +248,8 @@ std::uint8_t CudaHitPayloadContainer::locLayer(size_type index) const {
 void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(m_host, m_device);
-  copyColumnsToDevice(m_host, m_device, stream);
+  allocateColumns(hitPayloadColumns, m_host, m_device);
+  copyColumnsToDevice(hitPayloadColumns, m_host, m_device, stream);
 
   m_onDevice = true;
 }
@@ -249,11 +259,11 @@ void CudaHitPayloadContainer::moveToHost(cudaStream_t stream) {
     return;
   }
 
-  copyColumnsToHost(m_host, m_device, stream);
+  copyColumnsToHost(hitPayloadColumns, m_host, m_device, stream);
 }
 
 void CudaHitPayloadContainer::clearDevice() noexcept {
-  freeColumns(m_host, m_device);
+  freeColumns(hitPayloadColumns, m_host, m_device);
 
   m_device = {};
   m_onDevice = false;
@@ -264,6 +274,168 @@ void CudaHitPayloadContainer::checkIndex(size_type index) const {
     std::stringstream ss;
     ss << "CudaHitPayloadContainer: index " << index << " is out of range for "
        << m_size << " hit payloads";
+    throw std::out_of_range(ss.str());
+  }
+}
+
+CudaCandidateListContainer::CudaCandidateListContainer(
+    CudaCandidateListContainer&& other) noexcept
+    : m_host{std::move(other.m_host)},
+      m_device{std::exchange(other.m_device, {})},
+      m_onDevice{std::exchange(other.m_onDevice, false)} {
+  other.m_host = {};
+}
+
+CudaCandidateListContainer& CudaCandidateListContainer::operator=(
+    CudaCandidateListContainer&& other) noexcept {
+  if (this != &other) {
+    clearDevice();
+
+    m_host = std::move(other.m_host);
+    m_device = std::exchange(other.m_device, {});
+    m_onDevice = std::exchange(other.m_onDevice, false);
+    other.m_host = {};
+  }
+
+  return *this;
+}
+
+CudaCandidateListContainer::~CudaCandidateListContainer() noexcept {
+  clearDevice();
+}
+
+CudaCandidateListContainer::size_type CudaCandidateListContainer::nCandidates(
+    size_type seed) const {
+  return candidateEnd(seed) - candidateBegin(seed);
+}
+
+void CudaCandidateListContainer::addSeed(
+    std::uint32_t seedHitIndex, double sector, double theta,
+    std::span<const std::uint32_t> hitIndices) {
+  // Growing the CSR invalidates the device buffers
+  clearDevice();
+
+  m_host.seedHitIndex.push_back(seedHitIndex);
+  m_host.seedSector.push_back(sector);
+  m_host.seedTheta.push_back(theta);
+  m_host.candidateIndices.insert(m_host.candidateIndices.end(),
+                                 hitIndices.begin(), hitIndices.end());
+  m_host.candidateOffsets.push_back(
+      static_cast<std::uint32_t>(m_host.candidateIndices.size()));
+}
+
+void CudaCandidateListContainer::setSeed(size_type seed,
+                                         std::uint32_t seedHitIndex,
+                                         double sector, double theta) {
+  checkSeed(seed);
+
+  m_host.seedHitIndex[seed] = seedHitIndex;
+  m_host.seedSector[seed] = sector;
+  m_host.seedTheta[seed] = theta;
+}
+
+void CudaCandidateListContainer::setCandidate(size_type index,
+                                              std::uint32_t hitIndex) {
+  checkCandidate(index);
+
+  m_host.candidateIndices[index] = hitIndex;
+}
+
+std::uint32_t CudaCandidateListContainer::seedHitIndex(size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.seedHitIndex[seed];
+}
+
+double CudaCandidateListContainer::seedSector(size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.seedSector[seed];
+}
+
+double CudaCandidateListContainer::seedTheta(size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.seedTheta[seed];
+}
+
+CudaCandidateListContainer::size_type CudaCandidateListContainer::candidateBegin(
+    size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.candidateOffsets[seed];
+}
+
+CudaCandidateListContainer::size_type CudaCandidateListContainer::candidateEnd(
+    size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.candidateOffsets[seed + 1u];
+}
+
+std::uint32_t CudaCandidateListContainer::candidateHitIndex(
+    size_type seed, size_type local) const {
+  const size_type begin{candidateBegin(seed)};
+  const size_type index{begin + local};
+  if (index >= candidateEnd(seed)) {
+    std::stringstream ss;
+    ss << "CudaCandidateListContainer: local candidate " << local
+       << " is out of range for seed " << seed << " with " << nCandidates(seed)
+       << " candidates";
+    throw std::out_of_range(ss.str());
+  }
+
+  return m_host.candidateIndices[index];
+}
+
+std::span<const std::uint32_t> CudaCandidateListContainer::candidateHitIndices(
+    size_type seed) const {
+  const size_type begin{candidateBegin(seed)};
+  const size_type end{candidateEnd(seed)};
+  return std::span<const std::uint32_t>{m_host.candidateIndices.data() + begin,
+                                        end - begin};
+}
+
+void CudaCandidateListContainer::moveToDevice(cudaStream_t stream) {
+  clearDevice();
+
+  allocateColumns(candidateColumns, m_host, m_device);
+  copyColumnsToDevice(candidateColumns, m_host, m_device, stream);
+
+  m_device.nSeeds = static_cast<std::uint32_t>(nSeeds());
+  m_device.nCandidates = static_cast<std::uint32_t>(nCandidates());
+  m_onDevice = true;
+}
+
+void CudaCandidateListContainer::moveToHost(cudaStream_t stream) {
+  if (!m_onDevice) {
+    return;
+  }
+
+  copyColumnsToHost(candidateColumns, m_host, m_device, stream);
+}
+
+void CudaCandidateListContainer::clearDevice() noexcept {
+  freeColumns(candidateColumns, m_host, m_device);
+
+  m_device = {};
+  m_onDevice = false;
+}
+
+void CudaCandidateListContainer::checkSeed(size_type seed) const {
+  if (seed >= nSeeds()) {
+    std::stringstream ss;
+    ss << "CudaCandidateListContainer: seed " << seed
+       << " is out of range for " << nSeeds() << " seeds";
+    throw std::out_of_range(ss.str());
+  }
+}
+
+void CudaCandidateListContainer::checkCandidate(size_type index) const {
+  if (index >= nCandidates()) {
+    std::stringstream ss;
+    ss << "CudaCandidateListContainer: candidate " << index
+       << " is out of range for " << nCandidates() << " candidates";
     throw std::out_of_range(ss.str());
   }
 }

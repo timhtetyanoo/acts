@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <span>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -274,6 +276,157 @@ class CudaHitPayloadContainer {
   bool m_onDevice = false;
 
   void checkIndex(size_type index) const;
+};
+
+/// @brief Device-side raw structure-of-arrays view of the per-seed candidate
+///        lists. The structure holds raw device pointers and owns no memory.
+///        CUDA kernels receive it by value.
+///
+/// Seed s owns the candidate hit rows
+/// `[candidateOffsets[s], candidateOffsets[s + 1])` of candidateIndices.
+/// Those rows are indices into CudaHitPayloadContainer. The lists are the
+/// output of the host tree range search; the skip rule is not applied.
+struct CudaCandidateArrays {
+  std::uint32_t* seedHitIndex = nullptr;
+  double* seedSector = nullptr;
+  double* seedTheta = nullptr;
+
+  std::uint32_t* candidateOffsets = nullptr;
+  std::uint32_t* candidateIndices = nullptr;
+
+  std::uint32_t nSeeds = 0;
+  std::uint32_t nCandidates = 0;
+
+  /// @brief First candidate of a seed, as an index into candidateIndices
+  __host__ __device__ std::uint32_t begin(std::uint32_t seed) const noexcept {
+    return candidateOffsets[seed];
+  }
+  /// @brief One-past-last candidate of a seed, as an index into
+  ///        candidateIndices
+  __host__ __device__ std::uint32_t end(std::uint32_t seed) const noexcept {
+    return candidateOffsets[seed + 1u];
+  }
+};
+
+/// @brief Host copy of the candidate lists. The container copies this data to
+///        VRAM with moveToDevice(stream) and copies it back with
+///        moveToHost(stream).
+struct CudaCandidateHostData {
+  std::vector<std::uint32_t> seedHitIndex;
+  std::vector<double> seedSector;
+  std::vector<double> seedTheta;
+
+  /// @brief CSR offsets. Size is nSeeds() + 1, starting as {0}
+  std::vector<std::uint32_t> candidateOffsets{0};
+  std::vector<std::uint32_t> candidateIndices;
+};
+
+/// @brief CUDA-backed CSR of the hits returned by the tree for each seed.
+///
+/// One seed is one tree entry that passed goodForSeeding. Its candidates are
+/// the hits of the range search around that entry, stored as row indices into
+/// the payload container. Seeds may share hit rows. The host skip rule
+/// (maxSeedAttempts / resolveOverlaps) is left to the driver, so every seed is
+/// present.
+class CudaCandidateListContainer {
+ public:
+  using size_type = std::size_t;
+
+  CudaCandidateListContainer() = default;
+
+  CudaCandidateListContainer(const CudaCandidateListContainer&) = delete;
+  CudaCandidateListContainer& operator=(const CudaCandidateListContainer&) =
+      delete;
+
+  CudaCandidateListContainer(CudaCandidateListContainer&& other) noexcept;
+  CudaCandidateListContainer& operator=(
+      CudaCandidateListContainer&& other) noexcept;
+
+  ~CudaCandidateListContainer() noexcept;
+
+  /// @brief Returns the number of seeds
+  size_type nSeeds() const noexcept { return m_host.seedHitIndex.size(); }
+
+  /// @brief Returns the total number of candidate entries
+  size_type nCandidates() const noexcept {
+    return m_host.candidateIndices.size();
+  }
+
+  /// @brief Returns the number of candidate hits of one seed
+  size_type nCandidates(size_type seed) const;
+
+  /// @brief Checks whether there are no seeds
+  bool empty() const noexcept { return nSeeds() == 0; }
+
+  /// @brief Appends a seed and the hit rows of its tree range search
+  /// @param seedHitIndex Row of the seed hit in the payload container
+  /// @param sector Tree sector coordinate of the seed
+  /// @param theta Tree theta coordinate of the seed
+  /// @param hitIndices Payload rows of the candidate hits
+  void addSeed(std::uint32_t seedHitIndex, double sector, double theta,
+               std::span<const std::uint32_t> hitIndices);
+
+  /// @brief Overload taking a braced list of hit rows
+  void addSeed(std::uint32_t seedHitIndex, double sector, double theta,
+               std::initializer_list<std::uint32_t> hitIndices) {
+    addSeed(seedHitIndex, sector, theta,
+            std::span<const std::uint32_t>{hitIndices.begin(),
+                                           hitIndices.size()});
+  }
+
+  /// @brief Overwrites the header of an existing seed. The candidate range
+  ///        is left as it is
+  void setSeed(size_type seed, std::uint32_t seedHitIndex, double sector,
+               double theta);
+
+  /// @brief Overwrites one flat candidate entry
+  void setCandidate(size_type index, std::uint32_t hitIndex);
+
+  /// @brief Payload row of the seed hit
+  std::uint32_t seedHitIndex(size_type seed) const;
+
+  /// @brief Tree sector coordinate of the seed
+  double seedSector(size_type seed) const;
+
+  /// @brief Tree theta coordinate of the seed
+  double seedTheta(size_type seed) const;
+
+  /// @brief First candidate of a seed, as an index into the flat list
+  size_type candidateBegin(size_type seed) const;
+
+  /// @brief One-past-last candidate of a seed, as an index into the flat list
+  size_type candidateEnd(size_type seed) const;
+
+  /// @brief Payload row of one candidate of a seed
+  std::uint32_t candidateHitIndex(size_type seed, size_type local) const;
+
+  /// @brief Payload rows of every candidate of a seed
+  std::span<const std::uint32_t> candidateHitIndices(size_type seed) const;
+
+  /// @brief Copies all host columns on a CUDA stream.
+  /// The method waits only for the supplied stream.
+  void moveToDevice(cudaStream_t stream);
+
+  /// @brief Copies all device columns on a CUDA stream.
+  /// The method waits only for the supplied stream.
+  void moveToHost(cudaStream_t stream);
+
+  /// @brief Releases all device memory.
+  void clearDevice() noexcept;
+
+  /// @brief Checks whether device memory is currently allocated.
+  bool isOnDevice() const noexcept { return m_onDevice; }
+
+  /// @brief Returns raw device arrays for CUDA kernels.
+  CudaCandidateArrays deviceArrays() const noexcept { return m_device; }
+
+ private:
+  CudaCandidateHostData m_host{};
+  CudaCandidateArrays m_device{};
+  bool m_onDevice = false;
+
+  void checkSeed(size_type seed) const;
+  void checkCandidate(size_type index) const;
 };
 
 /// @brief Position of the precision coordinate in MuonSpacePoint::covariance()
