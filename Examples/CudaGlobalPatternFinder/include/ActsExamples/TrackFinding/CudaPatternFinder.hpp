@@ -12,6 +12,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_runtime.h>
@@ -105,7 +106,6 @@ struct Hit {
   double phiCovariance{0.};
   double driftCovariance{0.};
   double phiVariance{0.};
-  std::uint64_t geometryId{0u};
   std::uint32_t stationKey{0u};
   std::uint8_t station{0u};
   std::uint8_t locLayer{0u};
@@ -131,7 +131,6 @@ __host__ __device__ inline Hit loadHit(const CudaHitPayloadArrays& hits,
   hit.phiCovariance = hits.phiCovariance[row];
   hit.driftCovariance = hits.driftCovariance[row];
   hit.phiVariance = hits.phiVariance[row];
-  hit.geometryId = hits.geometryId[row];
   hit.stationKey = hits.stationKey[row];
   hit.station = hits.station[row];
   hit.locLayer = hits.locLayer[row];
@@ -154,7 +153,6 @@ inline Hit makeHit(const CudaHitPayloadRow& row) {
   hit.phiCovariance = row.phiCovariance;
   hit.driftCovariance = row.driftCovariance;
   hit.phiVariance = row.phiVariance;
-  hit.geometryId = row.geometryId;
   hit.stationKey = row.stationKey;
   hit.station = row.station;
   hit.locLayer = row.locLayer;
@@ -406,12 +404,6 @@ __host__ __device__ inline bool layerSorter(const Hit& hit1, const Hit& hit2) {
   return st1 == Station::BM;
 }
 
-/// @brief HitPayload::overlaps: the two hits stem from the same measurement
-__host__ __device__ inline bool overlaps(const Hit& hit1, const Hit& hit2) {
-  return hit1.geometryId == hit2.geometryId &&
-         std::abs(hit1.localPositionY - hit2.localPositionY) < epsilon;
-}
-
 /// @brief PatternTopology::sameLayer
 __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
   if (hit1.station != hit2.station) {
@@ -536,7 +528,50 @@ struct CudaPatternFinderConfig {
   std::uint32_t minGroups{2u};
   std::uint32_t minGroupLayers{4u};
   std::uint32_t maxMissLayersInGroup{2u};
+  std::uint32_t maxSeedAttempts{2u};
   CudaPatternMath::Beamspot beamspot{};
+};
+
+/// @brief Sizes of the device buffers of the pattern finding. They bound the
+///        memory, not the result: what does not fit is built again larger
+struct CudaPatternFinderSizes {
+  /// @brief Seeds built at once before their patterns are accepted
+  std::size_t batchSize{1024u};
+  /// @brief Patterns a seed holds at once in the first build
+  std::size_t capacityPerSeed{8u};
+  /// @brief The same, for the seeds that overflowed the first build
+  std::size_t retryCapacityPerSeed{64u};
+  /// @brief Hits of one pattern
+  std::size_t maxHitsPerPattern{64u};
+  /// @brief Accepted patterns of the event
+  std::size_t maxPatterns{4096u};
+  /// @brief Runs of the event, each with doubled retry sizes, before giving
+  ///        up
+  std::size_t maxAttempts{4u};
+};
+
+/// @brief Where the time of one event went, in microseconds, and what the
+///        event held. Host stages are wall time, device stages are measured
+///        with CUDA events on the stream.
+struct CudaPatternFinderTiming {
+  /// @brief Host: the search tree
+  double treeUs{0.};
+  /// @brief Host: the hit columns and the candidate lists
+  double fillUs{0.};
+  /// @brief Device: copy of the hits and the lists to the device
+  double uploadUs{0.};
+  /// @brief Device: seed preparation, builds and accepts, all attempts
+  double kernelsUs{0.};
+  /// @brief Device: copy of the event's patterns to the host
+  double downloadUs{0.};
+  /// @brief Host: phi-only hits and the conversion of the patterns
+  double tailUs{0.};
+  std::size_t nSeeds{0u};
+  std::size_t nCandidates{0u};
+  /// @brief Patterns in eta accepted on the device
+  std::size_t nPatternsInEta{0u};
+  /// @brief Runs of the event on the device; more than one if it overflowed
+  std::size_t nAttempts{0u};
 };
 
 /// @brief Copies the constants out of the CPU config
@@ -557,6 +592,7 @@ CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
       .minGroups = cfg.minGroups,
       .minGroupLayers = cfg.minGroupLayers,
       .maxMissLayersInGroup = cfg.maxMissLayersInGroup,
+      .maxSeedAttempts = cfg.maxSeedAttempts,
       .beamspot = {
           {beamspot.position.x(), beamspot.position.y(), beamspot.position.z()},
           beamspot.radius,
@@ -577,22 +613,152 @@ void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
                       CudaCandidateListContainer& lists,
                       const CudaPatternFinderConfig& cfg, cudaStream_t stream);
 
-/// @brief Builds the patterns of every seed on the device, one thread per
-///        seed, with the logic of GlobalPatternFinder::findPatternsInEta
+/// @brief Builds the patterns of a range of seeds on the device, one thread
+///        per seed, with the logic of GlobalPatternFinder::findPatternsInEta
 ///        after the seed checks: the forward and the backward extension, the
 ///        overlap removal among the patterns of the seed and the pattern cuts.
 ///
-/// The lists must have been through prepareCudaSeeds. Seed s writes its
-/// patterns to its slots in the records, already finalized. A seed that needs
-/// more patterns at once than the records have slots per seed, or more hits in
-/// a pattern than they have hit slots, sets its overflow flag and writes no
-/// pattern; the caller builds it again with larger records. The skip rule and
-/// the overlap removal between seeds are left to the caller. The call waits
-/// only for the stream.
-void buildCudaPatterns(const CudaHitPayloadContainer& hits,
-                       const CudaCandidateListContainer& lists,
-                       const CudaPatternFinderConfig& cfg,
-                       CudaPatternRecordContainer& patterns,
-                       cudaStream_t stream);
+/// The lists must have been through prepareCudaSeeds. Entry b of the records
+/// is seed firstSeed + b, and gets its patterns, already finalized. A seed
+/// that needs more patterns at once than the records have slots per seed, or
+/// more hits in a pattern than they have hit slots, sets its overflow flag and
+/// writes no pattern. With rebuildOverflowOf, only the seeds that overflowed
+/// those records are built. The call waits only for the stream.
+void buildCudaPatterns(
+    const CudaHitPayloadContainer& hits,
+    const CudaCandidateListContainer& lists, const CudaPatternFinderConfig& cfg,
+    std::size_t firstSeed, CudaPatternRecordContainer& patterns,
+    cudaStream_t stream,
+    const CudaPatternRecordContainer* rebuildOverflowOf = nullptr);
+
+/// @brief Finds the patterns in eta of an event on the device.
+///
+/// The seeds are prepared, then built in batches in tree order; seeds that
+/// overflow are built again with more room. After each batch, one thread
+/// accepts its patterns seed by seed: a seed whose hit is already in
+/// maxSeedAttempts accepted patterns is skipped, and each new pattern either
+/// replaces the accepted patterns it overlaps or loses to one of them. If the
+/// event still overflows, it is run again with doubled sizes. The hits and the
+/// lists must be on the device. Returns the event's patterns on the host as
+/// the slots of entry 0: the accepted ones have status ok, the dropped ones
+/// status rejected. The call synchronizes the stream.
+CudaPatternRecordContainer findCudaPatternsInEta(
+    const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
+    const CudaPatternFinderConfig& cfg, CudaPatternFinderSizes sizes,
+    cudaStream_t stream, CudaPatternFinderTiming* timing = nullptr);
 
 }  // namespace ActsExamples
+
+// The driver works with the CPU types of the pattern finder, which the device
+// code does not need
+#ifndef __CUDACC__
+#include "Acts/Utilities/Logger.hpp"
+#include "ActsExamples/Framework/DataHandle.hpp"
+#include "ActsExamples/Framework/IAlgorithm.hpp"
+#include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
+
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace ActsExamples {
+
+/// @brief GlobalPatternFinder_t::findPatterns on the GPU. The patterns in eta
+///        are found by findCudaPatternsInEta; the phi-only hits are added and
+///        the patterns converted on the host, as the CPU does it.
+class CudaGlobalPatternFinder {
+ public:
+  using OutputPattern = GlobalPatternFinder_t::OutputPattern;
+  using PatternState = GlobalPatternFinder_t::PatternState;
+  using BeamspotInfo = GlobalPatternFinder_t::BeamspotInfo;
+
+  struct Config {
+    /// @brief The configuration of the CPU pattern finder
+    GlobalPatternFinder_t::Config finder{};
+    /// @brief The sizes of the device buffers
+    CudaPatternFinderSizes sizes{};
+  };
+
+  explicit CudaGlobalPatternFinder(
+      Config cfg,
+      std::unique_ptr<const Acts::Logger> logger = Acts::getDefaultLogger(
+          "CudaGlobalPatternFinder", Acts::Logging::INFO));
+
+  /// @brief Finds the patterns of an event
+  /// @param gctx Geometry context
+  /// @param treeData The hit payloads and the search tree over them
+  /// @param seedSelector Selector of the seed hits
+  /// @param onlyPhiProvider Provider of the phi-only hits of a pattern
+  /// @param beamspot The beam spot
+  /// @param timing Filled with the time of each stage, if given
+  /// @return The patterns, in the order they were accepted
+  std::vector<OutputPattern> findPatterns(
+      const Acts::GeometryContext& gctx, const SearchTreeData& treeData,
+      const SeedSelector& seedSelector,
+      const OnlyPhiHitsProvider& onlyPhiProvider, const BeamspotInfo& beamspot,
+      CudaPatternFinderTiming* timing = nullptr) const;
+
+ private:
+  /// @brief A pattern found on the device as the CPU's PatternState
+  PatternState makePatternState(const Acts::GeometryContext& gctx,
+                                const std::vector<HitPayload>& payloads,
+                                const CudaPatternRecordContainer& event,
+                                std::size_t slot) const;
+
+  /// @brief GlobalPatternFinder::addPhiOnlyHits
+  void addPhiOnlyHits(const Acts::GeometryContext& gctx,
+                      const OnlyPhiHitsProvider& onlyPhiProvider,
+                      std::vector<PatternState>& patterns) const;
+
+  const Acts::Logger& logger() const { return *m_logger; }
+
+  Config m_cfg;
+  std::unique_ptr<const Acts::Logger> m_logger;
+};
+
+/// @brief GlobalPatternFinderAlgorithm with the pattern finding on the GPU.
+///        It reads the same space points and writes the same patterns; the
+///        search tree and the conversion of the patterns are those of the CPU
+///        algorithm.
+class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
+ public:
+  struct Config : GlobalPatternFinderAlgorithm::Config {
+    /// @brief CudaPatternFinderSizes
+    std::size_t batchSize{1024u};
+    std::size_t capacityPerSeed{8u};
+    std::size_t retryCapacityPerSeed{64u};
+    std::size_t maxHitsPerPattern{64u};
+    std::size_t maxPatterns{4096u};
+    std::size_t maxAttempts{4u};
+    /// @brief Key of the CudaPatternFinderTiming of each event in the event
+    ///        store; nothing is written if empty
+    std::string outTiming{};
+  };
+
+  CudaGlobalPatternFinderAlgorithm(const Config& cfg,
+                                   std::unique_ptr<const Acts::Logger> logger);
+
+  ProcessCode execute(const AlgorithmContext& ctx) const override;
+
+  const Config& config() const { return m_cfg; }
+
+ private:
+  /// @brief GlobalPatternFinderAlgorithm::constructTree
+  SearchTreeData constructTree(
+      const Acts::GeometryContext& gctx,
+      const MuonSpacePointContainer& spacePoints) const;
+
+  Config m_cfg;
+  std::unique_ptr<SeedSelector> m_seedSelector{};
+  std::unique_ptr<CudaGlobalPatternFinder> m_finder{};
+  OnlyPhiHitsProvider m_onlyPhiProvider{};
+
+  ReadDataHandle<MuonSpacePointContainer> m_inSpacePoints{this,
+                                                          "InSpacePoints"};
+  WriteDataHandle<MuonGlobalPatternContainer> m_outPatterns{this,
+                                                            "OutPatterns"};
+  WriteDataHandle<CudaPatternFinderTiming> m_outTiming{this, "OutTiming"};
+};
+
+}  // namespace ActsExamples
+#endif

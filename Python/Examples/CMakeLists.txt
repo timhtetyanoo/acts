@@ -205,6 +205,12 @@ add_examples_binding_if(
     PLUGIN_IMPORT TRUE
 )
 add_examples_binding_if(
+    NAME CudaGlobalPatternFinder
+    LINK_LIBRARIES Acts::ExamplesCudaGlobalPatternFinder
+    FLAG ACTS_BUILD_EXAMPLES_CUDA_GLOBAL_PATTERN_FINDER
+    PLUGIN_IMPORT FALSE
+)
+add_examples_binding_if(
     NAME DD4hep
     LINK_LIBRARIES Acts::ExamplesDetectorDD4hep
     FLAG ACTS_BUILD_EXAMPLES_DD4HEP

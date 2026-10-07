@@ -149,37 +149,82 @@ struct LineHits {
   }
 };
 
-/// @brief Runs the seed preparation and the pattern building with every hit
-///        on the line as a seed and every hit as its candidate
-ActsExamples::CudaPatternRecordContainer buildLinePatterns(
-    const GeometryContext& gctx, const LineHits& hits, std::size_t capacity) {
+/// @brief The pattern finder config of the line tests, and its candidate
+///        lists: every hit on the line is a seed and every hit its candidate
+ActsExamples::GlobalPatternFinder_t::Config lineConfig() {
   ActsExamples::GlobalPatternFinder_t::Config cfg{};
   cfg.minGroupLayers = 2u;
+  return cfg;
+}
+ActsExamples::CudaCandidateListContainer makeLineLists(const LineHits& hits) {
   std::vector<std::uint32_t> rows(hits.payloads.size());
   std::iota(rows.begin(), rows.end(), 0u);
-
-  auto payloads =
-      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
   ActsExamples::CudaCandidateListContainer lists{};
   // Expanded sector 10 is the centre of sector 5, at phi = 90 degrees
   for (std::uint32_t seed = 0u; seed < LineHits::nOnLine; ++seed) {
     lists.addSeed(seed, 10., 0., rows);
   }
+  return lists;
+}
+
+/// @brief Runs the seed preparation and the pattern building of the line
+ActsExamples::CudaPatternRecordContainer buildLinePatterns(
+    const GeometryContext& gctx, const LineHits& hits, std::size_t capacity) {
+  auto payloads =
+      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
+  auto lists = makeLineLists(hits);
   ActsExamples::CudaPatternRecordContainer patterns{lists.nSeeds(), capacity,
                                                     16u};
   const auto cudaCfg = ActsExamples::makeCudaPatternFinderConfig(
-      cfg, PatternState::BeamspotInfo{});
+      lineConfig(), PatternState::BeamspotInfo{});
 
   ActsExamples::CudaStream stream;
   payloads.moveToDevice(stream.get());
   lists.moveToDevice(stream.get());
   patterns.moveToDevice(stream.get());
   ActsExamples::prepareCudaSeeds(payloads, lists, cudaCfg, stream.get());
-  ActsExamples::buildCudaPatterns(payloads, lists, cudaCfg, patterns,
+  ActsExamples::buildCudaPatterns(payloads, lists, cudaCfg, 0u, patterns,
                                   stream.get());
   patterns.moveToHost(stream.get());
   stream.synchronize();
   return patterns;
+}
+
+/// @brief Runs the whole pattern finding in eta of the line and returns the
+///        hit rows of each accepted pattern, sorted
+std::vector<std::vector<std::uint32_t>> findLinePatterns(
+    const GeometryContext& gctx, const LineHits& hits,
+    const ActsExamples::CudaPatternFinderSizes& sizes) {
+  auto payloads =
+      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
+  auto lists = makeLineLists(hits);
+  ActsExamples::CudaStream stream;
+  payloads.moveToDevice(stream.get());
+  lists.moveToDevice(stream.get());
+  const auto event = ActsExamples::findCudaPatternsInEta(
+      payloads, lists,
+      ActsExamples::makeCudaPatternFinderConfig(lineConfig(),
+                                                PatternState::BeamspotInfo{}),
+      sizes, stream.get());
+
+  std::vector<std::vector<std::uint32_t>> accepted{};
+  for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
+    const auto slot = event.slot(0u, k);
+    if (event.pattern(slot).status != ActsExamples::CudaPatternStatus::ok) {
+      continue;
+    }
+    auto& rows = accepted.emplace_back(event.hitIndices(slot).begin(),
+                                       event.hitIndices(slot).end());
+    std::ranges::sort(rows);
+  }
+  return accepted;
+}
+
+/// @brief The rows of the hits on the line
+std::vector<std::uint32_t> lineRows() {
+  std::vector<std::uint32_t> rows(LineHits::nOnLine);
+  std::iota(rows.begin(), rows.end(), 0u);
+  return rows;
 }
 
 bool hasCudaDevice() {
@@ -433,8 +478,7 @@ BOOST_AUTO_TEST_CASE(CudaPatternBuildingFindsLine) {
       std::vector<std::uint32_t> found{patterns.hitIndices(slot).begin(),
                                        patterns.hitIndices(slot).end()};
       std::ranges::sort(found);
-      std::vector<std::uint32_t> expected(LineHits::nOnLine);
-      std::iota(expected.begin(), expected.end(), 0u);
+      const std::vector<std::uint32_t> expected{lineRows()};
       BOOST_CHECK_EQUAL_COLLECTIONS(found.begin(), found.end(),
                                     expected.begin(), expected.end());
       BOOST_CHECK_EQUAL(patterns.pattern(slot).nTriggerLayers,
@@ -461,6 +505,52 @@ BOOST_AUTO_TEST_CASE(CudaPatternBuildingOverflow) {
   const auto large = buildLinePatterns(gctx, hits, 4u);
   BOOST_CHECK(!large.overflow(0u));
   BOOST_CHECK_EQUAL(large.nPatterns(0u), 1u);
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
+  if (!hasCudaDevice()) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const LineHits hits{gctx, false};
+  const std::vector<std::uint32_t> expected{lineRows()};
+
+  // All six seeds find the line; it is accepted once, whatever the batches
+  for (const std::size_t batchSize : {1u, 4u, 64u}) {
+    BOOST_TEST_CONTEXT("batch size " << batchSize) {
+      const auto accepted =
+          findLinePatterns(gctx, hits, {.batchSize = batchSize});
+      BOOST_REQUIRE_EQUAL(accepted.size(), 1u);
+      BOOST_CHECK_EQUAL_COLLECTIONS(accepted[0].begin(), accepted[0].end(),
+                                    expected.begin(), expected.end());
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternFindingRetriesOverflow) {
+  if (!hasCudaDevice()) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const LineHits hits{gctx, true};
+
+  // The first seed overflows a single slot; the retry, or failing that the
+  // rerun of the event, gives it room for both branches
+  for (const std::size_t retryCapacity : {4u, 1u}) {
+    BOOST_TEST_CONTEXT("retry capacity " << retryCapacity) {
+      const auto accepted = findLinePatterns(
+          gctx, hits,
+          {.capacityPerSeed = 1u, .retryCapacityPerSeed = retryCapacity});
+      BOOST_CHECK_EQUAL(accepted.size(), 1u);
+    }
+  }
+  BOOST_CHECK_THROW(findLinePatterns(gctx, hits,
+                                     {.capacityPerSeed = 1u,
+                                      .retryCapacityPerSeed = 1u,
+                                      .maxAttempts = 1u}),
+                    std::runtime_error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

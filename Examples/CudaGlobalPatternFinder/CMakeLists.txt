@@ -2,6 +2,7 @@ acts_add_library(
     ExamplesCudaGlobalPatternFinder
     src/CudaPatternFinderData.cpp
     src/CudaPatternFinder.cu
+    src/CudaPatternFinder.cpp
     ACTS_INCLUDE_FOLDER include/ActsExamples
 )
 
@@ -15,6 +16,7 @@ target_link_libraries(
     PUBLIC
         Acts::ExamplesFramework
         ActsExamplesCudaMuonSegmentFitting
+        ActsExamplesTrackFinding
         CUDA::cudart
 )
 
