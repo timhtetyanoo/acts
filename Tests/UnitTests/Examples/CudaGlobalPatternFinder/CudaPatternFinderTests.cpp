@@ -190,11 +190,16 @@ ActsExamples::CudaPatternRecordContainer buildLinePatterns(
   return patterns;
 }
 
-/// @brief Runs the whole pattern finding in eta of the line and returns the
-///        hit rows of each accepted pattern, sorted
-std::vector<std::vector<std::uint32_t>> findLinePatterns(
-    const GeometryContext& gctx, const LineHits& hits,
-    const ActsExamples::CudaPatternFinderSizes& sizes) {
+/// @brief The result of the pattern finding in eta of the line: the hit rows
+///        of each accepted pattern, sorted, and what did not fit
+struct LineResult {
+  std::vector<std::vector<std::uint32_t>> accepted{};
+  std::uint8_t overflow{0u};
+};
+
+/// @brief Runs the whole pattern finding in eta of the line
+LineResult findLinePatterns(const GeometryContext& gctx, const LineHits& hits,
+                            const ActsExamples::CudaPatternFinderSizes& sizes) {
   auto payloads =
       ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
   auto lists = makeLineLists(hits);
@@ -207,17 +212,17 @@ std::vector<std::vector<std::uint32_t>> findLinePatterns(
                                                 PatternState::BeamspotInfo{}),
       sizes, stream.get());
 
-  std::vector<std::vector<std::uint32_t>> accepted{};
+  LineResult result{.overflow = event.overflow(0u)};
   for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
     const auto slot = event.slot(0u, k);
     if (event.pattern(slot).status != ActsExamples::CudaPatternStatus::ok) {
       continue;
     }
-    auto& rows = accepted.emplace_back(event.hitIndices(slot).begin(),
-                                       event.hitIndices(slot).end());
+    auto& rows = result.accepted.emplace_back(event.hitIndices(slot).begin(),
+                                              event.hitIndices(slot).end());
     std::ranges::sort(rows);
   }
-  return accepted;
+  return result;
 }
 
 /// @brief The rows of the hits on the line
@@ -520,7 +525,7 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
   for (const std::size_t batchSize : {1u, 4u, 64u}) {
     BOOST_TEST_CONTEXT("batch size " << batchSize) {
       const auto accepted =
-          findLinePatterns(gctx, hits, {.batchSize = batchSize});
+          findLinePatterns(gctx, hits, {.batchSize = batchSize}).accepted;
       BOOST_REQUIRE_EQUAL(accepted.size(), 1u);
       BOOST_CHECK_EQUAL_COLLECTIONS(accepted[0].begin(), accepted[0].end(),
                                     expected.begin(), expected.end());
@@ -528,7 +533,7 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(CudaPatternFindingRetriesOverflow) {
+BOOST_AUTO_TEST_CASE(CudaPatternFindingReportsOverflow) {
   if (!hasCudaDevice()) {
     BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
     return;
@@ -536,21 +541,19 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingRetriesOverflow) {
   const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
   const LineHits hits{gctx, true};
 
-  // The first seed overflows a single slot; the retry, or failing that the
-  // rerun of the event, gives it room for both branches
-  for (const std::size_t retryCapacity : {4u, 1u}) {
-    BOOST_TEST_CONTEXT("retry capacity " << retryCapacity) {
-      const auto accepted = findLinePatterns(
-          gctx, hits,
-          {.capacityPerSeed = 1u, .retryCapacityPerSeed = retryCapacity});
-      BOOST_CHECK_EQUAL(accepted.size(), 1u);
-    }
-  }
-  BOOST_CHECK_THROW(findLinePatterns(gctx, hits,
-                                     {.capacityPerSeed = 1u,
-                                      .retryCapacityPerSeed = 1u,
-                                      .maxAttempts = 1u}),
-                    std::runtime_error);
+  // A workspace with room for both branches of every seed: the line is found
+  // and nothing overflows
+  const auto ample = findLinePatterns(gctx, hits, {});
+  BOOST_CHECK_EQUAL(ample.overflow, 0u);
+  BOOST_CHECK_EQUAL(ample.accepted.size(), 1u);
+
+  // A workspace with room for one pattern per region and seed: the seeds whose
+  // pattern branches have no patterns and are reported, and the seed on the
+  // layer of the second hit, which does not branch, still finds the line
+  const auto small = findLinePatterns(gctx, hits, {.workspaceBytes = 1u});
+  BOOST_CHECK_EQUAL(small.overflow,
+                    ActsExamples::CudaPatternOverflow::patterns);
+  BOOST_CHECK_EQUAL(small.accepted.size(), 1u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

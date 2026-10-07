@@ -81,6 +81,12 @@ CudaGlobalPatternFinder::findPatterns(
       ACTS_CUDA_CHECK(cudaEventDestroy(mark));
     }
   }
+  if (const std::uint8_t overflow{event.overflow(0u)}; overflow != 0u) {
+    ACTS_WARNING(__func__ << "() Patterns did not fit the device buffers "
+                          << "(CudaPatternOverflow bits "
+                          << static_cast<int>(overflow)
+                          << "); the seeds that did not fit have no patterns");
+  }
   const auto tailStart = Clock::now();
 
   std::vector<PatternState> patterns{};
@@ -358,11 +364,9 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   patCfg.minHitDistance4Line = m_cfg.minHitDistance4Line;
   finderCfg.sizes =
       CudaPatternFinderSizes{.batchSize = m_cfg.batchSize,
-                             .capacityPerSeed = m_cfg.capacityPerSeed,
-                             .retryCapacityPerSeed = m_cfg.retryCapacityPerSeed,
+                             .workspaceBytes = m_cfg.workspaceBytes,
                              .maxHitsPerPattern = m_cfg.maxHitsPerPattern,
-                             .maxPatterns = m_cfg.maxPatterns,
-                             .maxAttempts = m_cfg.maxAttempts};
+                             .maxPatterns = m_cfg.maxPatterns};
   m_finder = std::make_unique<CudaGlobalPatternFinder>(
       std::move(finderCfg), this->logger().clone("CudaGlobalPatternFinder"));
 }
@@ -411,8 +415,7 @@ ProcessCode CudaGlobalPatternFinderAlgorithm::execute(
     pattern.meanNormResidual2 = candidate.meanNormResidual2;
   }
   ACTS_DEBUG("Found " << patterns.size() << " patterns from " << timing.nSeeds
-                      << " seeds in " << timing.nAttempts
-                      << " run(s) on the device");
+                      << " seeds");
 
   m_outPatterns(ctx, std::move(patterns));
   if (m_outTiming.isInitialized()) {

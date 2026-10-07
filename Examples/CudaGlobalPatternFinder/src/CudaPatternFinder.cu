@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -297,7 +298,8 @@ struct SeedBuilder {
   std::uint16_t* patternHits;
   std::uint32_t capacity;
   std::uint32_t maxHits;
-  bool overflow{false};
+  /// CudaPatternOverflow bits of what did not fit
+  std::uint8_t overflow{0u};
 
   __device__ Pattern& pattern(std::uint32_t region, std::uint32_t k) {
     return patterns[region * capacity + k];
@@ -339,7 +341,7 @@ struct SeedBuilder {
   __device__ Pattern* push(const Pattern& pat, std::uint32_t region,
                            std::uint32_t& n) {
     if (n == capacity) {
-      overflow = true;
+      overflow |= CudaPatternOverflow::patterns;
       return nullptr;
     }
     Pattern& to{pattern(region, n++)};
@@ -512,7 +514,7 @@ struct SeedBuilder {
   __device__ void addHit(Pattern& pat, std::uint16_t test, double residual,
                          double sigma) {
     if (pat.nHits == maxHits) {
-      overflow = true;
+      overflow |= CudaPatternOverflow::hits;
       return;
     }
     hitsOf(pat)[pat.nHits++] = test;
@@ -858,54 +860,103 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   }
 }
 
-__global__ void buildPatternsKernel(
-    CudaHitPayloadArrays hits, CudaCandidateArrays lists,
-    CudaPatternFinderConfig cfg, std::uint32_t firstSeed,
-    CudaPatternRecordArrays out, const std::uint8_t* onlyIf,
-    Pattern* workPatterns, std::uint16_t* workHits) {
-  // Entry b of the records is seed firstSeed + b
+/// The working memory of one batch of seeds: entry b of the batch is seed
+/// firstSeed + b and owns SeedBuilder::nRegions * capacity patterns, each with
+/// maxHits hit positions. After the build, the first nResults[b] patterns of
+/// its result region are its finalized patterns, and overflow[b] holds the
+/// CudaPatternOverflow bits of what did not fit; such a seed has no patterns.
+struct Workspace {
+  Pattern* patterns{nullptr};
+  std::uint16_t* patternHits{nullptr};
+  std::uint32_t* nResults{nullptr};
+  std::uint8_t* overflow{nullptr};
+  std::uint32_t nEntries{0u};
+  std::uint32_t capacity{0u};
+  std::uint32_t maxHits{0u};
+
+  /// The bytes of one pattern slot with its hits
+  __host__ __device__ static std::size_t slotBytes(std::size_t maxHits) {
+    return sizeof(Pattern) + maxHits * sizeof(std::uint16_t);
+  }
+
+  /// The builder of entry b
+  __device__ SeedBuilder builder(const CudaHitPayloadArrays& hits,
+                                 const CudaCandidateArrays& lists,
+                                 const CudaPatternFinderConfig& cfg,
+                                 std::uint32_t seed, std::uint32_t b) const {
+    const std::size_t nWork{SeedBuilder::nRegions *
+                            static_cast<std::size_t>(capacity)};
+    return SeedBuilder{
+        .hits = hits,
+        .cfg = cfg,
+        .rows = lists.candidateIndices + lists.begin(seed),
+        .globLayers = lists.candidateGlobLayer + lists.begin(seed),
+        .patterns = patterns + b * nWork,
+        .patternHits = patternHits + b * nWork * maxHits,
+        .capacity = capacity,
+        .maxHits = maxHits};
+  }
+};
+
+/// Builds the patterns of the seeds of a batch, one thread per seed, into the
+/// workspace
+__global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
+                                    CudaCandidateArrays lists,
+                                    CudaPatternFinderConfig cfg,
+                                    std::uint32_t firstSeed, Workspace ws) {
   const std::uint32_t b{blockIdx.x * blockDim.x + threadIdx.x};
   const std::uint32_t seed{firstSeed + b};
-  if (b >= out.nSeeds || seed >= lists.nSeeds ||
-      (onlyIf != nullptr && onlyIf[b] == 0u)) {
+  if (b >= ws.nEntries || seed >= lists.nSeeds) {
     return;
   }
-  out.nPatterns[b] = 0u;
-  out.overflow[b] = 0u;
+  ws.nResults[b] = 0u;
+  ws.overflow[b] = 0u;
   const std::uint16_t seedPos{lists.seedPosition[seed]};
   if (lists.seedStatus[seed] != CudaSeedStatus::accepted ||
       seedPos == cudaInvalidHitPosition) {
     return;
   }
-  const std::uint32_t nWork{SeedBuilder::nRegions * out.capacityPerSeed};
-  SeedBuilder builder{
-      .hits = hits,
-      .cfg = cfg,
-      .rows = lists.candidateIndices + lists.begin(seed),
-      .globLayers = lists.candidateGlobLayer + lists.begin(seed),
-      .patterns = workPatterns + b * nWork,
-      .patternHits = workHits + b * nWork * out.maxHitsPerPattern,
-      .capacity = out.capacityPerSeed,
-      .maxHits = out.maxHitsPerPattern};
+  SeedBuilder builder{ws.builder(hits, lists, cfg, seed, b)};
   const std::uint32_t nResult{
       builder.build(seedPos, lists.end(seed) - lists.begin(seed),
                     static_cast<std::int8_t>(lists.seedSector[seed]))};
-  if (builder.overflow) {
-    out.overflow[b] = 1u;
+  if (builder.overflow != 0u) {
+    ws.overflow[b] = builder.overflow;
     return;
   }
-
+  // Finalize, keep the patterns that pass the cuts, in order
   std::uint32_t nOut{0u};
   for (std::uint32_t k = 0u; k < nResult; ++k) {
     Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
     pat.meanNormResidual2 /= pat.nBendingLayers();
-    if (!builder.passPatternCuts(pat)) {
-      continue;
+    if (builder.passPatternCuts(pat)) {
+      builder.copy(pat, builder.pattern(SeedBuilder::regionResult, nOut++));
     }
-    writePattern(builder, pat, builder.hitsOf(pat), out, out.slot(b, nOut));
-    ++nOut;
   }
-  out.nPatterns[b] = nOut;
+  ws.nResults[b] = nOut;
+}
+
+/// Writes the finalized patterns of every seed of a batch to the records
+__global__ void exportPatternsKernel(CudaHitPayloadArrays hits,
+                                     CudaCandidateArrays lists,
+                                     CudaPatternFinderConfig cfg,
+                                     std::uint32_t firstSeed, Workspace ws,
+                                     CudaPatternRecordArrays out) {
+  const std::uint32_t b{blockIdx.x * blockDim.x + threadIdx.x};
+  const std::uint32_t seed{firstSeed + b};
+  if (b >= ws.nEntries || b >= out.nSeeds || seed >= lists.nSeeds) {
+    return;
+  }
+  out.overflow[b] = ws.overflow[b];
+  out.nPatterns[b] = ws.nResults[b];
+  if (ws.nResults[b] == 0u) {
+    return;
+  }
+  SeedBuilder builder{ws.builder(hits, lists, cfg, seed, b)};
+  for (std::uint32_t k = 0u; k < ws.nResults[b]; ++k) {
+    const Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
+    writePattern(builder, pat, builder.hitsOf(pat), out, out.slot(b, k));
+  }
 }
 
 /// Copies a pattern record between two containers
@@ -965,40 +1016,42 @@ __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
 /// maxSeedAttempts accepted patterns is skipped. A new pattern that overlaps
 /// a better accepted pattern is dropped; otherwise it is accepted and the
 /// accepted patterns it overlaps are dropped. The accepted patterns therefore
-/// never overlap, and no overlap removal over all of them is needed. Dropped
-/// patterns keep their slot with status rejected. Runs in one thread.
+/// never overlap, and no overlap removal over all of them is needed. Runs in
+/// one thread.
 ///
-/// The patterns of seed b of the batch are in `first`, or in `retry` if the
-/// first build overflowed. If the retry overflowed too, or the event's
-/// patterns are full, the overflow flag of the event is raised.
+/// The patterns of seed b of the batch are the results of entry b of the
+/// workspace. The CudaPatternOverflow bits of a seed that did not fit are
+/// added to those of the event. When the event's slots are full, the dropped
+/// patterns are removed to make room; if they are all accepted, the new
+/// pattern is not taken and the event gets the eventPatterns bit.
 __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
                                      CudaCandidateArrays lists,
                                      CudaPatternFinderConfig cfg,
-                                     std::uint32_t firstSeed,
-                                     CudaPatternRecordArrays first,
-                                     CudaPatternRecordArrays retry,
+                                     std::uint32_t firstSeed, Workspace ws,
                                      CudaPatternRecordArrays event) {
   if (blockIdx.x != 0u || threadIdx.x != 0u) {
     return;
   }
-  auto rowsOf = [](const CudaPatternRecordArrays& r, std::uint32_t slot) {
-    return
-        [&r, slot](std::uint32_t i) { return r.hitIndex[r.hitSlot(slot, i)]; };
+  auto eventRows = [&event](std::uint32_t slot) {
+    return [&event, slot](std::uint32_t i) {
+      return event.hitIndex[event.hitSlot(slot, i)];
+    };
   };
   auto isAlive = [&](std::uint32_t slot) {
     return event.status[slot] == CudaPatternStatus::ok;
   };
   std::uint32_t nEvent{event.nPatterns[0]};
-  for (std::uint32_t b = 0u; b < first.nSeeds; ++b) {
+  for (std::uint32_t b = 0u; b < ws.nEntries; ++b) {
     const std::uint32_t seed{firstSeed + b};
     if (seed >= lists.nSeeds ||
         lists.seedStatus[seed] != CudaSeedStatus::accepted) {
       continue;
     }
-    const CudaPatternRecordArrays& from{first.overflow[b] != 0u ? retry
-                                                                : first};
-    if (from.overflow[b] != 0u) {
-      event.overflow[0] = 1u;
+    if (ws.overflow[b] != 0u) {
+      event.overflow[0] |= ws.overflow[b];
+      continue;
+    }
+    if (ws.nResults[b] == 0u) {
       continue;
     }
     // The skip rule, against the accepted patterns
@@ -1019,16 +1072,18 @@ __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
       continue;
     }
 
-    for (std::uint32_t k = 0u; k < from.nPatterns[b]; ++k) {
-      const std::uint32_t slot{from.slot(b, k)};
-      const PatternInfo info{recordInfo(from, slot)};
-      const std::uint32_t good{countGroups(hits, info.nHits, rowsOf(from, slot),
-                                           cfg.minGroupLayers)};
+    SeedBuilder builder{ws.builder(hits, lists, cfg, seed, b)};
+    for (std::uint32_t k = 0u; k < ws.nResults[b]; ++k) {
+      const Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
+      // The pattern is finalized: its mean is already divided
+      PatternInfo info{builder.info(pat)};
+      info.meanResidual2 = pat.meanNormResidual2;
+      const std::uint32_t good{builder.countGroups(pat, true)};
       auto overlapsWith = [&](std::uint32_t e, std::uint32_t& goodE) {
-        goodE = countGroups(hits, event.nHits[e], rowsOf(event, e),
-                            cfg.minGroupLayers);
-        return areOverlapping(hits, cfg, info, rowsOf(from, slot), good,
-                              recordInfo(event, e), rowsOf(event, e), goodE);
+        goodE =
+            countGroups(hits, event.nHits[e], eventRows(e), cfg.minGroupLayers);
+        return areOverlapping(hits, cfg, info, builder.rowsOf(pat), good,
+                              recordInfo(event, e), eventRows(e), goodE);
       };
       bool beaten{false};
       for (std::uint32_t e = 0u; e < nEvent && !beaten; ++e) {
@@ -1040,8 +1095,21 @@ __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
         continue;
       }
       if (nEvent == event.capacityPerSeed) {
-        event.overflow[0] = 1u;
-        break;
+        // Make room by removing the dropped patterns, keeping the order
+        std::uint32_t nAlive{0u};
+        for (std::uint32_t e = 0u; e < nEvent; ++e) {
+          if (isAlive(e)) {
+            if (e != nAlive) {
+              copyRecord(event, e, event, nAlive);
+            }
+            ++nAlive;
+          }
+        }
+        nEvent = nAlive;
+      }
+      if (nEvent == event.capacityPerSeed) {
+        event.overflow[0] |= CudaPatternOverflow::eventPatterns;
+        continue;
       }
       for (std::uint32_t e = 0u; e < nEvent; ++e) {
         std::uint32_t goodE{0u};
@@ -1050,10 +1118,51 @@ __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
           event.flags[e] |= CudaPatternFlags::isOverlap;
         }
       }
-      copyRecord(from, slot, event, nEvent++);
+      writePattern(builder, pat, builder.hitsOf(pat), event, nEvent++);
     }
   }
   event.nPatterns[0] = nEvent;
+}
+
+/// Allocates the workspace of a batch of nEntries seeds on the stream, with
+/// the given room per seed
+Workspace allocateWorkspace(std::size_t nEntries, std::size_t capacity,
+                            std::size_t maxHits, cudaStream_t stream) {
+  Workspace ws{.nEntries = static_cast<std::uint32_t>(nEntries),
+               .capacity = static_cast<std::uint32_t>(capacity),
+               .maxHits = static_cast<std::uint32_t>(maxHits)};
+  const std::size_t nWork{nEntries * SeedBuilder::nRegions * capacity};
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&ws.patterns),
+                                  nWork * sizeof(Pattern), stream));
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&ws.patternHits),
+                                  nWork * maxHits * sizeof(std::uint16_t),
+                                  stream));
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&ws.nResults),
+                                  nEntries * sizeof(std::uint32_t), stream));
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&ws.overflow),
+                                  nEntries * sizeof(std::uint8_t), stream));
+  return ws;
+}
+
+void freeWorkspace(const Workspace& ws, cudaStream_t stream) {
+  ACTS_CUDA_CHECK(cudaFreeAsync(ws.patterns, stream));
+  ACTS_CUDA_CHECK(cudaFreeAsync(ws.patternHits, stream));
+  ACTS_CUDA_CHECK(cudaFreeAsync(ws.nResults, stream));
+  ACTS_CUDA_CHECK(cudaFreeAsync(ws.overflow, stream));
+}
+
+/// Launches the build of a batch
+void launchBuild(const CudaHitPayloadContainer& hits,
+                 const CudaCandidateListContainer& lists,
+                 const CudaPatternFinderConfig& cfg, std::size_t firstSeed,
+                 const Workspace& ws, cudaStream_t stream) {
+  constexpr unsigned blockSize{64u};
+  const auto nBlocks{
+      static_cast<unsigned>((ws.nEntries + blockSize - 1u) / blockSize)};
+  buildPatternsKernel<<<nBlocks, blockSize, 0, stream>>>(
+      hits.deviceArrays(), lists.deviceArrays(), cfg,
+      static_cast<std::uint32_t>(firstSeed), ws);
+  ACTS_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace
@@ -1084,55 +1193,60 @@ void buildCudaPatterns(const CudaHitPayloadContainer& hits,
                        const CudaPatternFinderConfig& cfg,
                        std::size_t firstSeed,
                        CudaPatternRecordContainer& patterns,
-                       cudaStream_t stream,
-                       const CudaPatternRecordContainer* rebuildOverflowOf) {
-  if (!hits.isOnDevice() || !lists.isOnDevice() || !patterns.isOnDevice() ||
-      (rebuildOverflowOf != nullptr && !rebuildOverflowOf->isOnDevice())) {
+                       cudaStream_t stream) {
+  if (!hits.isOnDevice() || !lists.isOnDevice() || !patterns.isOnDevice()) {
     throw std::invalid_argument(
         "buildCudaPatterns: the hits, the candidate lists and the pattern "
         "records must be on the device");
   }
-  if (rebuildOverflowOf != nullptr &&
-      rebuildOverflowOf->nSeeds() != patterns.nSeeds()) {
-    throw std::invalid_argument(
-        "buildCudaPatterns: the records to rebuild cover other seeds");
-  }
   if (patterns.empty() || firstSeed >= lists.nSeeds()) {
     return;
   }
-  // The working patterns of every seed, released once the kernel is done
-  const std::size_t nWork{patterns.nSeeds() * SeedBuilder::nRegions *
-                          patterns.capacityPerSeed()};
-  Pattern* workPatterns{nullptr};
-  std::uint16_t* workHits{nullptr};
-  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&workPatterns),
-                                  nWork * sizeof(Pattern), stream));
-  ACTS_CUDA_CHECK(cudaMallocAsync(
-      reinterpret_cast<void**>(&workHits),
-      nWork * patterns.maxHitsPerPattern() * sizeof(std::uint16_t), stream));
-
+  const Workspace ws{allocateWorkspace(patterns.nSeeds(),
+                                       patterns.capacityPerSeed(),
+                                       patterns.maxHitsPerPattern(), stream)};
+  launchBuild(hits, lists, cfg, firstSeed, ws, stream);
   constexpr unsigned blockSize{64u};
   const auto nBlocks{
-      static_cast<unsigned>((patterns.nSeeds() + blockSize - 1u) / blockSize)};
-  buildPatternsKernel<<<nBlocks, blockSize, 0, stream>>>(
+      static_cast<unsigned>((ws.nEntries + blockSize - 1u) / blockSize)};
+  exportPatternsKernel<<<nBlocks, blockSize, 0, stream>>>(
       hits.deviceArrays(), lists.deviceArrays(), cfg,
-      static_cast<std::uint32_t>(firstSeed), patterns.deviceArrays(),
-      rebuildOverflowOf != nullptr ? rebuildOverflowOf->deviceArrays().overflow
-                                   : nullptr,
-      workPatterns, workHits);
+      static_cast<std::uint32_t>(firstSeed), ws, patterns.deviceArrays());
   ACTS_CUDA_CHECK(cudaGetLastError());
-
-  ACTS_CUDA_CHECK(cudaFreeAsync(workPatterns, stream));
-  ACTS_CUDA_CHECK(cudaFreeAsync(workHits, stream));
+  freeWorkspace(ws, stream);
 }
 
 CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
-    const CudaPatternFinderConfig& cfg, CudaPatternFinderSizes sizes,
+    const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
     cudaStream_t stream, CudaPatternFinderTiming* timing) {
-  if (sizes.batchSize == 0u) {
-    throw std::invalid_argument("findCudaPatternsInEta: empty batches");
+  if (sizes.batchSize == 0u || sizes.maxHitsPerPattern == 0u ||
+      sizes.maxHitsPerPattern >= cudaInvalidHitPosition) {
+    throw std::invalid_argument(
+        "findCudaPatternsInEta: the batch size and the hits per pattern have "
+        "to be positive, and the hits have to fit the hit positions");
   }
+  // The workspace is taken from the device's memory pool every event. The
+  // pool keeps what is freed, instead of returning it to the system at each
+  // synchronization, so that taking it again costs nothing
+  {
+    int device{0};
+    ACTS_CUDA_CHECK(cudaGetDevice(&device));
+    cudaMemPool_t pool{};
+    ACTS_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, device));
+    std::uint64_t keepAll{std::numeric_limits<std::uint64_t>::max()};
+    ACTS_CUDA_CHECK(cudaMemPoolSetAttribute(
+        pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
+  }
+  // The room per seed is what the workspace budget leaves to each seed of a
+  // batch, at least one pattern per region
+  const std::size_t batchSize{
+      std::max<std::size_t>(1u, std::min(sizes.batchSize, lists.nSeeds()))};
+  const std::size_t capacity{std::max<std::size_t>(
+      1u,
+      sizes.workspaceBytes / (batchSize * SeedBuilder::nRegions *
+                              Workspace::slotBytes(sizes.maxHitsPerPattern)))};
+
   // Marks on the stream: the start, the start of the download and its end
   std::array<cudaEvent_t, 3> marks{};
   if (timing != nullptr) {
@@ -1145,81 +1259,48 @@ CudaPatternRecordContainer findCudaPatternsInEta(
       ACTS_CUDA_CHECK(cudaEventRecord(marks[i], stream));
     }
   };
-  auto elapsedUs = [&](std::size_t from, std::size_t to) {
-    float ms{0.f};
-    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[from], marks[to]));
-    return 1000. * ms;
-  };
-  auto finish = [&](CudaPatternRecordContainer&& event, std::size_t attempt) {
-    if (timing != nullptr) {
-      timing->nAttempts = attempt + 1u;
-      timing->nPatternsInEta = 0u;
-      for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
-        timing->nPatternsInEta +=
-            event.pattern(event.slot(0u, k)).status == CudaPatternStatus::ok;
-      }
-      for (cudaEvent_t& m : marks) {
-        ACTS_CUDA_CHECK(cudaEventDestroy(m));
-      }
-    }
-    return std::move(event);
-  };
+
+  mark(0u);
+  prepareCudaSeeds(hits, lists, cfg, stream);
+  CudaPatternRecordContainer event{1u, sizes.maxPatterns,
+                                   sizes.maxHitsPerPattern};
+  event.moveToDevice(stream);
+  const Workspace ws{
+      allocateWorkspace(batchSize, capacity, sizes.maxHitsPerPattern, stream)};
+  for (std::size_t firstSeed = 0u; firstSeed < lists.nSeeds();
+       firstSeed += batchSize) {
+    launchBuild(hits, lists, cfg, firstSeed, ws, stream);
+    acceptPatternsKernel<<<1, 1, 0, stream>>>(
+        hits.deviceArrays(), lists.deviceArrays(), cfg,
+        static_cast<std::uint32_t>(firstSeed), ws, event.deviceArrays());
+    ACTS_CUDA_CHECK(cudaGetLastError());
+  }
+  freeWorkspace(ws, stream);
+  mark(1u);
+  event.moveToHost(stream);
+  mark(2u);
+  ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
 
   if (timing != nullptr) {
-    timing->kernelsUs = 0.;
-    timing->downloadUs = 0.;
+    auto elapsedUs = [&](std::size_t from, std::size_t to) {
+      float ms{0.f};
+      ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[from], marks[to]));
+      return 1000. * ms;
+    };
+    timing->kernelsUs = elapsedUs(0u, 1u);
+    timing->downloadUs = elapsedUs(1u, 2u);
+    timing->capacityPerSeed = capacity;
+    timing->overflow = event.overflow(0u);
+    timing->nPatternsInEta = 0u;
+    for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
+      timing->nPatternsInEta +=
+          event.pattern(event.slot(0u, k)).status == CudaPatternStatus::ok;
+    }
+    for (cudaEvent_t& m : marks) {
+      ACTS_CUDA_CHECK(cudaEventDestroy(m));
+    }
   }
-  for (std::size_t attempt = 0u;; ++attempt) {
-    mark(0u);
-    prepareCudaSeeds(hits, lists, cfg, stream);
-    const std::size_t batchSize{
-        std::max<std::size_t>(1u, std::min(sizes.batchSize, lists.nSeeds()))};
-    CudaPatternRecordContainer first{batchSize, sizes.capacityPerSeed,
-                                     sizes.maxHitsPerPattern};
-    CudaPatternRecordContainer retry{batchSize, sizes.retryCapacityPerSeed,
-                                     sizes.maxHitsPerPattern};
-    CudaPatternRecordContainer event{1u, sizes.maxPatterns,
-                                     sizes.maxHitsPerPattern};
-    first.moveToDevice(stream);
-    retry.moveToDevice(stream);
-    event.moveToDevice(stream);
-
-    for (std::size_t firstSeed = 0u; firstSeed < lists.nSeeds();
-         firstSeed += batchSize) {
-      buildCudaPatterns(hits, lists, cfg, firstSeed, first, stream);
-      buildCudaPatterns(hits, lists, cfg, firstSeed, retry, stream, &first);
-      acceptPatternsKernel<<<1, 1, 0, stream>>>(
-          hits.deviceArrays(), lists.deviceArrays(), cfg,
-          static_cast<std::uint32_t>(firstSeed), first.deviceArrays(),
-          retry.deviceArrays(), event.deviceArrays());
-      ACTS_CUDA_CHECK(cudaGetLastError());
-    }
-    mark(1u);
-    event.moveToHost(stream);
-    mark(2u);
-    ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (timing != nullptr) {
-      timing->kernelsUs += elapsedUs(0u, 1u);
-      timing->downloadUs += elapsedUs(1u, 2u);
-    }
-    if (!event.overflow(0u)) {
-      return finish(std::move(event), attempt);
-    }
-    if (attempt + 1u >= sizes.maxAttempts) {
-      for (cudaEvent_t& m : marks) {
-        if (timing != nullptr) {
-          ACTS_CUDA_CHECK(cudaEventDestroy(m));
-        }
-      }
-      throw std::runtime_error(
-          "findCudaPatternsInEta: the event still overflows the pattern "
-          "records after the last attempt");
-    }
-    sizes.retryCapacityPerSeed *= 2u;
-    sizes.maxHitsPerPattern = std::min<std::size_t>(
-        2u * sizes.maxHitsPerPattern, cudaInvalidHitPosition - 1u);
-    sizes.maxPatterns *= 2u;
-  }
+  return event;
 }
 
 }  // namespace ActsExamples

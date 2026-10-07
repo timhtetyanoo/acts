@@ -498,6 +498,18 @@ struct CudaPatternStatus {
   static constexpr std::uint8_t rejected = 2u;
 };
 
+/// @brief Bits of the overflow column of the pattern records: what did not fit
+struct CudaPatternOverflow {
+  /// @brief A seed needed more patterns at once than its slots
+  static constexpr std::uint8_t patterns = 1u << 0u;
+  /// @brief A pattern needed more hits than its hit slots
+  static constexpr std::uint8_t hits = 1u << 1u;
+  /// @brief The event had more accepted patterns than its slots
+  static constexpr std::uint8_t eventPatterns = 1u << 2u;
+  /// @brief More seeds of a batch overflowed than the retry has entries for
+  static constexpr std::uint8_t retrySeeds = 1u << 3u;
+};
+
 /// @brief One pattern as plain numbers, the way the host container takes and
 ///        returns it. This is PatternState without the host pointers.
 struct CudaPatternRecordRow {
@@ -551,9 +563,9 @@ struct CudaPatternRecordRow {
 ///
 /// so a seed writes only its own slots and the output order does not depend on
 /// the order the threads run in. nPatterns[seed] is how many of them the seed
-/// filled, and overflow[seed] is set when it needed more slots or more hit
-/// slots than there are; such a seed is rebuilt by the CPU code. Each pattern
-/// slot owns maxHitsPerPattern hit slots.
+/// filled, and overflow[seed] holds the CudaPatternOverflow bits of what did
+/// not fit; such a seed is built again with more room. Each pattern slot owns
+/// maxHitsPerPattern hit slots.
 struct CudaPatternRecordArrays {
   std::int8_t* sector = nullptr;
 
@@ -705,8 +717,9 @@ class CudaPatternRecordContainer {
   void setNPatterns(size_type seed, std::uint32_t nPatterns);
 
   /// @brief Whether a seed ran out of slots and has to be rebuilt on the CPU
-  bool overflow(size_type seed) const;
-  void setOverflow(size_type seed, bool overflow);
+  /// @brief The CudaPatternOverflow bits of a seed, zero if it fitted
+  std::uint8_t overflow(size_type seed) const;
+  void setOverflow(size_type seed, std::uint8_t overflow);
 
   /// @brief Sets every quantity of one pattern slot except the hit list
   void setPattern(size_type patternSlot, const CudaPatternRecordRow& row);

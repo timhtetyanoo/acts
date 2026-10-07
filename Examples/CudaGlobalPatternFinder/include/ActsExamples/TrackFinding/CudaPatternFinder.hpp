@@ -532,22 +532,20 @@ struct CudaPatternFinderConfig {
   CudaPatternMath::Beamspot beamspot{};
 };
 
-/// @brief Sizes of the device buffers of the pattern finding. They bound the
-///        memory, not the result: what does not fit is built again larger
+/// @brief Sizes of the device buffers of the pattern finding. The finding
+///        runs once per event, with buffers of fixed size; what does not fit
+///        is dropped and reported, never built again.
 struct CudaPatternFinderSizes {
   /// @brief Seeds built at once before their patterns are accepted
   std::size_t batchSize{1024u};
-  /// @brief Patterns a seed holds at once in the first build
-  std::size_t capacityPerSeed{8u};
-  /// @brief The same, for the seeds that overflowed the first build
-  std::size_t retryCapacityPerSeed{64u};
-  /// @brief Hits of one pattern
+  /// @brief Device memory for the patterns being built, shared by the seeds
+  ///        of a batch. A seed that needs more room than its share has no
+  ///        patterns and is reported
+  std::size_t workspaceBytes{std::size_t{1} << 30u};
+  /// @brief Hits of one pattern, at most one per detector layer it crosses
   std::size_t maxHitsPerPattern{64u};
   /// @brief Accepted patterns of the event
   std::size_t maxPatterns{4096u};
-  /// @brief Runs of the event, each with doubled retry sizes, before giving
-  ///        up
-  std::size_t maxAttempts{4u};
 };
 
 /// @brief Where the time of one event went, in microseconds, and what the
@@ -560,7 +558,7 @@ struct CudaPatternFinderTiming {
   double fillUs{0.};
   /// @brief Device: copy of the hits and the lists to the device
   double uploadUs{0.};
-  /// @brief Device: seed preparation, builds and accepts, all attempts
+  /// @brief Device: seed preparation, builds and accepts
   double kernelsUs{0.};
   /// @brief Device: copy of the event's patterns to the host
   double downloadUs{0.};
@@ -570,8 +568,11 @@ struct CudaPatternFinderTiming {
   std::size_t nCandidates{0u};
   /// @brief Patterns in eta accepted on the device
   std::size_t nPatternsInEta{0u};
-  /// @brief Runs of the event on the device; more than one if it overflowed
-  std::size_t nAttempts{0u};
+  /// @brief Patterns each seed had room for, from the workspace budget
+  std::size_t capacityPerSeed{0u};
+  /// @brief CudaPatternOverflow bits of what did not fit, whose seeds have no
+  ///        patterns; zero if everything fitted
+  std::uint8_t overflow{0u};
 };
 
 /// @brief Copies the constants out of the CPU config
@@ -621,30 +622,31 @@ void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
 /// The lists must have been through prepareCudaSeeds. Entry b of the records
 /// is seed firstSeed + b, and gets its patterns, already finalized. A seed
 /// that needs more patterns at once than the records have slots per seed, or
-/// more hits in a pattern than they have hit slots, sets its overflow flag and
-/// writes no pattern. With rebuildOverflowOf, only the seeds that overflowed
-/// those records are built. The call waits only for the stream.
-void buildCudaPatterns(
-    const CudaHitPayloadContainer& hits,
-    const CudaCandidateListContainer& lists, const CudaPatternFinderConfig& cfg,
-    std::size_t firstSeed, CudaPatternRecordContainer& patterns,
-    cudaStream_t stream,
-    const CudaPatternRecordContainer* rebuildOverflowOf = nullptr);
+/// more hits in a pattern than they have hit slots, writes no pattern; its
+/// overflow column holds the CudaPatternOverflow bits of what did not fit. The
+/// call waits only for the stream.
+void buildCudaPatterns(const CudaHitPayloadContainer& hits,
+                       const CudaCandidateListContainer& lists,
+                       const CudaPatternFinderConfig& cfg,
+                       std::size_t firstSeed,
+                       CudaPatternRecordContainer& patterns,
+                       cudaStream_t stream);
 
-/// @brief Finds the patterns in eta of an event on the device.
+/// @brief Finds the patterns in eta of an event on the device, in one pass.
 ///
-/// The seeds are prepared, then built in batches in tree order; seeds that
-/// overflow are built again with more room. After each batch, one thread
+/// The seeds are prepared, then built in batches in tree order, each seed in
+/// the room the workspace budget gives it. After each batch, one thread
 /// accepts its patterns seed by seed: a seed whose hit is already in
 /// maxSeedAttempts accepted patterns is skipped, and each new pattern either
-/// replaces the accepted patterns it overlaps or loses to one of them. If the
-/// event still overflows, it is run again with doubled sizes. The hits and the
-/// lists must be on the device. Returns the event's patterns on the host as
-/// the slots of entry 0: the accepted ones have status ok, the dropped ones
-/// status rejected. The call synchronizes the stream.
+/// replaces the accepted patterns it overlaps or loses to one of them. A seed
+/// that did not fit its room, and a pattern that did not fit the event's
+/// slots, are left out; the overflow bits of entry 0 say what did not fit.
+/// The hits and the lists must be on the device. Returns the event's patterns
+/// on the host as the slots of entry 0: the accepted ones have status ok, the
+/// dropped ones status rejected. The call synchronizes the stream.
 CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
-    const CudaPatternFinderConfig& cfg, CudaPatternFinderSizes sizes,
+    const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
     cudaStream_t stream, CudaPatternFinderTiming* timing = nullptr);
 
 }  // namespace ActsExamples
@@ -725,11 +727,9 @@ class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
   struct Config : GlobalPatternFinderAlgorithm::Config {
     /// @brief CudaPatternFinderSizes
     std::size_t batchSize{1024u};
-    std::size_t capacityPerSeed{8u};
-    std::size_t retryCapacityPerSeed{64u};
+    std::size_t workspaceBytes{std::size_t{1} << 30u};
     std::size_t maxHitsPerPattern{64u};
     std::size_t maxPatterns{4096u};
-    std::size_t maxAttempts{4u};
     /// @brief Key of the CudaPatternFinderTiming of each event in the event
     ///        store; nothing is written if empty
     std::string outTiming{};

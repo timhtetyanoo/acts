@@ -643,16 +643,17 @@ void CudaPatternRecordContainer::setNPatterns(size_type seed,
   m_host.nPatterns[seed] = nPatterns;
 }
 
-bool CudaPatternRecordContainer::overflow(size_type seed) const {
+std::uint8_t CudaPatternRecordContainer::overflow(size_type seed) const {
   checkSeed(seed);
 
-  return m_host.overflow[seed] != 0u;
+  return m_host.overflow[seed];
 }
 
-void CudaPatternRecordContainer::setOverflow(size_type seed, bool overflow) {
+void CudaPatternRecordContainer::setOverflow(size_type seed,
+                                             std::uint8_t overflow) {
   checkSeed(seed);
 
-  m_host.overflow[seed] = overflow ? 1u : 0u;
+  m_host.overflow[seed] = overflow;
 }
 
 void CudaPatternRecordContainer::setPattern(size_type patternSlot,
