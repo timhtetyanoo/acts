@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 using namespace Acts::UnitLiterals;
@@ -39,10 +40,11 @@ using OrderedHit = PatternState::OrderedHit;
 namespace {
 ActsExamples::MuonSpacePoint makeSpacePoint(MuonId::StationName station,
                                             MuonId::TechField tech,
-                                            bool measPhi, const Vector3& pos) {
+                                            bool measPhi, const Vector3& pos,
+                                            std::uint8_t layer = 2u) {
   MuonId id{};
   id.setChamber(station, MuonId::DetSide::A, 3u, tech);
-  id.setLayAndCh(2u, 5u);
+  id.setLayAndCh(layer, 5u);
   id.setCoordFlags(true, measPhi, false);
 
   ActsExamples::MuonSpacePoint sp{};
@@ -101,6 +103,89 @@ struct Hits {
     }
   }
 };
+
+/// @brief Trigger strip hits of a straight track from the origin in the
+///        y-z plane, two layers in each of BI, BM and BO, a little off the
+///        line in alternating directions. Then one hit far off the line, and
+///        optionally a second hit on the first BM layer, close to the line
+struct LineHits {
+  ActsExamples::MuonSpacePointBucket bucket{};
+  std::shared_ptr<Surface> surface{};
+  std::vector<ActsExamples::HitPayload> payloads{};
+
+  static constexpr std::uint32_t nOnLine = 6u;
+
+  LineHits(const GeometryContext& gctx, bool withTwin) {
+    using SN = MuonId::StationName;
+    // The strips run along x, perpendicular to the bending plane, and measure
+    // z
+    Transform3 surfaceTrf{Transform3::Identity()};
+    surfaceTrf.linear().col(0) = Vector3::UnitZ();
+    surfaceTrf.linear().col(1) = Vector3::UnitX();
+    surfaceTrf.linear().col(2) = Vector3::UnitY();
+    surface = Surface::makeShared<PlaneSurface>(
+        surfaceTrf, std::make_shared<RectangleBounds>(1._m, 1._m));
+
+    auto add = [&](SN station, double r, double offset, std::uint8_t layer) {
+      auto sp = makeSpacePoint(station, MuonId::TechField::Rpc, false,
+                               {0., r, 0.4 * r + offset}, layer);
+      sp.setCovariance(0.09, 4., 0.);
+      bucket.push_back(sp);
+    };
+    add(SN::BIL, 4800., 0.1, 1u);
+    add(SN::BIL, 5000., -0.1, 2u);
+    add(SN::BML, 7000., 0.1, 1u);
+    add(SN::BML, 7200., -0.1, 2u);
+    add(SN::BOL, 9500., 0.1, 1u);
+    add(SN::BOL, 9700., -0.1, 2u);
+    add(SN::BML, 7400., 60., 3u);
+    if (withTwin) {
+      add(SN::BML, 7000., 0.3, 1u);
+    }
+    for (const auto& sp : bucket) {
+      payloads.emplace_back(gctx, &sp, &bucket, Transform3::Identity(),
+                            surface.get());
+    }
+  }
+};
+
+/// @brief Runs the seed preparation and the pattern building with every hit
+///        on the line as a seed and every hit as its candidate
+ActsExamples::CudaPatternRecordContainer buildLinePatterns(
+    const GeometryContext& gctx, const LineHits& hits, std::size_t capacity) {
+  ActsExamples::GlobalPatternFinder_t::Config cfg{};
+  cfg.minGroupLayers = 2u;
+  std::vector<std::uint32_t> rows(hits.payloads.size());
+  std::iota(rows.begin(), rows.end(), 0u);
+
+  auto payloads =
+      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
+  ActsExamples::CudaCandidateListContainer lists{};
+  // Expanded sector 10 is the centre of sector 5, at phi = 90 degrees
+  for (std::uint32_t seed = 0u; seed < LineHits::nOnLine; ++seed) {
+    lists.addSeed(seed, 10., 0., rows);
+  }
+  ActsExamples::CudaPatternRecordContainer patterns{lists.nSeeds(), capacity,
+                                                    16u};
+  const auto cudaCfg = ActsExamples::makeCudaPatternFinderConfig(
+      cfg, PatternState::BeamspotInfo{});
+
+  ActsExamples::CudaStream stream;
+  payloads.moveToDevice(stream.get());
+  lists.moveToDevice(stream.get());
+  patterns.moveToDevice(stream.get());
+  ActsExamples::prepareCudaSeeds(payloads, lists, cudaCfg, stream.get());
+  ActsExamples::buildCudaPatterns(payloads, lists, cudaCfg, patterns,
+                                  stream.get());
+  patterns.moveToHost(stream.get());
+  stream.synchronize();
+  return patterns;
+}
+
+bool hasCudaDevice() {
+  int deviceCount = 0;
+  return cudaGetDeviceCount(&deviceCount) == cudaSuccess && deviceCount > 0;
+}
 
 Math::Vector3 toMath(const Vector3& v) {
   return {v.x(), v.y(), v.z()};
@@ -248,8 +333,7 @@ BOOST_AUTO_TEST_CASE(CudaPatternLayerOrderMatchesCpu) {
 
 BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
   using ActsExamples::CudaSeedStatus;
-  int deviceCount = 0;
-  if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) {
+  if (!hasCudaDevice()) {
     BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
     return;
   }
@@ -282,7 +366,8 @@ BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
   payloads.moveToDevice(stream.get());
   lists.moveToDevice(stream.get());
   ActsExamples::prepareCudaSeeds(payloads, lists,
-                                 ActsExamples::makeCudaPatternFinderConfig(cfg),
+                                 ActsExamples::makeCudaPatternFinderConfig(
+                                     cfg, PatternState::BeamspotInfo{}),
                                  stream.get());
   lists.moveToHost(stream.get());
   stream.synchronize();
@@ -307,6 +392,75 @@ BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
       }
     }
   }
+}
+
+BOOST_AUTO_TEST_CASE(CudaExpandedSectorMatchesCpu) {
+  namespace Sector = Math::ExpandedSector;
+  using ActsExamples::ExpandedSector;
+  for (int s = 0; s < Sector::nExpanded; ++s) {
+    const ExpandedSector cpu{static_cast<ExpandedSector::Index_t>(s)};
+    BOOST_TEST_CONTEXT("sector " << s) {
+      BOOST_CHECK_EQUAL(cpu.phi(), Sector::phi(s));
+      BOOST_CHECK_EQUAL(cpu.sectorSize(), Sector::size(s));
+      for (int o = 0; o < Sector::nExpanded; ++o) {
+        BOOST_CHECK_EQUAL(cpu.isNeighbour(ExpandedSector{
+                              static_cast<ExpandedSector::Index_t>(o)}),
+                          Sector::isNeighbour(s, o));
+      }
+      for (int i = 0; i < 720; ++i) {
+        const double phi{-Math::pi + i * Math::pi / 360.};
+        BOOST_CHECK_EQUAL(cpu.insideSector(phi), Sector::inside(s, phi));
+      }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternBuildingFindsLine) {
+  if (!hasCudaDevice()) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const LineHits hits{gctx, false};
+  const auto patterns = buildLinePatterns(gctx, hits, 4u);
+
+  // Every seed on the line finds the line, without the outlier
+  for (std::uint32_t seed = 0u; seed < LineHits::nOnLine; ++seed) {
+    BOOST_TEST_CONTEXT("seed " << seed) {
+      BOOST_CHECK(!patterns.overflow(seed));
+      BOOST_REQUIRE_EQUAL(patterns.nPatterns(seed), 1u);
+      const auto slot = patterns.slot(seed, 0u);
+      std::vector<std::uint32_t> found{patterns.hitIndices(slot).begin(),
+                                       patterns.hitIndices(slot).end()};
+      std::ranges::sort(found);
+      std::vector<std::uint32_t> expected(LineHits::nOnLine);
+      std::iota(expected.begin(), expected.end(), 0u);
+      BOOST_CHECK_EQUAL_COLLECTIONS(found.begin(), found.end(),
+                                    expected.begin(), expected.end());
+      BOOST_CHECK_EQUAL(patterns.pattern(slot).nTriggerLayers,
+                        LineHits::nOnLine);
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternBuildingOverflow) {
+  if (!hasCudaDevice()) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  // The second hit on the first BM layer branches the pattern of the first
+  // seed in two
+  const LineHits hits{gctx, true};
+
+  const auto small = buildLinePatterns(gctx, hits, 1u);
+  BOOST_CHECK(small.overflow(0u));
+  BOOST_CHECK_EQUAL(small.nPatterns(0u), 0u);
+
+  // With room for both branches, the overlap removal keeps one of them
+  const auto large = buildLinePatterns(gctx, hits, 4u);
+  BOOST_CHECK(!large.overflow(0u));
+  BOOST_CHECK_EQUAL(large.nPatterns(0u), 1u);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

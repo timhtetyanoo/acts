@@ -27,6 +27,8 @@ namespace ActsExamples::CudaPatternMath {
 /// @brief Acts::s_epsilon
 constexpr double epsilon = 3. * DBL_EPSILON;
 
+constexpr double pi = 3.14159265358979323846;
+
 /// @brief Plain three-vector, usable in a kernel
 struct Vector3 {
   double x{0.};
@@ -62,6 +64,36 @@ __host__ __device__ inline double perp(const Vector3& a) {
   return std::sqrt(a.x * a.x + a.y * a.y);
 }
 
+/// @brief Acts::VectorHelpers::phi
+__host__ __device__ inline double phi(const Vector3& a) {
+  return std::atan2(a.y, a.x);
+}
+
+/// @brief Acts::VectorHelpers::theta
+__host__ __device__ inline double theta(const Vector3& a) {
+  return std::atan2(perp(a), a.z);
+}
+
+/// @brief Acts::makeDirectionFromPhiTheta
+__host__ __device__ inline Vector3 directionFromPhiTheta(double phi,
+                                                         double theta) {
+  const double cosTheta{std::cos(theta)};
+  const double sinTheta{std::sin(theta)};
+  return Vector3{std::cos(phi) * sinTheta, std::sin(phi) * sinTheta, cosTheta};
+}
+
+/// @brief Acts::detail::difference_periodic
+__host__ __device__ inline double differencePeriodic(double lhs, double rhs,
+                                                     double range) {
+  double delta{std::fmod(lhs - rhs, range)};
+  if ((2. * delta) < -range) {
+    delta += range;
+  } else if (range <= (2. * delta)) {
+    delta -= range;
+  }
+  return delta;
+}
+
 /// @brief The quantities of one hit that the arithmetic reads
 struct Hit {
   Vector3 position{};
@@ -73,6 +105,7 @@ struct Hit {
   double phiCovariance{0.};
   double driftCovariance{0.};
   double phiVariance{0.};
+  std::uint64_t geometryId{0u};
   std::uint32_t stationKey{0u};
   std::uint8_t station{0u};
   std::uint8_t locLayer{0u};
@@ -98,6 +131,7 @@ __host__ __device__ inline Hit loadHit(const CudaHitPayloadArrays& hits,
   hit.phiCovariance = hits.phiCovariance[row];
   hit.driftCovariance = hits.driftCovariance[row];
   hit.phiVariance = hits.phiVariance[row];
+  hit.geometryId = hits.geometryId[row];
   hit.stationKey = hits.stationKey[row];
   hit.station = hits.station[row];
   hit.locLayer = hits.locLayer[row];
@@ -120,6 +154,7 @@ inline Hit makeHit(const CudaHitPayloadRow& row) {
   hit.phiCovariance = row.phiCovariance;
   hit.driftCovariance = row.driftCovariance;
   hit.phiVariance = row.phiVariance;
+  hit.geometryId = row.geometryId;
   hit.stationKey = row.stationKey;
   hit.station = row.station;
   hit.locLayer = row.locLayer;
@@ -371,6 +406,12 @@ __host__ __device__ inline bool layerSorter(const Hit& hit1, const Hit& hit2) {
   return st1 == Station::BM;
 }
 
+/// @brief HitPayload::overlaps: the two hits stem from the same measurement
+__host__ __device__ inline bool overlaps(const Hit& hit1, const Hit& hit2) {
+  return hit1.geometryId == hit2.geometryId &&
+         std::abs(hit1.localPositionY - hit2.localPositionY) < epsilon;
+}
+
 /// @brief PatternTopology::sameLayer
 __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
   if (hit1.station != hit2.station) {
@@ -386,6 +427,97 @@ __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
   return std::abs(delta) <= epsilon;
 }
 
+/// @brief The expanded sectors of ActsExamples::ExpandedSector: the 16 muon
+///        sectors and the 16 overlaps between neighbours, numbered 0 to 31.
+///        Even numbers are sector centres, odd ones the overlap with the next
+///        sector
+namespace ExpandedSector {
+constexpr int nMsSectors = 16;
+constexpr int nExpanded = 2 * nMsSectors;
+constexpr double oneEighthOfPi = pi / 8.;
+constexpr double overlap = 0.1 * oneEighthOfPi;
+
+/// @brief sectorMap::sectorSize: half size of a muon sector, without overlap
+__host__ __device__ inline double msSize(int msSector) {
+  return msSector % 2 == 0 ? 0.4 * oneEighthOfPi : 0.6 * oneEighthOfPi;
+}
+
+/// @brief sectorMap::sectorWidth
+__host__ __device__ inline double msWidth(int msSector) {
+  return msSize(msSector) + overlap;
+}
+
+/// @brief sectorMap::sectorPhi
+__host__ __device__ inline double msPhi(int msSector) {
+  if (msSector < 10) {
+    return pi * (msSector - 1) / 8.;
+  }
+  return -pi * (2 - (msSector - 1) / 8.);
+}
+
+/// @brief sectorMap::insideSector
+__host__ __device__ inline bool insideMsSector(int msSector, double phi) {
+  double dphi{phi - msPhi(msSector)};
+  if (dphi > pi) {
+    dphi -= 2 * pi;
+  }
+  if (dphi < -pi) {
+    dphi += 2 * pi;
+  }
+  return !(dphi < -msWidth(msSector)) && !(dphi > msWidth(msSector));
+}
+
+/// @brief ExpandedSector::msSector
+__host__ __device__ inline int msSector(int sector) {
+  return sector < 2 ? nMsSectors : sector / 2;
+}
+
+/// @brief ExpandedSector::adjacentMsSector
+__host__ __device__ inline int adjacentMsSector(int sector) {
+  const int ms{msSector(sector)};
+  if (sector % 2 == 0) {
+    return ms;
+  }
+  return ms == nMsSectors ? 1 : ms + 1;
+}
+
+/// @brief ExpandedSector::phi
+__host__ __device__ inline double phi(int sector) {
+  const int s1{msSector(sector)};
+  const int s2{adjacentMsSector(sector)};
+  if (s1 == s2) {
+    return msPhi(s1);
+  }
+  // The overlap starts at the upper edge of the first sector of the pair
+  double phiO{msPhi(s1) + msSize(s1)};
+  if (phiO > pi) {
+    phiO -= 2 * pi;
+  }
+  return phiO;
+}
+
+/// @brief ExpandedSector::sectorSize
+__host__ __device__ inline double size(int sector) {
+  const int s1{msSector(sector)};
+  if (s1 == adjacentMsSector(sector)) {
+    return msSize(s1);
+  }
+  return msWidth(s1) - msSize(s1);
+}
+
+/// @brief ExpandedSector::insideSector
+__host__ __device__ inline bool inside(int sector, double phi) {
+  return insideMsSector(msSector(sector), phi) &&
+         insideMsSector(adjacentMsSector(sector), phi);
+}
+
+/// @brief ExpandedSector::isNeighbour
+__host__ __device__ inline bool isNeighbour(int sector1, int sector2) {
+  const int dS{std::abs(sector2 - sector1)};
+  return (dS < nExpanded - dS ? dS : nExpanded - dS) <= 1;
+}
+}  // namespace ExpandedSector
+
 }  // namespace ActsExamples::CudaPatternMath
 
 namespace ActsExamples {
@@ -393,20 +525,42 @@ namespace ActsExamples {
 /// @brief The constants of the GlobalPatternFinder config that the kernels
 ///        read
 struct CudaPatternFinderConfig {
-  /// @brief minStripEtaLayers + minPrecisionLayers
-  std::uint32_t minLayers{3u};
+  double nResidualSigma{3.};
+  double nPhiSigma{3.};
+  double minHitDistance4Line{40.};
+  double maxThetaSizeOverlap{0.05};
+  double lowConfidenceResSigma{50.};
+  double meanNormRes2Cut{0.2};
+  std::uint32_t minStripEtaLayers{3u};
+  std::uint32_t minPrecisionLayers{0u};
   std::uint32_t minGroups{2u};
   std::uint32_t minGroupLayers{4u};
+  std::uint32_t maxMissLayersInGroup{2u};
+  CudaPatternMath::Beamspot beamspot{};
 };
 
 /// @brief Copies the constants out of the CPU config
 /// @tparam Config ActsExamples::GlobalPatternFinder_t::Config
-template <typename Config>
-CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg) {
+/// @tparam Beamspot ActsExamples::GlobalPatternFinder_t::BeamspotInfo
+template <typename Config, typename Beamspot>
+CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
+                                                    const Beamspot& beamspot) {
   return CudaPatternFinderConfig{
-      .minLayers = cfg.minStripEtaLayers + cfg.minPrecisionLayers,
+      .nResidualSigma = cfg.nResidualSigma,
+      .nPhiSigma = cfg.nPhiSigma,
+      .minHitDistance4Line = cfg.minHitDistance4Line,
+      .maxThetaSizeOverlap = cfg.maxThetaSizeOverlap,
+      .lowConfidenceResSigma = cfg.lowConfidenceResSigma,
+      .meanNormRes2Cut = cfg.meanNormRes2Cut,
+      .minStripEtaLayers = cfg.minStripEtaLayers,
+      .minPrecisionLayers = cfg.minPrecisionLayers,
       .minGroups = cfg.minGroups,
-      .minGroupLayers = cfg.minGroupLayers};
+      .minGroupLayers = cfg.minGroupLayers,
+      .maxMissLayersInGroup = cfg.maxMissLayersInGroup,
+      .beamspot = {
+          {beamspot.position.x(), beamspot.position.y(), beamspot.position.z()},
+          beamspot.radius,
+          beamspot.length}};
 }
 
 /// @brief Runs the seed preparation of the CPU seed loop on the device, one
@@ -422,5 +576,23 @@ CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg) {
 void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
                       CudaCandidateListContainer& lists,
                       const CudaPatternFinderConfig& cfg, cudaStream_t stream);
+
+/// @brief Builds the patterns of every seed on the device, one thread per
+///        seed, with the logic of GlobalPatternFinder::findPatternsInEta
+///        after the seed checks: the forward and the backward extension, the
+///        overlap removal among the patterns of the seed and the pattern cuts.
+///
+/// The lists must have been through prepareCudaSeeds. Seed s writes its
+/// patterns to its slots in the records, already finalized. A seed that needs
+/// more patterns at once than the records have slots per seed, or more hits in
+/// a pattern than they have hit slots, sets its overflow flag and writes no
+/// pattern; the caller builds it again with larger records. The skip rule and
+/// the overlap removal between seeds are left to the caller. The call waits
+/// only for the stream.
+void buildCudaPatterns(const CudaHitPayloadContainer& hits,
+                       const CudaCandidateListContainer& lists,
+                       const CudaPatternFinderConfig& cfg,
+                       CudaPatternRecordContainer& patterns,
+                       cudaStream_t stream);
 
 }  // namespace ActsExamples
