@@ -540,13 +540,17 @@ BOOST_AUTO_TEST_CASE(CudaPatternRecordDeviceRoundTrip) {
   BOOST_CHECK_EQUAL(device.slot(1, 1), 3u);
   BOOST_CHECK_EQUAL(device.hitSlot(3, 2), 11u);
 
-  // Stand in for a kernel: seed 1 filled two slots, the first holding hit 9
+  // Stand in for a kernel: seed 1 filled two slots, the first holding hit 9.
+  // The writes go on the container's stream, which does not wait for the
+  // default stream
   const std::uint32_t nFilled{2u};
   const std::uint32_t hit{9u};
-  BOOST_REQUIRE(cudaMemcpy(device.nPatterns + 1, &nFilled, sizeof(nFilled),
-                           cudaMemcpyHostToDevice) == cudaSuccess);
-  BOOST_REQUIRE(cudaMemcpy(device.hitIndex + device.hitSlot(2, 0), &hit,
-                           sizeof(hit), cudaMemcpyHostToDevice) == cudaSuccess);
+  BOOST_REQUIRE(cudaMemcpyAsync(device.nPatterns + 1, &nFilled, sizeof(nFilled),
+                                cudaMemcpyHostToDevice,
+                                stream.get()) == cudaSuccess);
+  BOOST_REQUIRE(cudaMemcpyAsync(device.hitIndex + device.hitSlot(2, 0), &hit,
+                                sizeof(hit), cudaMemcpyHostToDevice,
+                                stream.get()) == cudaSuccess);
 
   patterns.moveToHost(stream.get());
   stream.synchronize();
