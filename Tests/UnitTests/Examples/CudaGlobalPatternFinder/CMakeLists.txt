@@ -4,3 +4,4 @@ set(
     ActsExamplesTrackFinding
 )
 add_unittest(CudaPatternFinderData CudaPatternFinderDataTests.cpp)
+add_unittest(CudaPatternFinder CudaPatternFinderTests.cpp)
