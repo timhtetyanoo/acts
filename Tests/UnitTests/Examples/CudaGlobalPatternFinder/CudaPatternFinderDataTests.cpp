@@ -19,6 +19,7 @@
 #include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
 #include "ActsExamples/Utilities/CudaStream.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -49,10 +50,11 @@ MuonId makeId(MuonId::StationName station, MuonId::DetSide side,
 }
 
 /// @brief Build a space point with the given technology and measured coordinates
-ActsExamples::MuonSpacePoint makeSpacePoint(MuonId::TechField tech,
-                                            bool measPhi, const Vector3& pos) {
+ActsExamples::MuonSpacePoint makeSpacePoint(
+    MuonId::TechField tech, bool measPhi, const Vector3& pos,
+    MuonId::StationName station = MuonId::StationName::BML) {
   MuonId id{};
-  id.setChamber(MuonId::StationName::BML, MuonId::DetSide::A, 3u, tech);
+  id.setChamber(station, MuonId::DetSide::A, 3u, tech);
   id.setLayAndCh(2u, 5u);
   id.setCoordFlags(true, measPhi, false);
 
@@ -405,70 +407,115 @@ BOOST_AUTO_TEST_CASE(CudaCandidateListDeviceRoundTrip) {
   BOOST_CHECK(lists.deviceArrays().candidateIndices == nullptr);
 }
 
-BOOST_AUTO_TEST_CASE(CudaPatternRecordHostConstruction) {
-  ActsExamples::CudaPatternRecordContainer patterns{2, 3};
+BOOST_AUTO_TEST_CASE(CudaCandidateListsFromTree) {
+  using ActsExamples::GlobalPatternFinder_t;
+  using StationName = MuonId::StationName;
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const auto surface = Surface::makeShared<PlaneSurface>(
+      Transform3::Identity(), std::make_shared<RectangleBounds>(1._m, 1._m));
 
-  BOOST_CHECK_EQUAL(patterns.nPatterns(), 2u);
-  BOOST_CHECK_EQUAL(patterns.maxHitsPerPattern(), 3u);
-  BOOST_CHECK(!patterns.empty());
+  // Middle, outer and inner layer hits. The inner one is no seed
+  ActsExamples::MuonSpacePointBucket bucket{};
+  for (const StationName station :
+       {StationName::BML, StationName::BOL, StationName::BIL, StationName::BML,
+        StationName::BML}) {
+    bucket.push_back(makeSpacePoint(MuonId::TechField::Rpc, false,
+                                    Vector3{0., 10., 100.}, station));
+  }
+  std::vector<ActsExamples::HitPayload> payloads{};
+  for (const auto& sp : bucket) {
+    payloads.emplace_back(gctx, &sp, &bucket, Transform3::Identity(),
+                          surface.get());
+  }
+
+  // Tree coordinates are sector and theta. Hit 0 enters a second sector, as a
+  // hit close to the sector border does
+  ActsExamples::SearchTree_t::vector_t entries{};
+  auto add = [&](std::size_t hit, double sector, double theta) {
+    entries.push_back({{sector, theta}, &payloads[hit]});
+  };
+  add(0, 4., 0.50);
+  add(1, 4., 0.51);
+  add(2, 4., 0.505);
+  add(3, 4., 0.80);
+  add(4, 6., 0.50);
+  add(0, 5., 0.50);
+  const ActsExamples::SearchTree_t tree{std::move(entries)};
+
+  const ActsExamples::SeedSelector selector{
+      ActsExamples::SeedSelector::Config{}};
+  const auto lists =
+      ActsExamples::makeCudaCandidateLists<GlobalPatternFinder_t>(
+          tree, payloads, selector);
+
+  // Every tree entry but the inner hit is a seed. The candidates are the hits
+  // inside the sector and theta window of the seed
+  BOOST_REQUIRE_EQUAL(lists.nSeeds(), 5u);
+  for (std::size_t seed = 0; seed < lists.nSeeds(); ++seed) {
+    auto candidates = lists.candidateHitIndices(seed);
+    std::vector<std::uint32_t> rows{candidates.begin(), candidates.end()};
+    std::ranges::sort(rows);
+
+    std::vector<std::uint32_t> expected{};
+    if (lists.seedSector(seed) == 4. && lists.seedTheta(seed) < 0.6) {
+      expected = {0u, 1u, 2u};
+    } else {
+      expected = {lists.seedHitIndex(seed)};
+    }
+    BOOST_CHECK_EQUAL_COLLECTIONS(rows.begin(), rows.end(), expected.begin(),
+                                  expected.end());
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaPatternRecordHostConstruction) {
+  // Two seeds with two pattern slots each and three hit slots per pattern
+  ActsExamples::CudaPatternRecordContainer patterns{2, 2, 3};
+
+  BOOST_CHECK_EQUAL(patterns.nSeeds(), 2u);
+  BOOST_CHECK_EQUAL(patterns.nSlots(), 4u);
+  BOOST_CHECK_EQUAL(patterns.slot(1, 1), 3u);
   BOOST_CHECK(!patterns.isOnDevice());
-  BOOST_CHECK_EQUAL(patterns.nHits(0), 0u);
+  BOOST_CHECK_EQUAL(patterns.nPatterns(0), 0u);
+  BOOST_CHECK(!patterns.overflow(0));
   BOOST_CHECK_EQUAL(patterns.pattern(0).lastInsertedHit,
-                    ActsExamples::cudaInvalidHitIndex);
-  BOOST_CHECK_EQUAL(patterns.pattern(0).status,
-                    ActsExamples::CudaPatternStatus::empty);
+                    ActsExamples::cudaInvalidHitPosition);
 
   ActsExamples::CudaPatternRecordRow row{};
-  row.seedIndex = 4u;
   row.sector = 3;
-  row.patPhi = 0.12;
   row.patTheta = 0.40;
-  row.patPhiCov = 1.e-4;
-  row.meanNormResidual2 = 0.05;
-  row.lastResidual = 2.0;
-  row.lastResSigma = 0.5;
   row.linePos = Vector3{1.0, 2.0, 3.0};
-  row.lineDir = Vector3{0.0, 0.0, 1.0};
   row.leverArm = 40.0;
-  row.bendPlaneNorm = Vector3{0.0, 1.0, 0.0};
   row.nPrecisionLayers = 5u;
-  row.nTriggerLayers = 2u;
-  row.nPhiLayers = 1u;
   row.nHits = 2u;
-  row.lastInsertedHit = 11u;
-  row.prevLayerHit = 10u;
-  row.lineAnchorHit = 10u;
-  row.flags = ActsExamples::CudaPatternFlags::needLineUpdate;
+  row.lastInsertedHit = 1u;
+  row.lineAnchorHit = 0u;
+  row.flags = ActsExamples::CudaPatternFlags::isOverlap;
   row.status = ActsExamples::CudaPatternStatus::ok;
 
-  patterns.setPattern(0, row);
-  patterns.setHit(0, 0, 10u, 1u);
-  patterns.setHit(0, 1, 11u, 2u);
+  const std::size_t slot{patterns.slot(0, 0)};
+  patterns.setPattern(slot, row);
+  patterns.setHit(slot, 0, 10u, 1u);
+  patterns.setHit(slot, 1, 11u, 2u);
+  patterns.setNPatterns(0, 1u);
+  patterns.setOverflow(1, true);
 
-  const ActsExamples::CudaPatternRecordRow back{patterns.pattern(0)};
-  BOOST_CHECK_EQUAL(back.seedIndex, 4u);
+  const ActsExamples::CudaPatternRecordRow back{patterns.pattern(slot)};
   BOOST_CHECK_EQUAL(back.sector, 3);
-  BOOST_CHECK_EQUAL(back.patTheta, 0.40);
   BOOST_CHECK(back.linePos == row.linePos);
-  BOOST_CHECK(back.lineDir == row.lineDir);
-  BOOST_CHECK(back.bendPlaneNorm == row.bendPlaneNorm);
-  BOOST_CHECK_EQUAL(back.nPrecisionLayers, 5u);
-  BOOST_CHECK_EQUAL(back.lastInsertedHit, 11u);
+  BOOST_CHECK_EQUAL(back.lastInsertedHit, 1u);
   BOOST_CHECK_EQUAL(back.flags, row.flags);
-  BOOST_CHECK_EQUAL(back.status, ActsExamples::CudaPatternStatus::ok);
-  BOOST_CHECK_EQUAL(patterns.nHits(0), 2u);
-  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 1), 11u);
-  BOOST_CHECK_EQUAL(patterns.globLayer(0, 1), 2u);
-  BOOST_CHECK_EQUAL(patterns.hitIndices(0).size(), 2u);
-  BOOST_CHECK_EQUAL(patterns.hitIndices(0)[0], 10u);
+  // A hit reference is a position in the pattern's own hit list, so it gives
+  // the payload row and the global layer of the hit
+  BOOST_CHECK_EQUAL(patterns.hitIndex(slot, back.lastInsertedHit), 11u);
+  BOOST_CHECK_EQUAL(patterns.globLayer(slot, back.lastInsertedHit), 2u);
+  BOOST_CHECK_EQUAL(patterns.hitIndices(slot).size(), 2u);
+  BOOST_CHECK_EQUAL(patterns.nPatterns(0), 1u);
+  BOOST_CHECK(patterns.overflow(1));
 
-  BOOST_CHECK_EQUAL(patterns.nHits(1), 0u);
-  BOOST_CHECK_EQUAL(patterns.pattern(1).status,
-                    ActsExamples::CudaPatternStatus::empty);
-
-  BOOST_CHECK_THROW(patterns.pattern(2), std::out_of_range);
-  BOOST_CHECK_THROW(patterns.setHit(0, 3, 0u), std::out_of_range);
-  BOOST_CHECK_THROW(patterns.setNHits(0, 4u), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.slot(2, 0), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.slot(0, 2), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.setHit(slot, 3, 0u), std::out_of_range);
+  BOOST_CHECK_THROW(patterns.setNPatterns(0, 3u), std::out_of_range);
 }
 
 BOOST_AUTO_TEST_CASE(CudaPatternRecordDeviceRoundTrip) {
@@ -478,64 +525,41 @@ BOOST_AUTO_TEST_CASE(CudaPatternRecordDeviceRoundTrip) {
     return;
   }
 
-  ActsExamples::CudaPatternRecordContainer patterns{2, 3};
-
-  ActsExamples::CudaPatternRecordRow row{};
-  row.seedIndex = 4u;
-  row.sector = -2;
-  row.patTheta = 0.40;
-  row.linePos = Vector3{1.0, 2.0, 3.0};
-  row.leverArm = 40.0;
-  row.nHits = 2u;
-  row.lastInsertedHit = 11u;
-  row.flags = ActsExamples::CudaPatternFlags::useBeamspot;
-  row.status = ActsExamples::CudaPatternStatus::overflow;
-
-  patterns.setPattern(0, row);
-  patterns.setHit(0, 0, 10u, 1u);
-  patterns.setHit(0, 1, 11u, 2u);
+  ActsExamples::CudaPatternRecordContainer patterns{2, 2, 3};
+  // A host value that must not reach the device: the records are output
+  patterns.setNPatterns(0, 1u);
 
   ActsExamples::CudaStream stream;
   patterns.moveToDevice(stream.get());
   stream.synchronize();
 
+  const ActsExamples::CudaPatternRecordArrays device{patterns.deviceArrays()};
   BOOST_CHECK(patterns.isOnDevice());
-  BOOST_CHECK(patterns.deviceArrays().patTheta != nullptr);
-  BOOST_CHECK(patterns.deviceArrays().hitIndex != nullptr);
-  BOOST_CHECK_EQUAL(patterns.deviceArrays().nPatterns, 2u);
-  BOOST_CHECK_EQUAL(patterns.deviceArrays().maxHitsPerPattern, 3u);
-  BOOST_CHECK_EQUAL(patterns.deviceArrays().hitSlot(1, 2), 5u);
+  BOOST_CHECK(device.hitIndex != nullptr);
+  BOOST_CHECK_EQUAL(device.capacityPerSeed, 2u);
+  BOOST_CHECK_EQUAL(device.slot(1, 1), 3u);
+  BOOST_CHECK_EQUAL(device.hitSlot(3, 2), 11u);
 
-  // Overwrite the host columns, so the copy back is the only source of the
-  // values checked below
-  patterns.setPattern(0, ActsExamples::CudaPatternRecordRow{});
-  patterns.setHit(0, 0, 0u, 0u);
-  patterns.setHit(0, 1, 0u, 0u);
+  // Stand in for a kernel: seed 1 filled two slots, the first holding hit 9
+  const std::uint32_t nFilled{2u};
+  const std::uint32_t hit{9u};
+  BOOST_REQUIRE(cudaMemcpy(device.nPatterns + 1, &nFilled, sizeof(nFilled),
+                           cudaMemcpyHostToDevice) == cudaSuccess);
+  BOOST_REQUIRE(cudaMemcpy(device.hitIndex + device.hitSlot(2, 0), &hit,
+                           sizeof(hit), cudaMemcpyHostToDevice) == cudaSuccess);
 
   patterns.moveToHost(stream.get());
   stream.synchronize();
 
-  const ActsExamples::CudaPatternRecordRow back{patterns.pattern(0)};
-  BOOST_CHECK_EQUAL(back.seedIndex, 4u);
-  BOOST_CHECK_EQUAL(back.sector, -2);
-  BOOST_CHECK_EQUAL(back.patTheta, 0.40);
-  BOOST_CHECK(back.linePos == row.linePos);
-  BOOST_CHECK_EQUAL(back.leverArm, 40.0);
-  BOOST_CHECK_EQUAL(back.nHits, 2u);
-  BOOST_CHECK_EQUAL(back.lastInsertedHit, 11u);
-  BOOST_CHECK_EQUAL(back.flags, row.flags);
-  BOOST_CHECK_EQUAL(back.status, ActsExamples::CudaPatternStatus::overflow);
-  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 0), 10u);
-  BOOST_CHECK_EQUAL(patterns.hitIndex(0, 1), 11u);
-  BOOST_CHECK_EQUAL(patterns.globLayer(0, 1), 2u);
-  BOOST_CHECK_EQUAL(patterns.nHits(1), 0u);
-  BOOST_CHECK_EQUAL(patterns.pattern(1).lastInsertedHit,
-                    ActsExamples::cudaInvalidHitIndex);
+  BOOST_CHECK_EQUAL(patterns.nPatterns(0), 0u);
+  BOOST_CHECK_EQUAL(patterns.nPatterns(1), 2u);
+  BOOST_CHECK(!patterns.overflow(1));
+  BOOST_CHECK_EQUAL(patterns.hitIndex(patterns.slot(1, 0), 0), 9u);
+  BOOST_CHECK_EQUAL(patterns.pattern(0).status,
+                    ActsExamples::CudaPatternStatus::empty);
 
   patterns.clearDevice();
-
   BOOST_CHECK(!patterns.isOnDevice());
-  BOOST_CHECK(patterns.deviceArrays().hitIndex == nullptr);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

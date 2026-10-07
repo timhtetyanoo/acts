@@ -316,8 +316,8 @@ struct CudaCandidateHostData {
   std::vector<double> seedSector;
   std::vector<double> seedTheta;
 
-/// @brief Start index of each seed in candidateIndices. Size is nSeeds() + 1,
-///        starting as {0}
+  /// @brief Start index of each seed in candidateIndices. Size is nSeeds() + 1,
+  ///        starting as {0}
   std::vector<std::uint32_t> candidateOffsets{0};
   std::vector<std::uint32_t> candidateIndices;
 };
@@ -371,9 +371,9 @@ class CudaCandidateListContainer {
   /// @brief Overload taking a braced list of hit rows
   void addSeed(std::uint32_t seedHitIndex, double sector, double theta,
                std::initializer_list<std::uint32_t> hitIndices) {
-    addSeed(seedHitIndex, sector, theta,
-            std::span<const std::uint32_t>{hitIndices.begin(),
-                                           hitIndices.size()});
+    addSeed(
+        seedHitIndex, sector, theta,
+        std::span<const std::uint32_t>{hitIndices.begin(), hitIndices.size()});
   }
 
   /// @brief Overwrites the header of an existing seed. The candidate range
@@ -431,9 +431,9 @@ class CudaCandidateListContainer {
   void checkCandidate(size_type index) const;
 };
 
-/// @brief Payload row used as a sentinel for an unset hit reference in a
-///        pattern, such as lastInsertedHit before any hit is added
-constexpr std::uint32_t cudaInvalidHitIndex = ~std::uint32_t{0};
+/// @brief Position in a pattern's own hit list that marks an unset hit
+///        reference
+constexpr std::uint16_t cudaInvalidHitPosition = 0xFFFFu;
 
 /// @brief Bits of the flags column of a pattern record
 struct CudaPatternFlags {
@@ -443,33 +443,32 @@ struct CudaPatternFlags {
   static constexpr std::uint8_t needLineUpdate = 1u << 1u;
   /// @brief The pattern has passed the quality cuts
   static constexpr std::uint8_t isFinalized = 1u << 2u;
+  /// @brief The pattern lost against an overlapping one and is dropped
+  static constexpr std::uint8_t isOverlap = 1u << 3u;
 };
 
-/// @brief Status of a pattern slot. Overflowing seeds are rebuilt on the CPU
+/// @brief Status of a pattern slot
 struct CudaPatternStatus {
   /// @brief The slot has not been written
   static constexpr std::uint8_t empty = 0u;
   /// @brief The kernel built a pattern
   static constexpr std::uint8_t ok = 1u;
-  /// @brief The kernel ran out of hit slots or branches; rebuild on the CPU
-  static constexpr std::uint8_t overflow = 2u;
   /// @brief The pattern failed the quality cuts
-  static constexpr std::uint8_t rejected = 3u;
+  static constexpr std::uint8_t rejected = 2u;
 };
 
 /// @brief One pattern as plain numbers, the way the host container takes and
-///        returns it. This is PatternState without the host pointers: the
-///        kernel's working state and the record the host tail reads back.
+///        returns it. This is PatternState without the host pointers.
 struct CudaPatternRecordRow {
-  /// @brief Seed that built this pattern, as an index into the candidate lists
-  std::uint32_t seedIndex{0u};
   /// @brief Expanded sector index of the pattern
   std::int8_t sector{0};
   /// @brief Pattern phi and theta, and the variance of phi
   double patPhi{0.};
   double patTheta{0.};
   double patPhiCov{0.};
-  /// @brief Mean over eta hits of the square of residual / uncertainty
+  /// @brief While the pattern is built, the sum over its eta hits of the
+  ///        squared residual over uncertainty. Divided by the number of
+  ///        bending layers once the pattern is finalized, as on the CPU
   double meanNormResidual2{0.};
   /// @brief Residual and uncertainty of the last inserted hit
   double lastResidual{0.};
@@ -487,11 +486,13 @@ struct CudaPatternRecordRow {
   std::uint8_t nPhiLayers{0u};
   /// @brief Number of hits stored in this pattern's slot
   std::uint32_t nHits{0u};
-  /// @brief Payload rows of the last inserted hit, the previous-layer hit and
-  ///        the line anchor. cudaInvalidHitIndex if the reference is unset
-  std::uint32_t lastInsertedHit{cudaInvalidHitIndex};
-  std::uint32_t prevLayerHit{cudaInvalidHitIndex};
-  std::uint32_t lineAnchorHit{cudaInvalidHitIndex};
+  /// @brief Positions in this pattern's own hit list of the last inserted hit,
+  ///        the last hit of the previous layer and the line anchor. A
+  ///        position gives both the payload row and the global layer of the
+  ///        hit, which the CPU compares. cudaInvalidHitPosition if unset
+  std::uint16_t lastInsertedHit{cudaInvalidHitPosition};
+  std::uint16_t prevLayerHit{cudaInvalidHitPosition};
+  std::uint16_t lineAnchorHit{cudaInvalidHitPosition};
   /// @brief Bits of CudaPatternFlags
   std::uint8_t flags{0u};
   /// @brief One of CudaPatternStatus
@@ -502,10 +503,17 @@ struct CudaPatternRecordRow {
 ///        The structure holds raw device pointers and owns no memory. CUDA
 ///        kernels receive it by value.
 ///
-/// Pattern p owns maxHitsPerPattern hit slots starting at
-/// `p * maxHitsPerPattern`. nHits[p] is how many of those slots are used.
+/// Every seed owns capacityPerSeed pattern slots, in order:
+///
+///   seed 0: slot 0, slot 1, ..., slot capacityPerSeed - 1
+///   seed 1: slot 0, ...
+///
+/// so a seed writes only its own slots and the output order does not depend on
+/// the order the threads run in. nPatterns[seed] is how many of them the seed
+/// filled, and overflow[seed] is set when it needed more slots or more hit
+/// slots than there are; such a seed is rebuilt by the CPU code. Each pattern
+/// slot owns maxHitsPerPattern hit slots.
 struct CudaPatternRecordArrays {
-  std::uint32_t* seedIndex = nullptr;
   std::int8_t* sector = nullptr;
 
   double* patPhi = nullptr;
@@ -536,29 +544,39 @@ struct CudaPatternRecordArrays {
 
   std::uint32_t* nHits = nullptr;
 
-  std::uint32_t* lastInsertedHit = nullptr;
-  std::uint32_t* prevLayerHit = nullptr;
-  std::uint32_t* lineAnchorHit = nullptr;
+  std::uint16_t* lastInsertedHit = nullptr;
+  std::uint16_t* prevLayerHit = nullptr;
+  std::uint16_t* lineAnchorHit = nullptr;
 
   std::uint8_t* flags = nullptr;
   std::uint8_t* status = nullptr;
 
+  /// @brief Payload row and global layer of every hit slot
   std::uint32_t* hitIndex = nullptr;
-  std::uint32_t* globLayer = nullptr;
+  std::uint16_t* globLayer = nullptr;
 
-  std::uint32_t nPatterns = 0;
+  /// @brief Number of filled slots and the overflow flag of every seed
+  std::uint32_t* nPatterns = nullptr;
+  std::uint8_t* overflow = nullptr;
+
+  std::uint32_t nSeeds = 0;
+  std::uint32_t capacityPerSeed = 0;
   std::uint32_t maxHitsPerPattern = 0;
 
-  /// @brief Flat index of hit slot `local` of pattern `pattern`
+  /// @brief Pattern slot k of a seed
+  __host__ __device__ std::uint32_t slot(std::uint32_t seed,
+                                         std::uint32_t k) const noexcept {
+    return seed * capacityPerSeed + k;
+  }
+  /// @brief Hit slot `local` of a pattern slot
   __host__ __device__ std::uint32_t hitSlot(
-      std::uint32_t pattern, std::uint32_t local) const noexcept {
-    return pattern * maxHitsPerPattern + local;
+      std::uint32_t patternSlot, std::uint32_t local) const noexcept {
+    return patternSlot * maxHitsPerPattern + local;
   }
 };
 
 /// @brief Host copy of the pattern records
 struct CudaPatternRecordHostData {
-  std::vector<std::uint32_t> seedIndex;
   std::vector<std::int8_t> sector;
 
   std::vector<double> patPhi;
@@ -589,32 +607,37 @@ struct CudaPatternRecordHostData {
 
   std::vector<std::uint32_t> nHits;
 
-  std::vector<std::uint32_t> lastInsertedHit;
-  std::vector<std::uint32_t> prevLayerHit;
-  std::vector<std::uint32_t> lineAnchorHit;
+  std::vector<std::uint16_t> lastInsertedHit;
+  std::vector<std::uint16_t> prevLayerHit;
+  std::vector<std::uint16_t> lineAnchorHit;
 
   std::vector<std::uint8_t> flags;
   std::vector<std::uint8_t> status;
 
   std::vector<std::uint32_t> hitIndex;
-  std::vector<std::uint32_t> globLayer;
+  std::vector<std::uint16_t> globLayer;
+
+  std::vector<std::uint32_t> nPatterns;
+  std::vector<std::uint8_t> overflow;
 };
 
-/// @brief CUDA-backed pattern records: one fixed slot per pattern, each with
-///        room for maxHitsPerPattern payload rows.
+/// @brief CUDA-backed pattern records, the output of the pattern building.
 ///
-/// The kernel writes these slots as it builds. A pattern that would need more
-/// hits than the slot holds is marked overflow and rebuilt on the CPU. Hit
-/// rows are indices into CudaHitPayloadContainer.
+/// The records are written by the kernel, so moveToDevice() allocates the
+/// device buffers and zeroes the counts, the overflow flags and the slot status
+/// without uploading anything, as CudaHoughMaximumBatch does. moveToHost()
+/// copies every slot back, used or not. Hit rows are indices into
+/// CudaHitPayloadContainer.
 class CudaPatternRecordContainer {
  public:
   using size_type = std::size_t;
 
-  /// Constructor with a fixed number of pattern slots and a hit capacity
-  /// per slot.
-  /// @param nPatterns The number of pattern slots.
-  /// @param maxHitsPerPattern The number of hit slots of each pattern.
-  CudaPatternRecordContainer(size_type nPatterns, size_type maxHitsPerPattern);
+  /// @brief Constructor with the slots of every seed
+  /// @param nSeeds The number of seeds
+  /// @param capacityPerSeed The number of pattern slots of each seed
+  /// @param maxHitsPerPattern The number of hit slots of each pattern
+  CudaPatternRecordContainer(size_type nSeeds, size_type capacityPerSeed,
+                             size_type maxHitsPerPattern);
 
   CudaPatternRecordContainer(const CudaPatternRecordContainer&) = delete;
   CudaPatternRecordContainer& operator=(const CudaPatternRecordContainer&) =
@@ -626,50 +649,58 @@ class CudaPatternRecordContainer {
 
   ~CudaPatternRecordContainer() noexcept;
 
-  /// @brief Returns the number of pattern slots
-  size_type nPatterns() const noexcept { return m_nPatterns; }
-
-  /// @brief Returns the hit capacity of one pattern slot
+  size_type nSeeds() const noexcept { return m_nSeeds; }
+  size_type capacityPerSeed() const noexcept { return m_capacityPerSeed; }
   size_type maxHitsPerPattern() const noexcept { return m_maxHitsPerPattern; }
+  /// @brief Returns the number of pattern slots of all seeds together
+  size_type nSlots() const noexcept { return m_nSeeds * m_capacityPerSeed; }
+  bool empty() const noexcept { return nSlots() == 0; }
 
-  /// @brief Checks whether there are no pattern slots
-  bool empty() const noexcept { return nPatterns() == 0; }
+  /// @brief Returns pattern slot k of a seed
+  size_type slot(size_type seed, size_type k) const;
 
-  /// @brief Sets every quantity of one pattern except the hit list
-  void setPattern(size_type pattern, const CudaPatternRecordRow& row);
+  /// @brief Number of slots a seed filled
+  std::uint32_t nPatterns(size_type seed) const;
+  void setNPatterns(size_type seed, std::uint32_t nPatterns);
 
-  /// @brief Returns every quantity of one pattern except the hit list
-  CudaPatternRecordRow pattern(size_type pattern) const;
+  /// @brief Whether a seed ran out of slots and has to be rebuilt on the CPU
+  bool overflow(size_type seed) const;
+  void setOverflow(size_type seed, bool overflow);
 
-  /// @brief Sets one hit of a pattern. local must be less than
-  ///        maxHitsPerPattern()
-  /// @param pattern The pattern slot
+  /// @brief Sets every quantity of one pattern slot except the hit list
+  void setPattern(size_type patternSlot, const CudaPatternRecordRow& row);
+
+  /// @brief Returns every quantity of one pattern slot except the hit list
+  CudaPatternRecordRow pattern(size_type patternSlot) const;
+
+  /// @brief Sets one hit of a pattern slot
+  /// @param patternSlot The pattern slot
   /// @param local The hit slot inside the pattern
   /// @param hitIndex The payload row of the hit
   /// @param globLayer The global layer number of the hit
-  void setHit(size_type pattern, size_type local, std::uint32_t hitIndex,
-              std::uint32_t globLayer = 0u);
+  void setHit(size_type patternSlot, size_type local, std::uint32_t hitIndex,
+              std::uint16_t globLayer = 0u);
 
-  /// @brief Sets how many hit slots of a pattern are in use
-  void setNHits(size_type pattern, std::uint32_t nHits);
+  /// @brief Sets how many hit slots of a pattern slot are in use
+  void setNHits(size_type patternSlot, std::uint32_t nHits);
 
-  /// @brief Returns how many hit slots of a pattern are in use
-  std::uint32_t nHits(size_type pattern) const;
+  /// @brief Returns how many hit slots of a pattern slot are in use
+  std::uint32_t nHits(size_type patternSlot) const;
 
-  /// @brief Payload row of one hit of a pattern
-  std::uint32_t hitIndex(size_type pattern, size_type local) const;
+  /// @brief Payload row of one hit of a pattern slot
+  std::uint32_t hitIndex(size_type patternSlot, size_type local) const;
 
-  /// @brief Global layer number of one hit of a pattern
-  std::uint32_t globLayer(size_type pattern, size_type local) const;
+  /// @brief Global layer number of one hit of a pattern slot
+  std::uint16_t globLayer(size_type patternSlot, size_type local) const;
 
-  /// @brief Payload rows of the used hits of a pattern
-  std::span<const std::uint32_t> hitIndices(size_type pattern) const;
+  /// @brief Payload rows of the used hits of a pattern slot
+  std::span<const std::uint32_t> hitIndices(size_type patternSlot) const;
 
-  /// @brief Copies all host columns on a CUDA stream.
-  /// The method waits only for the supplied stream.
+  /// @brief Allocates the device buffers and zeroes the counts, the overflow
+  ///        flags and the slot status. Nothing is uploaded.
   void moveToDevice(cudaStream_t stream);
 
-  /// @brief Copies all device columns on a CUDA stream.
+  /// @brief Copies the counts, the overflow flags and every slot to the host.
   /// The method waits only for the supplied stream.
   void moveToHost(cudaStream_t stream);
 
@@ -683,15 +714,17 @@ class CudaPatternRecordContainer {
   CudaPatternRecordArrays deviceArrays() const noexcept { return m_device; }
 
  private:
-  size_type m_nPatterns = 0;
+  size_type m_nSeeds = 0;
+  size_type m_capacityPerSeed = 0;
   size_type m_maxHitsPerPattern = 0;
   CudaPatternRecordHostData m_host{};
   CudaPatternRecordArrays m_device{};
   bool m_onDevice = false;
 
-  size_type hitSlot(size_type pattern, size_type local) const;
-  void checkPattern(size_type pattern) const;
-  void checkHit(size_type pattern, size_type local) const;
+  size_type hitSlot(size_type patternSlot, size_type local) const;
+  void checkSeed(size_type seed) const;
+  void checkSlot(size_type patternSlot) const;
+  void checkHit(size_type patternSlot, size_type local) const;
 };
 
 /// @brief Position of the precision coordinate in MuonSpacePoint::covariance()
@@ -788,6 +821,58 @@ CudaHitPayloadContainer makeCudaHitPayloadContainer(
     container.setHit(row, makeCudaHitPayloadRow(gctx, hits[row]));
   }
   return container;
+}
+
+/// @brief Builds the per-seed candidate lists of an event from the host tree,
+///        as the CPU seed loop does.
+///
+/// Every tree entry is a seed candidate, in the order of the tree. An entry
+/// that is not good for seeding is left out; every other gets the hits of the
+/// same range search the CPU makes, in the order the search returns them. A
+/// hit enters the tree once per sector it is projected into, so the same hit
+/// can be several seeds. The skip rule is not applied: it depends on the
+/// patterns found before a seed and is replayed by the driver.
+///
+/// @tparam Finder The pattern finder, for its tree and coordinate types
+///         (ActsExamples::GlobalPatternFinder_t)
+/// @param tree The search tree. Its entries point into payloads
+/// @param payloads The hit payloads, in the order of the payload container rows
+/// @param seedSelector The seed selector of the pattern finder
+/// @return The candidate lists, on the host
+template <typename Finder, typename Payload, typename Selector>
+CudaCandidateListContainer makeCudaCandidateLists(
+    const typename Finder::SearchTree_t& tree,
+    const std::vector<Payload>& payloads, const Selector& seedSelector) {
+  using HitCoords = typename Finder::HitCoords;
+  constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
+  constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);
+  auto row = [&payloads](const Payload* hit) {
+    return static_cast<std::uint32_t>(hit - payloads.data());
+  };
+
+  CudaCandidateListContainer lists{};
+  std::vector<std::uint32_t> candidates{};
+  for (const auto& [seedCoords, seedPtr] : tree) {
+    if (!seedSelector.goodForSeeding(*seedPtr)) {
+      continue;
+    }
+    // The window of GlobalPatternFinder::findPatternsInEta
+    typename Finder::SearchTree_t::range_t selectRange{};
+    selectRange[sectorIdx].shrink(seedCoords[sectorIdx] - 0.1,
+                                  seedCoords[sectorIdx] + 0.1);
+    const double thetaHalfWindow{seedSelector.thetaSearchWindow(*seedPtr) / 2.};
+    selectRange[thetaIdx].shrink(seedCoords[thetaIdx] - thetaHalfWindow,
+                                 seedCoords[thetaIdx] + thetaHalfWindow);
+
+    candidates.clear();
+    tree.rangeSearchMapDiscard(selectRange,
+                               [&](const auto& /*coords*/, const Payload* hit) {
+                                 candidates.push_back(row(hit));
+                               });
+    lists.addSeed(row(seedPtr), seedCoords[sectorIdx], seedCoords[thetaIdx],
+                  candidates);
+  }
+  return lists;
 }
 
 }  // namespace ActsExamples
