@@ -285,7 +285,9 @@ class CudaHitPayloadContainer {
 /// Seed s owns the candidate hit rows
 /// `[candidateOffsets[s], candidateOffsets[s + 1])` of candidateIndices.
 /// Those rows are indices into CudaHitPayloadContainer. The lists are the
-/// output of the host tree range search; the skip rule is not applied.
+/// output of the host tree range search; the skip rule is not applied. The
+/// seed preparation kernel sorts each list in place and fills the output
+/// columns.
 struct CudaCandidateArrays {
   std::uint32_t* seedHitIndex = nullptr;
   double* seedSector = nullptr;
@@ -293,6 +295,13 @@ struct CudaCandidateArrays {
 
   std::uint32_t* candidateOffsets = nullptr;
   std::uint32_t* candidateIndices = nullptr;
+
+  /// @brief Output: CudaSeedStatus of each seed
+  std::uint8_t* seedStatus = nullptr;
+  /// @brief Output: position of the seed hit in its sorted candidate list
+  std::uint16_t* seedPosition = nullptr;
+  /// @brief Output: global layer number of each candidate
+  std::uint16_t* candidateGlobLayer = nullptr;
 
   std::uint32_t nSeeds = 0;
   std::uint32_t nCandidates = 0;
@@ -320,6 +329,27 @@ struct CudaCandidateHostData {
   ///        starting as {0}
   std::vector<std::uint32_t> candidateOffsets{0};
   std::vector<std::uint32_t> candidateIndices;
+
+  std::vector<std::uint8_t> seedStatus;
+  std::vector<std::uint16_t> seedPosition;
+  std::vector<std::uint16_t> candidateGlobLayer;
+};
+
+/// @brief Values of the seed status column, in the order the CPU seed loop
+///        applies its cuts
+struct CudaSeedStatus {
+  /// @brief The seed preparation has not run
+  static constexpr std::uint8_t pending = 0u;
+  /// @brief The seed goes on to pattern building
+  static constexpr std::uint8_t accepted = 1u;
+  /// @brief Fewer candidates than minStripEtaLayers + minPrecisionLayers
+  static constexpr std::uint8_t tooFewHits = 2u;
+  /// @brief Fewer than minGroups groups with minGroupLayers candidates
+  static constexpr std::uint8_t tooFewGroups = 3u;
+  /// @brief Fewer layers than minStripEtaLayers + minPrecisionLayers
+  static constexpr std::uint8_t tooFewLayers = 4u;
+  /// @brief The list does not fit the 16-bit positions; left to the CPU
+  static constexpr std::uint8_t overflow = 5u;
 };
 
 /// @brief CUDA-backed per-seed candidate lists: a flat list of payload rows
@@ -405,8 +435,19 @@ class CudaCandidateListContainer {
   /// @brief Payload rows of every candidate of a seed
   std::span<const std::uint32_t> candidateHitIndices(size_type seed) const;
 
-  /// @brief Copies all host columns on a CUDA stream.
-  /// The method waits only for the supplied stream.
+  /// @brief CudaSeedStatus of a seed, after the seed preparation
+  std::uint8_t seedStatus(size_type seed) const;
+
+  /// @brief Position of the seed hit in its sorted list, after the seed
+  ///        preparation
+  std::uint16_t seedPosition(size_type seed) const;
+
+  /// @brief Global layer numbers of every candidate of a seed, after the seed
+  ///        preparation
+  std::span<const std::uint16_t> candidateGlobLayers(size_type seed) const;
+
+  /// @brief Copies the input columns on a CUDA stream and zeroes the output
+  ///        columns. The method waits only for the supplied stream.
   void moveToDevice(cudaStream_t stream);
 
   /// @brief Copies all device columns on a CUDA stream.

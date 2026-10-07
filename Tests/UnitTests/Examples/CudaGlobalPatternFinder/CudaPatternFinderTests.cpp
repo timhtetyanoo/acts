@@ -18,7 +18,9 @@
 #include "ActsExamples/EventData/MuonSpacePoint.hpp"
 #include "ActsExamples/TrackFinding/CudaPatternFinder.hpp"
 #include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
+#include "ActsExamples/Utilities/CudaStream.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -108,6 +110,62 @@ Math::Vector3 toMath(const Vector3& v) {
 bool same(const Vector3& cpu, const Math::Vector3& device) {
   return cpu.x() == device.x && cpu.y() == device.y && cpu.z() == device.z;
 }
+
+/// @brief The candidate checks of GlobalPatternFinder::findPatternsInEta on
+///        one list, written with the CPU types. The sort is stable, as the
+///        device sort is
+struct CpuSeed {
+  std::uint8_t status{ActsExamples::CudaSeedStatus::pending};
+  std::vector<std::uint32_t> rows{};
+  std::vector<std::uint16_t> globLayer{};
+  std::uint16_t seedPosition{0u};
+};
+CpuSeed prepareSeedOnCpu(
+    const std::vector<ActsExamples::HitPayload>& payloads,
+    std::vector<std::uint32_t> rows, std::uint32_t seedRow,
+    const ActsExamples::GlobalPatternFinder_t::Config& cfg) {
+  using ActsExamples::CudaSeedStatus;
+  using ActsExamples::PatternTopology;
+  CpuSeed out{};
+  if (rows.size() < cfg.minStripEtaLayers + cfg.minPrecisionLayers) {
+    out.status = CudaSeedStatus::tooFewHits;
+    return out;
+  }
+  std::array<PatternTopology::GroupIdx, PatternTopology::nGroups> groupCounts{};
+  PatternTopology::GroupIdx nValidGroups{0u};
+  for (const std::uint32_t row : rows) {
+    if (++groupCounts[PatternTopology::groupIndex(payloads[row])] ==
+        cfg.minGroupLayers) {
+      ++nValidGroups;
+    }
+    if (nValidGroups >= cfg.minGroups) {
+      break;
+    }
+  }
+  if (nValidGroups < cfg.minGroups) {
+    out.status = CudaSeedStatus::tooFewGroups;
+    return out;
+  }
+  std::ranges::stable_sort(rows, [&](std::uint32_t r1, std::uint32_t r2) {
+    return PatternTopology::layerSorter(payloads[r1], payloads[r2]);
+  });
+  out.globLayer.push_back(0u);
+  for (std::size_t i = 1; i < rows.size(); ++i) {
+    out.globLayer.push_back(
+        out.globLayer.back() +
+        !PatternTopology::sameLayer(payloads[rows[i - 1]], payloads[rows[i]]));
+  }
+  out.rows = rows;
+  if (out.globLayer.back() + 1u <
+      cfg.minStripEtaLayers + cfg.minPrecisionLayers) {
+    out.status = CudaSeedStatus::tooFewLayers;
+    return out;
+  }
+  out.status = CudaSeedStatus::accepted;
+  out.seedPosition = static_cast<std::uint16_t>(
+      std::ranges::find(rows, seedRow) - rows.begin());
+  return out;
+}
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(CudaPatternFinderSuite)
@@ -185,6 +243,69 @@ BOOST_AUTO_TEST_CASE(CudaPatternLayerOrderMatchesCpu) {
     BOOST_CHECK_EQUAL(
         static_cast<unsigned>(PatternTopology::groupIndex(hits.payloads[i])),
         static_cast<unsigned>(Math::groupIndex(hits.device[i])));
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
+  using ActsExamples::CudaSeedStatus;
+  int deviceCount = 0;
+  if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) {
+    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
+    return;
+  }
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const Hits hits{gctx};
+  ActsExamples::GlobalPatternFinder_t::Config cfg{};
+  cfg.minGroups = 1u;
+  cfg.minGroupLayers = 2u;
+
+  // One seed per outcome. Rows 1, 3 and 4 are the three BM hits
+  struct Seed {
+    std::uint32_t seedRow;
+    std::vector<std::uint32_t> rows;
+    std::uint8_t expected;
+  };
+  const std::vector<Seed> seeds{
+      {2u, {8u, 7u, 6u, 5u, 4u, 3u, 2u, 1u, 0u}, CudaSeedStatus::accepted},
+      {1u, {1u, 3u}, CudaSeedStatus::tooFewHits},
+      {0u, {0u, 2u, 5u, 6u}, CudaSeedStatus::tooFewGroups},
+      {1u, {1u, 1u, 1u}, CudaSeedStatus::tooFewLayers},
+      {3u, {4u, 3u, 1u, 0u, 2u}, CudaSeedStatus::accepted}};
+
+  auto payloads =
+      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
+  ActsExamples::CudaCandidateListContainer lists{};
+  for (const Seed& seed : seeds) {
+    lists.addSeed(seed.seedRow, 0., 0., seed.rows);
+  }
+  ActsExamples::CudaStream stream;
+  payloads.moveToDevice(stream.get());
+  lists.moveToDevice(stream.get());
+  ActsExamples::prepareCudaSeeds(payloads, lists,
+                                 ActsExamples::makeCudaPatternFinderConfig(cfg),
+                                 stream.get());
+  lists.moveToHost(stream.get());
+  stream.synchronize();
+
+  for (std::size_t s = 0; s < seeds.size(); ++s) {
+    const CpuSeed cpu{
+        prepareSeedOnCpu(hits.payloads, seeds[s].rows, seeds[s].seedRow, cfg)};
+    BOOST_TEST_CONTEXT("seed " << s) {
+      BOOST_CHECK_EQUAL(cpu.status, seeds[s].expected);
+      BOOST_CHECK_EQUAL(lists.seedStatus(s), cpu.status);
+      if (cpu.status == CudaSeedStatus::accepted) {
+        BOOST_CHECK_EQUAL(lists.seedPosition(s), cpu.seedPosition);
+      }
+      if (!cpu.rows.empty()) {
+        const auto rows = lists.candidateHitIndices(s);
+        const auto globLayer = lists.candidateGlobLayers(s);
+        BOOST_CHECK_EQUAL_COLLECTIONS(rows.begin(), rows.end(),
+                                      cpu.rows.begin(), cpu.rows.end());
+        BOOST_CHECK_EQUAL_COLLECTIONS(globLayer.begin(), globLayer.end(),
+                                      cpu.globLayer.begin(),
+                                      cpu.globLayer.end());
+      }
+    }
   }
 }
 

@@ -52,15 +52,29 @@ constexpr auto hitPayloadColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.flags, device.flags);
 };
 
-/// The host column and the device column of every field of the candidate
-/// lists. Offsets are one longer than the per-seed columns; the visit uses
-/// each vector's own size.
-constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
+/// The host column and the device column of every input field of the
+/// candidate lists. Offsets are one longer than the per-seed columns; the visit
+/// uses each vector's own size.
+constexpr auto candidateInputColumns = [](auto& host, auto& device,
+                                          auto&& visit) {
   visit(host.seedHitIndex, device.seedHitIndex);
   visit(host.seedSector, device.seedSector);
   visit(host.seedTheta, device.seedTheta);
   visit(host.candidateOffsets, device.candidateOffsets);
   visit(host.candidateIndices, device.candidateIndices);
+};
+
+/// The columns the seed preparation kernel writes
+constexpr auto candidateOutputColumns = [](auto& host, auto& device,
+                                           auto&& visit) {
+  visit(host.seedStatus, device.seedStatus);
+  visit(host.seedPosition, device.seedPosition);
+  visit(host.candidateGlobLayer, device.candidateGlobLayer);
+};
+
+constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
+  candidateInputColumns(host, device, visit);
+  candidateOutputColumns(host, device, visit);
 };
 
 /// The host column and the device column of every per-slot field of the
@@ -390,6 +404,10 @@ void CudaCandidateListContainer::addSeed(
                                  hitIndices.begin(), hitIndices.end());
   m_host.candidateOffsets.push_back(
       static_cast<std::uint32_t>(m_host.candidateIndices.size()));
+
+  m_host.seedStatus.push_back(CudaSeedStatus::pending);
+  m_host.seedPosition.push_back(0u);
+  m_host.candidateGlobLayer.resize(m_host.candidateIndices.size(), 0u);
 }
 
 void CudaCandidateListContainer::setSeed(size_type seed,
@@ -464,11 +482,36 @@ std::span<const std::uint32_t> CudaCandidateListContainer::candidateHitIndices(
                                         end - begin};
 }
 
+std::uint8_t CudaCandidateListContainer::seedStatus(size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.seedStatus[seed];
+}
+
+std::uint16_t CudaCandidateListContainer::seedPosition(size_type seed) const {
+  checkSeed(seed);
+
+  return m_host.seedPosition[seed];
+}
+
+std::span<const std::uint16_t> CudaCandidateListContainer::candidateGlobLayers(
+    size_type seed) const {
+  const size_type begin{candidateBegin(seed)};
+  const size_type end{candidateEnd(seed)};
+  return std::span<const std::uint16_t>{
+      m_host.candidateGlobLayer.data() + begin, end - begin};
+}
+
 void CudaCandidateListContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
   allocateColumns(candidateColumns, m_host, m_device);
-  copyColumnsToDevice(candidateColumns, m_host, m_device, stream);
+  copyColumnsToDevice(candidateInputColumns, m_host, m_device, stream);
+  // Zeroed, so that a seed the kernel has not reached reads as pending
+  candidateOutputColumns(
+      m_host, m_device, [stream](const auto& hostColumn, auto& deviceColumn) {
+        zeroDeviceColumn(deviceColumn, hostColumn.size(), stream);
+      });
 
   m_device.nSeeds = static_cast<std::uint32_t>(nSeeds());
   m_device.nCandidates = static_cast<std::uint32_t>(nCandidates());

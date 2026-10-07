@@ -287,7 +287,9 @@ __host__ __device__ inline LineResidual lineResidual(
 namespace Station {
 constexpr std::uint8_t BI = 0u, BM = 1u, BO = 2u, BE = 3u, EI = 4u, EM = 5u,
                        EO = 6u, EE = 7u;
-}
+/// @brief PatternTopology::nGroups
+constexpr std::uint8_t nGroups = 8u;
+}  // namespace Station
 namespace Layer {
 constexpr std::uint8_t Inner = 0u, Middle = 1u, Outer = 2u, Extended = 3u,
                        BarrelExtended = 4u;
@@ -385,3 +387,40 @@ __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
 }
 
 }  // namespace ActsExamples::CudaPatternMath
+
+namespace ActsExamples {
+
+/// @brief The constants of the GlobalPatternFinder config that the kernels
+///        read
+struct CudaPatternFinderConfig {
+  /// @brief minStripEtaLayers + minPrecisionLayers
+  std::uint32_t minLayers{3u};
+  std::uint32_t minGroups{2u};
+  std::uint32_t minGroupLayers{4u};
+};
+
+/// @brief Copies the constants out of the CPU config
+/// @tparam Config ActsExamples::GlobalPatternFinder_t::Config
+template <typename Config>
+CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg) {
+  return CudaPatternFinderConfig{
+      .minLayers = cfg.minStripEtaLayers + cfg.minPrecisionLayers,
+      .minGroups = cfg.minGroups,
+      .minGroupLayers = cfg.minGroupLayers};
+}
+
+/// @brief Runs the seed preparation of the CPU seed loop on the device, one
+///        thread per seed: the candidate count, the group count, the sort by
+///        layer and the global layer numbering, with their cuts.
+///
+/// Each candidate list is sorted in place with a stable insertion sort, so
+/// ties of PatternTopology::layerSorter keep the order of the range search.
+/// The status, the global layers and the position of the seed hit in its
+/// sorted list are written to the output columns of the lists; the position is
+/// cudaInvalidHitPosition if the seed hit is not in its own list. Both
+/// containers must be on the device. The call waits only for the stream.
+void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
+                      CudaCandidateListContainer& lists,
+                      const CudaPatternFinderConfig& cfg, cudaStream_t stream);
+
+}  // namespace ActsExamples
