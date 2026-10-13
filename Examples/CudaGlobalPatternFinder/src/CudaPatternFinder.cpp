@@ -70,9 +70,14 @@ CudaGlobalPatternFinder::findPatterns(
   if (timing != nullptr) {
     ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream.get()));
   }
-  const CudaPatternRecordContainer event{findCudaPatternsInEta(
-      hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot),
-      m_cfg.sizes, stream.get(), timing)};
+  const CudaPatternFinderConfig deviceCfg{
+      makeCudaPatternFinderConfig(m_cfg.finder, beamspot)};
+  const CudaPatternRecordContainer event{
+      m_cfg.version == 2u
+          ? findCudaPatternsInEtaV2(hits, lists, deviceCfg, m_cfg.sizes,
+                                    stream.get(), timing)
+          : findCudaPatternsInEta(hits, lists, deviceCfg, m_cfg.sizes,
+                                  stream.get(), timing)};
   if (timing != nullptr) {
     float ms{0.f};
     ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
@@ -88,18 +93,34 @@ CudaGlobalPatternFinder::findPatterns(
                           << "); the seeds that did not fit have no patterns");
   }
   const auto tailStart = Clock::now();
+  std::vector<OutputPattern> output{finishPatterns(
+      gctx,
+      [&payloads](std::uint32_t row) -> const HitPayload& {
+        return payloads[row];
+      },
+      event, onlyPhiProvider, beamspot)};
+  ACTS_DEBUG(__func__ << "() Found " << output.size() << " patterns from "
+                      << lists.nSeeds() << " seeds");
+  if (timing != nullptr) {
+    timing->tailUs = microseconds(Clock::now() - tailStart);
+  }
+  return output;
+}
 
+std::vector<CudaGlobalPatternFinder::OutputPattern>
+CudaGlobalPatternFinder::finishPatterns(
+    const Acts::GeometryContext& gctx, const PayloadOf& payloadOf,
+    const CudaPatternRecordContainer& event,
+    const OnlyPhiHitsProvider& onlyPhiProvider,
+    const BeamspotInfo& beamspot) const {
   std::vector<PatternStateAux> patterns{};
   for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
     const std::size_t slot{event.slot(0u, k)};
     if (event.pattern(slot).status == CudaPatternStatus::ok) {
       patterns.push_back(
-          makePatternState(gctx, payloads, event, slot, beamspot));
+          makePatternState(gctx, payloadOf, event, slot, beamspot));
     }
   }
-  ACTS_DEBUG(__func__ << "() Found " << patterns.size()
-                      << " patterns in eta from " << lists.nSeeds()
-                      << " seeds");
 
   if (m_cfg.finder.searchOnlyPhiHits) {
     addPhiOnlyHits(gctx, beamspot, onlyPhiProvider, patterns);
@@ -123,22 +144,19 @@ CudaGlobalPatternFinder::findPatterns(
     out.nTriggerLayers = static_cast<std::uint8_t>(pat.nTriggerLayers);
     out.nPhiLayers = static_cast<std::uint8_t>(pat.nPhiLayers);
   }
-  if (timing != nullptr) {
-    timing->tailUs = microseconds(Clock::now() - tailStart);
-  }
   return output;
 }
 
 CudaGlobalPatternFinder::PatternStateAux
 CudaGlobalPatternFinder::makePatternState(
-    const Acts::GeometryContext& gctx, const std::vector<HitPayload>& payloads,
+    const Acts::GeometryContext& gctx, const PayloadOf& payloadOf,
     const CudaPatternRecordContainer& event, std::size_t slot,
     const BeamspotInfo& beamspot) const {
   using OrderedHit = PatternStateAux::OrderedHit;
   using BendPlaneCov = PatternStateAux::BendPlaneCov;
   const CudaPatternRecordRow row{event.pattern(slot)};
   auto orderedHit = [&](std::size_t i) {
-    return OrderedHit{&payloads[event.hitIndex(slot, i)],
+    return OrderedHit{&payloadOf(event.hitIndex(slot, i)),
                       event.globLayer(slot, i)};
   };
   PatternStateAux pat{gctx,     orderedHit(0u), row.sector,
@@ -385,31 +403,61 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
                              .workspaceBytes = m_cfg.workspaceBytes,
                              .maxHitsPerPattern = m_cfg.maxHitsPerPattern,
                              .maxPatterns = m_cfg.maxPatterns};
+  if (m_cfg.version != 1u && m_cfg.version != 2u) {
+    throw std::invalid_argument(
+        "CudaGlobalPatternFinderAlgorithm: version has to be 1 or 2");
+  }
+  finderCfg.version = m_cfg.version;
+  finderCfg.trackingGeometry = m_cfg.trackingGeometry;
+  finderCfg.useMdtHits = m_cfg.useMdtHits;
   m_finder = std::make_unique<CudaGlobalPatternFinder>(
       std::move(finderCfg), this->logger().clone("CudaGlobalPatternFinder"));
 }
 
 ProcessCode CudaGlobalPatternFinderAlgorithm::execute(
     const AlgorithmContext& ctx) const {
-  using Clock = std::chrono::steady_clock;
   const MuonSpacePointContainer& inSpacePoints{m_inSpacePoints(ctx)};
   const Acts::GeometryContext& gctx{ctx.recoGeoContext};
 
   CudaPatternFinderTiming timing{};
+  GlobalPatternFinder_t::BeamspotInfo beamSpot{};
+  beamSpot.position = Acts::Vector3::Zero();
+  beamSpot.radius = m_cfg.beamSpotRadius;
+  beamSpot.length = m_cfg.beamSpotLength;
+
+  auto found{m_cfg.version == 2u
+                 ? m_finder->findPatternsV2(gctx, inSpacePoints,
+                                            *m_seedSelector, m_onlyPhiProvider,
+                                            beamSpot, &timing)
+                 : findPatternsV1(gctx, inSpacePoints, beamSpot, timing)};
+  ACTS_DEBUG("Found " << found.size() << " patterns from " << timing.nSeeds
+                      << " seeds");
+  m_outPatterns(ctx, std::move(found));
+  if (m_outTiming.isInitialized()) {
+    m_outTiming(ctx, std::move(timing));
+  }
+  return ProcessCode::SUCCESS;
+}
+
+MuonGlobalPatternContainer CudaGlobalPatternFinderAlgorithm::findPatternsV1(
+    const Acts::GeometryContext& gctx,
+    const MuonSpacePointContainer& inSpacePoints,
+    const GlobalPatternFinder_t::BeamspotInfo& beamSpot,
+    CudaPatternFinderTiming& timing) const {
+  using Clock = std::chrono::steady_clock;
   const auto treeStart = Clock::now();
   const SearchTreeData treeData{constructTree(gctx, inSpacePoints)};
   timing.treeUs =
       std::chrono::duration<double, std::micro>(Clock::now() - treeStart)
           .count();
 
-  GlobalPatternFinder_t::BeamspotInfo beamSpot{};
-  beamSpot.position = Acts::Vector3::Zero();
-  beamSpot.radius = m_cfg.beamSpotRadius;
-  beamSpot.length = m_cfg.beamSpotLength;
+  // Converted while the payloads the patterns point to are alive
+  return toMuonGlobalPatterns(m_finder->findPatterns(
+      gctx, treeData, *m_seedSelector, m_onlyPhiProvider, beamSpot, &timing));
+}
 
-  const auto found{m_finder->findPatterns(
-      gctx, treeData, *m_seedSelector, m_onlyPhiProvider, beamSpot, &timing)};
-
+MuonGlobalPatternContainer toMuonGlobalPatterns(
+    const std::vector<GlobalPatternFinder_t::OutputPattern>& found) {
   // GlobalPatternFinderAlgorithm::convertToPattern
   MuonGlobalPatternContainer patterns{};
   patterns.reserve(found.size());
@@ -432,14 +480,7 @@ ProcessCode CudaGlobalPatternFinderAlgorithm::execute(
     pattern.nPhiLayers = candidate.nPhiLayers;
     pattern.meanNormResidual2 = candidate.meanNormResidual2;
   }
-  ACTS_DEBUG("Found " << patterns.size() << " patterns from " << timing.nSeeds
-                      << " seeds");
-
-  m_outPatterns(ctx, std::move(patterns));
-  if (m_outTiming.isInitialized()) {
-    m_outTiming(ctx, std::move(timing));
-  }
-  return ProcessCode::SUCCESS;
+  return patterns;
 }
 
 SearchTreeData CudaGlobalPatternFinderAlgorithm::constructTree(

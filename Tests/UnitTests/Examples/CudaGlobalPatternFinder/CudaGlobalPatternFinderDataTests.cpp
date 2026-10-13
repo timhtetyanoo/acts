@@ -17,6 +17,8 @@
 ///          ACTS_GPF_TIMING      per event timing csv, optional
 ///          ACTS_GPF_MAX_EVENTS  event cap, optional
 ///          ACTS_GPF_BATCH_SIZE  seeds built at once on the device, optional
+///          ACTS_GPF_CUDA_VERSION  1 or 2, the device pattern finding,
+///                               optional (default 1)
 ///
 /// The timing file has the columns of the CPU test, then the time of each
 /// stage of CudaPatternFinderTiming and what the event held.
@@ -120,6 +122,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
   finderCfg.trackingGeometry = trackingGeometry;
   finderCfg.batchSize =
       countFromEnv("ACTS_GPF_BATCH_SIZE", finderCfg.batchSize);
+  finderCfg.version = static_cast<unsigned>(
+      countFromEnv("ACTS_GPF_CUDA_VERSION", finderCfg.version));
+  BOOST_TEST_MESSAGE("Device pattern finding version " << finderCfg.version);
   ActsExamples::CudaGlobalPatternFinderAlgorithm finder{
       finderCfg, Acts::getDefaultLogger("CudaGlobalPatternFinderAlgorithm",
                                         Acts::Logging::DEBUG)};

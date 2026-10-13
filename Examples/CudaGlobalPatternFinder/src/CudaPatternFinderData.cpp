@@ -150,19 +150,43 @@ void zeroDeviceColumn(T* deviceColumn, std::size_t size, cudaStream_t stream) {
   ACTS_CUDA_CHECK(cudaMemsetAsync(deviceColumn, 0, size * sizeof(T), stream));
 }
 
-/// The column functions of CudaUtilities.hpp applied to every column of a
-/// list
+/// Takes a device column from the device's memory pool, in the order of the
+/// stream. The containers are rebuilt every event, and the pool hands back
+/// what was freed instead of allocating and synchronizing anew
+template <typename T>
+void allocateColumn(T*& deviceColumn, std::size_t size, cudaStream_t stream) {
+  if (size == 0) {
+    return;
+  }
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&deviceColumn),
+                                  size * sizeof(T), stream));
+}
+
+/// Returns a device column to the pool. The containers are released once the
+/// work on their columns has completed, so the release does not need the
+/// stream that used them
+template <typename T>
+void freeColumn(T*& deviceColumn) noexcept {
+  if (deviceColumn != nullptr) {
+    // Called from noexcept destructors, so a failure cannot be reported
+    (void)cudaFreeAsync(deviceColumn, cudaStreamPerThread);
+    deviceColumn = nullptr;
+  }
+}
+
+/// The column functions applied to every column of a list
 template <typename Columns, typename Host, typename Device>
-void allocateColumns(Columns&& columns, const Host& host, Device& device) {
-  columns(host, device, [](const auto& hostColumn, auto& deviceColumn) {
-    ActsExamples::allocateDeviceColumn(deviceColumn, hostColumn.size());
+void allocateColumns(Columns&& columns, const Host& host, Device& device,
+                     cudaStream_t stream) {
+  columns(host, device, [stream](const auto& hostColumn, auto& deviceColumn) {
+    allocateColumn(deviceColumn, hostColumn.size(), stream);
   });
 }
 
 template <typename Columns, typename Host, typename Device>
 void freeColumns(Columns&& columns, const Host& host, Device& device) noexcept {
   columns(host, device, [](const auto& /*hostColumn*/, auto& deviceColumn) {
-    ActsExamples::freeDeviceColumn(deviceColumn);
+    freeColumn(deviceColumn);
   });
 }
 
@@ -333,9 +357,21 @@ std::uint8_t CudaHitPayloadContainer::locLayer(size_type index) const {
 void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(hitPayloadColumns, m_host, m_device);
+  allocateColumns(hitPayloadColumns, m_host, m_device, stream);
   copyColumnsToDevice(hitPayloadColumns, m_host, m_device, stream);
 
+  m_onDevice = true;
+}
+
+void CudaHitPayloadContainer::allocateDevice(size_type size,
+                                             cudaStream_t stream) {
+  clearDevice();
+  m_size = size;
+  hitPayloadColumns(m_host, m_device,
+                    [size, stream](auto& hostColumn, auto& deviceColumn) {
+                      hostColumn.clear();
+                      allocateColumn(deviceColumn, size, stream);
+                    });
   m_onDevice = true;
 }
 
@@ -508,7 +544,7 @@ std::span<const std::uint16_t> CudaCandidateListContainer::candidateGlobLayers(
 void CudaCandidateListContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(candidateColumns, m_host, m_device);
+  allocateColumns(candidateColumns, m_host, m_device, stream);
   copyColumnsToDevice(candidateInputColumns, m_host, m_device, stream);
   // Zeroed, so that a seed the kernel has not reached reads as pending
   candidateOutputColumns(
@@ -583,6 +619,54 @@ CudaPatternRecordContainer::CudaPatternRecordContainer(
   m_host.lastInsertedHit.assign(slots, cudaInvalidHitPosition);
   m_host.prevLayerHit.assign(slots, cudaInvalidHitPosition);
   m_host.lineAnchorHit.assign(slots, cudaInvalidHitPosition);
+}
+
+CudaPatternRecordContainer CudaPatternRecordContainer::onDevice(
+    size_type nSeeds, size_type capacityPerSeed, size_type maxHitsPerPattern,
+    cudaStream_t stream) {
+  CudaPatternRecordContainer records{};
+  records.m_nSeeds = nSeeds;
+  records.m_capacityPerSeed = capacityPerSeed;
+  records.m_maxHitsPerPattern = maxHitsPerPattern;
+  const size_type slots{records.nSlots()};
+  const size_type hitSlots{slots * maxHitsPerPattern};
+  CudaPatternRecordArrays& device{records.m_device};
+  patternSlotColumns(records.m_host, device,
+                     [&](auto& /*hostColumn*/, auto& deviceColumn) {
+                       allocateColumn(deviceColumn, slots, stream);
+                     });
+  patternHitColumns(records.m_host, device,
+                    [&](auto& /*hostColumn*/, auto& deviceColumn) {
+                      allocateColumn(deviceColumn, hitSlots, stream);
+                    });
+  patternSeedColumns(records.m_host, device,
+                     [&](auto& /*hostColumn*/, auto& deviceColumn) {
+                       allocateColumn(deviceColumn, nSeeds, stream);
+                     });
+  zeroDeviceColumn(device.nPatterns, nSeeds, stream);
+  zeroDeviceColumn(device.overflow, nSeeds, stream);
+  zeroDeviceColumn(device.status, slots, stream);
+  device.nSeeds = static_cast<std::uint32_t>(nSeeds);
+  device.capacityPerSeed = static_cast<std::uint32_t>(capacityPerSeed);
+  device.maxHitsPerPattern = static_cast<std::uint32_t>(maxHitsPerPattern);
+  records.m_onDevice = true;
+  return records;
+}
+
+void CudaPatternRecordContainer::copyFromDevice(
+    const CudaPatternRecordArrays& source, cudaStream_t stream) {
+  if (source.maxHitsPerPattern != m_maxHitsPerPattern) {
+    throw std::invalid_argument(
+        "CudaPatternRecordContainer::copyFromDevice: the hit slots per "
+        "pattern differ");
+  }
+  // The first slots of the source, which has at least as many as this one
+  CudaPatternRecordArrays& sourceColumns{
+      const_cast<CudaPatternRecordArrays&>(source)};
+  patternColumns(m_host, sourceColumns,
+                 [stream](auto& hostColumn, const auto& deviceColumn) {
+                   copyColumnToHost(hostColumn, deviceColumn, stream);
+                 });
 }
 
 CudaPatternRecordContainer::CudaPatternRecordContainer(
@@ -810,7 +894,7 @@ std::span<const std::uint32_t> CudaPatternRecordContainer::hitIndices(
 void CudaPatternRecordContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(patternColumns, m_host, m_device);
+  allocateColumns(patternColumns, m_host, m_device, stream);
   // A kernel reads these before it writes them; everything else of a slot is
   // valid only once the slot is counted in nPatterns
   zeroDeviceColumn(m_device.nPatterns, m_nSeeds, stream);

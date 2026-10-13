@@ -250,6 +250,13 @@ class CudaHitPayloadContainer {
   /// The method waits only for the supplied stream.
   void moveToDevice(cudaStream_t stream);
 
+  /// @brief Allocates the device columns of a number of hit payloads that a
+  ///        kernel fills, without host columns. The host accessors are not
+  ///        usable afterwards.
+  /// @param size The number of hit payloads
+  /// @param stream The stream the allocation is ordered on
+  void allocateDevice(size_type size, cudaStream_t stream);
+
   /// @brief Copies all device columns on a CUDA stream.
   /// The method waits only for the supplied stream.
   void moveToHost(cudaStream_t stream);
@@ -709,6 +716,23 @@ class CudaPatternRecordContainer {
   CudaPatternRecordContainer(size_type nSeeds, size_type capacityPerSeed,
                              size_type maxHitsPerPattern);
 
+  /// @brief Records that live on the device only, for the kernels to fill:
+  ///        the device columns are allocated on the stream and the counts,
+  ///        the overflow flags and the slot status zeroed. There are no host
+  ///        columns.
+  static CudaPatternRecordContainer onDevice(size_type nSeeds,
+                                             size_type capacityPerSeed,
+                                             size_type maxHitsPerPattern,
+                                             cudaStream_t stream);
+
+  /// @brief Copies the first slots of device records into the host columns
+  ///        of this container, as many as it has: the slot columns, their hit
+  ///        slots and the per-seed columns. The source must have the same hit
+  ///        slots per pattern and at least as many slots and seeds.
+  /// The method waits only for the supplied stream.
+  void copyFromDevice(const CudaPatternRecordArrays& source,
+                      cudaStream_t stream);
+
   CudaPatternRecordContainer(const CudaPatternRecordContainer&) = delete;
   CudaPatternRecordContainer& operator=(const CudaPatternRecordContainer&) =
       delete;
@@ -785,6 +809,8 @@ class CudaPatternRecordContainer {
   CudaPatternRecordArrays deviceArrays() const noexcept { return m_device; }
 
  private:
+  CudaPatternRecordContainer() = default;
+
   size_type m_nSeeds = 0;
   size_type m_capacityPerSeed = 0;
   size_type m_maxHitsPerPattern = 0;

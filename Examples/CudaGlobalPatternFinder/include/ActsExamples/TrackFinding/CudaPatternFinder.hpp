@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "ActsExamples/EventData/CudaMuonSpacePoint.hpp"
 #include "ActsExamples/EventData/CudaPatternFinderData.hpp"
 
 #include <cfloat>
@@ -814,6 +815,68 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
     cudaStream_t stream, CudaPatternFinderTiming* timing = nullptr);
 
+/// @brief The measurement surfaces of the tracking geometry on the device,
+///        sorted by geometry identifier: the rotation of surface s, column
+///        major, is rotation[9 * s, 9 * s + 9). The arrays are not owned.
+struct CudaSurfaceTableArrays {
+  const std::uint64_t* geometryId{nullptr};
+  const double* rotation{nullptr};
+  std::uint32_t nSurfaces{0u};
+};
+
+/// @brief The space points of an event that the pattern finding uses, one row
+///        per hit payload: the index of its space point in the
+///        CudaMuonSpacePointContainer, its bucket, its global position, which
+///        the host computes for the search tree, and the rotation of each
+///        bucket into the global frame, column major, rotation[9 * b, 9 * b +
+///        9). The arrays are not owned.
+struct CudaUsedHitArrays {
+  const std::uint32_t* spacePoint{nullptr};
+  const std::uint32_t* bucket{nullptr};
+  const double* positionX{nullptr};
+  const double* positionY{nullptr};
+  const double* positionZ{nullptr};
+  const double* bucketRotation{nullptr};
+  std::uint32_t nHits{0u};
+};
+
+/// @brief Builds the hit payloads on the device, one thread per hit, from the
+///        space points (CudaMuonSpacePointArrays) and the surfaces: the
+///        quantities of makeCudaHitPayloadRow, with the formulas of HitPayload.
+/// @param spacePoints Device arrays of a CudaMuonSpacePointContainer
+/// @param used The hits to build, row r of the output from row r of used
+/// @param surfaces The measurement surfaces
+/// @param payloads Device arrays of the output, with used.nHits rows
+/// @param nMissingSurfaces Device counter of the hits whose surface is not in
+///        the table, which the CPU rejects with an exception
+/// @param stream The stream; the call does not wait
+void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
+                          const CudaUsedHitArrays& used,
+                          const CudaSurfaceTableArrays& surfaces,
+                          const CudaHitPayloadArrays& payloads,
+                          std::uint32_t* nMissingSurfaces, cudaStream_t stream);
+
+/// @brief Finds the patterns in eta of an event on the device, version 2, in
+///        one pass.
+///
+/// The seed checks run a warp per seed: the group count as a reduction, the
+/// sort by layer as a sorting network and the layer numbers as a prefix sum.
+/// Each seed is then built by a warp,
+/// one layer at a time: every hit of a layer is tested against every pattern
+/// at once, with the line the pattern had before the layer, and each
+/// compatible hit gives a pattern of its own. The backward passes of all
+/// forward patterns run side by side. The overlaps, inside a seed and among
+/// all the patterns of the event, are resolved by priority (more good groups,
+/// more bending layers, more precision layers, smaller residual, then the
+/// index) rather than in seed order, and the skip rule is not applied. Inputs
+/// and overflow reporting are those of findCudaPatternsInEta. Only the kept
+/// patterns are copied back: the returned records hold them alone, in seed
+/// order, as the slots of entry 0.
+CudaPatternRecordContainer findCudaPatternsInEtaV2(
+    const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
+    const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
+    cudaStream_t stream, CudaPatternFinderTiming* timing = nullptr);
+
 }  // namespace ActsExamples
 
 // The driver works with the CPU types of the pattern finder, which the device
@@ -824,7 +887,9 @@ CudaPatternRecordContainer findCudaPatternsInEta(
 #include "ActsExamples/Framework/IAlgorithm.hpp"
 #include "ActsExamples/TrackFinding/GlobalPatternFinderAlgorithm.hpp"
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -844,6 +909,12 @@ class CudaGlobalPatternFinder {
     GlobalPatternFinder_t::Config finder{};
     /// @brief The sizes of the device buffers
     CudaPatternFinderSizes sizes{};
+    /// @brief 1: findCudaPatternsInEta, 2: findCudaPatternsInEtaV2
+    unsigned version{1u};
+    /// @brief Version 2: the tracking geometry, whose surfaces go to the device
+    ///        once, and whether MDT hits take part
+    std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
+    bool useMdtHits{true};
   };
 
   explicit CudaGlobalPatternFinder(
@@ -865,13 +936,57 @@ class CudaGlobalPatternFinder {
       const OnlyPhiHitsProvider& onlyPhiProvider, const BeamspotInfo& beamspot,
       CudaPatternFinderTiming* timing = nullptr) const;
 
+  /// @brief Finds the patterns of an event with version 2, converted to the
+  ///        output of the algorithm. The host computes
+  ///        the global positions, the search tree and the candidate lists;
+  ///        the space points go to the device, which builds the hit payloads
+  ///        and finds the patterns in eta. The host builds the payloads of the
+  ///        hits of the kept patterns only, for the phi-only hits and the
+  ///        conversion.
+  /// @param gctx Geometry context
+  /// @param spacePoints The space points of the event
+  /// @param seedSelector Selector of the seed hits
+  /// @param onlyPhiProvider Provider of the phi-only hits of a pattern
+  /// @param beamspot The beam spot
+  /// @param timing Filled with the time of each stage, if given
+  MuonGlobalPatternContainer findPatternsV2(
+      const Acts::GeometryContext& gctx,
+      const MuonSpacePointContainer& spacePoints,
+      const SeedSelector& seedSelector,
+      const OnlyPhiHitsProvider& onlyPhiProvider, const BeamspotInfo& beamspot,
+      CudaPatternFinderTiming* timing = nullptr) const;
+
+  ~CudaGlobalPatternFinder();
+
  private:
+  /// @brief The hit payload of a row of the device hit columns
+  using PayloadOf = std::function<const HitPayload&(std::uint32_t row)>;
+
   /// @brief A pattern found on the device as the CPU's PatternStateAux
   PatternStateAux makePatternState(const Acts::GeometryContext& gctx,
-                                   const std::vector<HitPayload>& payloads,
+                                   const PayloadOf& payloadOf,
                                    const CudaPatternRecordContainer& event,
                                    std::size_t slot,
                                    const BeamspotInfo& beamspot) const;
+
+  /// @brief The patterns of status ok of entry 0 of the records, with their
+  ///        phi-only hits, converted to the output
+  std::vector<OutputPattern> finishPatterns(
+      const Acts::GeometryContext& gctx, const PayloadOf& payloadOf,
+      const CudaPatternRecordContainer& event,
+      const OnlyPhiHitsProvider& onlyPhiProvider,
+      const BeamspotInfo& beamspot) const;
+
+  /// @brief The measurement surfaces on the device, filled at the first event
+  ///        of version 2
+  struct SurfaceTable {
+    std::uint64_t* geometryId{nullptr};
+    double* rotation{nullptr};
+    std::uint32_t nSurfaces{0u};
+  };
+  const SurfaceTable& surfaceTable(const Acts::GeometryContext& gctx) const;
+  mutable SurfaceTable m_surfaces{};
+  mutable std::once_flag m_surfacesOnce{};
 
   /// @brief GlobalPatternFinder::addPhiOnlyHits
   void addPhiOnlyHits(const Acts::GeometryContext& gctx,
@@ -885,6 +1000,12 @@ class CudaGlobalPatternFinder {
   std::unique_ptr<const Acts::Logger> m_logger;
 };
 
+/// @brief GlobalPatternFinderAlgorithm::convertToPattern: the space points of
+///        the patterns, which point into the payloads the patterns were found
+///        with, so it is called while those are alive
+MuonGlobalPatternContainer toMuonGlobalPatterns(
+    const std::vector<GlobalPatternFinder_t::OutputPattern>& found);
+
 /// @brief GlobalPatternFinderAlgorithm with the pattern finding on the GPU.
 ///        It reads the same space points and writes the same patterns; the
 ///        search tree and the conversion of the patterns are those of the CPU
@@ -897,6 +1018,9 @@ class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
     std::size_t workspaceBytes{std::size_t{1} << 30u};
     std::size_t maxHitsPerPattern{64u};
     std::size_t maxPatterns{4096u};
+    /// @brief Version of the device pattern finding, 1 or 2, see
+    ///        CudaGlobalPatternFinder::Config
+    unsigned version{1u};
     /// @brief Key of the CudaPatternFinderTiming of each event in the event
     ///        store; nothing is written if empty
     std::string outTiming{};
@@ -910,6 +1034,13 @@ class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
   const Config& config() const { return m_cfg; }
 
  private:
+  /// @brief Version 1: the CPU search tree and payloads, then the device
+  MuonGlobalPatternContainer findPatternsV1(
+      const Acts::GeometryContext& gctx,
+      const MuonSpacePointContainer& inSpacePoints,
+      const GlobalPatternFinder_t::BeamspotInfo& beamSpot,
+      CudaPatternFinderTiming& timing) const;
+
   /// @brief GlobalPatternFinderAlgorithm::constructTree
   SearchTreeData constructTree(
       const Acts::GeometryContext& gctx,
