@@ -175,18 +175,6 @@ inline std::tuple<unsigned, SectorProjector> msSectorAndProj(
   // all cases have been addressed
 }
 
-/// @brief Helper function to construct the gradient of the azimuthal coordinate
-/// @param pos The position vector where the gradient is to be computed
-/// @return The gradient of the azimuthal coordinate
-Acts::Vector3 phiGradient(const Acts::Vector3& pos) {
-  return Acts::Vector3{-pos.y(), pos.x(), 0.} /
-         Acts::square(Acts::VectorHelpers::perp(pos));
-}
-
-/// @brief Indices into the space point covariance: precision (eta), non-precision
-///        (phi) and time
-enum class CovIdx : std::uint8_t { etaCov = 0, phiCov = 1, timeCov = 2 };
-
 }  // namespace
 
 namespace ActsExamples {
@@ -426,59 +414,22 @@ HitPayload::HitPayload(const Acts::GeometryContext& gctx,
       underlyingSp{sp},
       bucket{parentBucket},
       surface{measSurface} {
-  if (!sp->id().measuresEta()) {
-    // Phi-only measurements
-    const Acts::Vector3 phiMeasDir{localToGlobal.rotation() *
-                                   sp->toNextSensor()};
-
-    phiCov = sp->covariance()[Acts::toUnderlying(CovIdx::phiCov)] *
-             Acts::square(phiMeasDir.dot(phiGradient(position)));
+  // Only the eta strips of two-dimensional TGC measurements can be tilted
+  // against their phi strips; their sensor direction follows the tilt
+  if (!sp->id().measuresEta() || !sp->id().measuresPhi() || sp->isStraw() ||
+      sp->id().technology() != MuonId::TechField::Tgc) {
     return;
   }
   const auto& surfLinearTrf =
       measSurface->localToGlobalTransform(gctx).linear();
-
-  if (sp->isStraw()) {
-    // Remember that for straw hits, the x component of secondaryMeasDir is
-    // repurposed to store the transverse covariance of the drift radius
-    double& discCov = stripAngle;
-    discCov = Acts::square(sp->driftRadius()) +
-              sp->covariance()[Acts::toUnderlying(CovIdx::etaCov)];
-
-    if (sp->id().measuresPhi()) {
-      phiCov =
-          discCov / Acts::square(Acts::VectorHelpers::perp(position)) +
-          Acts::square(globalSensorDirection(gctx).dot(phiGradient(position))) *
-              (sp->covariance()[Acts::toUnderlying(CovIdx::phiCov)] - discCov);
-    }
-  } else if (sp->id().measuresPhi()) {
-    const Acts::Vector3 phiMeasDir = surfLinearTrf.col(Acts::eY);
-    const Acts::Vector3 gradPhi{phiGradient(position)};
-    /// @brief Helper method to compute the contribution of a 1D measurement to the residual variance
-    auto oneDimContribution = [&](CovIdx idx,
-                                  const Acts::Vector3& measDir) -> double {
-      return sp->covariance()[Acts::toUnderlying(idx)] *
-             Acts::square(measDir.dot(gradPhi));
-    };
-
-    // Handle the case of TGC separately
-    if (sp->id().technology() == MuonId::TechField::Tgc) {
-      const Acts::Vector3 etaMeasDir =
-          localToGlobal.rotation() * sp->toNextSensor();
-      const Acts::Vector3 phiSensorDir = surfLinearTrf.col(Acts::eX);
-
-      const double c{etaMeasDir.dot(phiMeasDir)};
-      if (std::abs(c) > Acts::s_epsilon) {
-        stripAngle = std::atan2(etaMeasDir.dot(phiSensorDir), c);
-        nonOrthogonalStrips = true;
-      }
-      phiCov = oneDimContribution(CovIdx::etaCov, etaMeasDir) +
-               oneDimContribution(CovIdx::phiCov, phiMeasDir);
-    } else {
-      const Acts::Vector3 etaMeasDir = surfLinearTrf.col(Acts::eX);
-      phiCov = oneDimContribution(CovIdx::etaCov, etaMeasDir) +
-               oneDimContribution(CovIdx::phiCov, phiMeasDir);
-    }
+  const Acts::Vector3 phiMeasDir = surfLinearTrf.col(Acts::eY);
+  const Acts::Vector3 etaMeasDir =
+      localToGlobal.rotation() * sp->toNextSensor();
+  const Acts::Vector3 phiSensorDir = surfLinearTrf.col(Acts::eX);
+  const double c{etaMeasDir.dot(phiMeasDir)};
+  if (std::abs(c) > Acts::s_epsilon) {
+    stripAngle = std::atan2(etaMeasDir.dot(phiSensorDir), c);
+    nonOrthogonalStrips = true;
   }
 }
 const Acts::Vector3& HitPayload::globalPosition(
@@ -499,48 +450,22 @@ Acts::Vector3 HitPayload::globalSensorDirection(
     return surfLinearTrf.col(Acts::eY);
   }
 }
-double HitPayload::intrinsicVariance(
-    const Acts::GeometryContext& gctx,
-    const Acts::Vector3& contractionVector) const {
-  if (spacePoint()->isStraw()) {
-    const double discCov{stripAngle};
-    const double dotProdSq{
-        Acts::square(globalSensorDirection(gctx).dot(contractionVector))};
-    const double etaTerm{discCov *
-                         (contractionVector.squaredNorm() - dotProdSq)};
-    if (spacePoint()->id().measuresPhi()) {
-      return etaTerm +
-             dotProdSq *
-                 spacePoint()->covariance()[Acts::toUnderlying(CovIdx::phiCov)];
-    } else {
-      return etaTerm;
-    }
-  } else if (spacePoint()->id().measuresEta()) {
-    const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
-    /// @brief Helper method to compute the contribution of a 1D measurement to the residual variance
-    auto oneDimContribution = [&](CovIdx idx,
-                                  const Acts::Vector3& measDir) -> double {
-      return spacePoint()->covariance()[Acts::toUnderlying(idx)] *
-             Acts::square(measDir.dot(contractionVector));
-    };
-    if (spacePoint()->id().measuresPhi()) {
-      const Acts::Vector3 etaMeasDir{
-          nonOrthogonalStrips ? Acts::Vector3{globalSensorDirection(gctx).cross(
-                                    surfLinearTrf.col(Acts::eZ))}
-                              : Acts::Vector3{surfLinearTrf.col(Acts::eX)}};
-      const Acts::Vector3 phiMeasDir{surfLinearTrf.col(Acts::eY)};
-      return oneDimContribution(CovIdx::etaCov, etaMeasDir) +
-             oneDimContribution(CovIdx::phiCov, phiMeasDir);
-    }
-    const Acts::Vector3 etaMeasDir{surfLinearTrf.col(Acts::eX)};
-    return oneDimContribution(CovIdx::etaCov, etaMeasDir);
-  } else {
-    throw std::runtime_error(
-        "Phi only hits are not meant to be used for residual computation.");
+Acts::Experimental::detail::StripMeasurementDirections
+HitPayload::stripMeasurementDirections(
+    const Acts::GeometryContext& gctx) const {
+  const auto& surfLinearTrf = surface->localToGlobalTransform(gctx).linear();
+  // Phi-only strips measure along the surface y axis
+  if (!spacePoint()->id().measuresEta()) {
+    return {surfLinearTrf.col(Acts::eY), std::nullopt};
   }
-}
-double HitPayload::phiVariance(const Acts::GeometryContext& /*gctx*/) const {
-  return phiCov;
+  if (spacePoint()->id().measuresPhi()) {
+    const Acts::Vector3 etaMeasDir{
+        nonOrthogonalStrips ? Acts::Vector3{globalSensorDirection(gctx).cross(
+                                  surfLinearTrf.col(Acts::eZ))}
+                            : Acts::Vector3{surfLinearTrf.col(Acts::eX)}};
+    return {etaMeasDir, Acts::Vector3{surfLinearTrf.col(Acts::eY)}};
+  }
+  return {surfLinearTrf.col(Acts::eX), std::nullopt};
 }
 bool HitPayload::operator==(const HitPayload& other) const {
   return spacePoint() == other.spacePoint();
@@ -644,7 +569,7 @@ PatternTopology::GroupIdx PatternTopology::groupIndex(const HitPayload& hit) {
 }
 
 OnlyPhiHitsProvider::PhiHitsPerGroup OnlyPhiHitsProvider::getPhiOnlyHits(
-    const PatternState& pattern, const Acts::GeometryContext& gctx) const {
+    const PatternStateAux& pattern, const Acts::GeometryContext& gctx) const {
   PhiHitsPerGroup phiOnlyHits{};
   for (const auto& [group, hits] : Acts::enumerate(pattern.hitsPerGroup)) {
     std::vector<const MuonSpacePointBucket*> parentBuckets{};
@@ -699,7 +624,7 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config patCfg{};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
-  patCfg.nPhiSigma = m_cfg.nPhiSigma;
+  patCfg.phiTolerance = m_cfg.phiTolerance;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
   patCfg.minPrecisionLayers = m_cfg.minPrecisionLayers;
   patCfg.minPhiLayers = m_cfg.minPhiLayers;
@@ -725,7 +650,7 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
           << m_cfg.maxMissLayersInStation << "\n"
           << " Min hit distance for line [mm]: " << m_cfg.minHitDistance4Line
           << "\n"
-          << " Number of phi standard deviations: " << m_cfg.nPhiSigma << "\n"
+          << " Phi tolerance [deg]: " << m_cfg.phiTolerance / 1_degree << "\n"
           << " Min trigger layers: " << m_cfg.minTriggerLayers << "\n"
           << " Min precision layers: " << m_cfg.minPrecisionLayers << "\n"
           << " Min phi layers: " << m_cfg.minPhiLayers << "\n"
@@ -816,13 +741,10 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
         const HitPayload& newHit{hitPayloads.back()};
         std::ostringstream oss{};
         oss << __func__ << "() Building hit from " << hit << std::endl
-            << "PhiCov: " << newHit.phiCov
-            << ", Pos: " << Acts::toString(newHit.position) << ", SensorDir: "
+            << "Pos: " << Acts::toString(newHit.position) << ", SensorDir: "
             << Acts::toString(newHit.globalSensorDirection(gctx));
-        if (newHit.spacePoint()->isStraw()) {
-          oss << ", discCov: " << newHit.stripAngle;
-        } else {
-          oss << "orthogonalStrips: " << !newHit.nonOrthogonalStrips;
+        if (!newHit.spacePoint()->isStraw()) {
+          oss << ", orthogonalStrips: " << !newHit.nonOrthogonalStrips;
         }
         ACTS_VERBOSE(oss.str());
       }
@@ -917,7 +839,7 @@ MuonGlobalPattern GlobalPatternFinderAlgorithm::convertToPattern(
   pattern.theta = candidate.patTheta;
   pattern.phi = candidate.patPhi;
   // Set the pattern sector(s) and theta.
-  pattern.sector = candidate.expSect.sector();
+  pattern.sector = candidate.sector.sector();
   // Set pattern quality information.
   pattern.nPrecisionLayers = candidate.nPrecisionLayers;
   pattern.nTriggerLayers = candidate.nTriggerLayers;
