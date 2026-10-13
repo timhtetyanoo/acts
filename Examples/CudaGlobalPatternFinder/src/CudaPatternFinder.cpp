@@ -89,24 +89,27 @@ CudaGlobalPatternFinder::findPatterns(
   }
   const auto tailStart = Clock::now();
 
-  std::vector<PatternState> patterns{};
+  std::vector<PatternStateAux> patterns{};
   for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
     const std::size_t slot{event.slot(0u, k)};
     if (event.pattern(slot).status == CudaPatternStatus::ok) {
-      patterns.push_back(makePatternState(gctx, payloads, event, slot));
+      patterns.push_back(
+          makePatternState(gctx, payloads, event, slot, beamspot));
     }
   }
   ACTS_DEBUG(__func__ << "() Found " << patterns.size()
                       << " patterns in eta from " << lists.nSeeds()
                       << " seeds");
 
-  addPhiOnlyHits(gctx, onlyPhiProvider, patterns);
+  if (m_cfg.finder.searchOnlyPhiHits) {
+    addPhiOnlyHits(gctx, beamspot, onlyPhiProvider, patterns);
+  }
 
   // GlobalPatternFinder::convertToPattern
   std::vector<OutputPattern> output{};
   output.reserve(patterns.size());
-  for (PatternState& pat : patterns) {
-    OutputPattern& out{output.emplace_back(pat.expSect.sector())};
+  for (PatternStateAux& pat : patterns) {
+    OutputPattern& out{output.emplace_back(pat.sector.sector())};
     for (std::size_t g = 0u; g < PatternTopology::nGroups; ++g) {
       for (const auto& hit : pat.hitsPerGroup[g]) {
         out.hitsPerGroup[g].push_back(hit.hitPtr);
@@ -126,17 +129,20 @@ CudaGlobalPatternFinder::findPatterns(
   return output;
 }
 
-CudaGlobalPatternFinder::PatternState CudaGlobalPatternFinder::makePatternState(
+CudaGlobalPatternFinder::PatternStateAux
+CudaGlobalPatternFinder::makePatternState(
     const Acts::GeometryContext& gctx, const std::vector<HitPayload>& payloads,
-    const CudaPatternRecordContainer& event, std::size_t slot) const {
-  using OrderedHit = PatternState::OrderedHit;
+    const CudaPatternRecordContainer& event, std::size_t slot,
+    const BeamspotInfo& beamspot) const {
+  using OrderedHit = PatternStateAux::OrderedHit;
+  using BendPlaneCov = PatternStateAux::BendPlaneCov;
   const CudaPatternRecordRow row{event.pattern(slot)};
   auto orderedHit = [&](std::size_t i) {
     return OrderedHit{&payloads[event.hitIndex(slot, i)],
                       event.globLayer(slot, i)};
   };
-  PatternState pat{gctx, orderedHit(0u), row.sector, &m_cfg.finder,
-                   m_logger.get()};
+  PatternStateAux pat{gctx,     orderedHit(0u), row.sector,
+                      beamspot, &m_cfg.finder,  m_logger.get()};
   pat.hitsPerGroup = {};
   for (std::size_t i = 0u; i < row.nHits; ++i) {
     const OrderedHit hit{orderedHit(i)};
@@ -155,11 +161,18 @@ CudaGlobalPatternFinder::PatternState CudaGlobalPatternFinder::makePatternState(
   pat.lineDir = row.lineDir;
   pat.leverArm = row.leverArm;
   pat.meanNormResidual2 = row.meanNormResidual2;
-  pat.lastResidual = row.lastResidual;
-  pat.lastResSigma = row.lastResSigma;
   pat.patPhi = row.patPhi;
   pat.patTheta = row.patTheta;
-  pat.patPhiCov = row.patPhiCov;
+  pat.patPhiOffset = row.patPhiOffset;
+  pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiPhi)] =
+      row.bendPlaneCovPhiPhi;
+  pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::eSS)] = row.bendPlaneCovSS;
+  pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiS)] =
+      row.bendPlaneCovPhiS;
+  pat.nDoF = row.nDoF;
+  pat.lastHitTestRes.residual = row.lastResidual;
+  pat.lastHitTestRes.sigma = row.lastResSigma;
+  pat.lastHitTestRes.nDof = row.lastNDoF;
   pat.nPrecisionLayers = row.nPrecisionLayers;
   pat.nTriggerLayers = row.nTriggerLayers;
   pat.nPhiLayers = row.nPhiLayers;
@@ -170,13 +183,22 @@ CudaGlobalPatternFinder::PatternState CudaGlobalPatternFinder::makePatternState(
 }
 
 void CudaGlobalPatternFinder::addPhiOnlyHits(
-    const Acts::GeometryContext& gctx,
+    const Acts::GeometryContext& gctx, const BeamspotInfo& beamspot,
     const OnlyPhiHitsProvider& onlyPhiProvider,
-    std::vector<PatternState>& patterns) const {
-  using OrderedHit = PatternState::OrderedHit;
+    std::vector<PatternStateAux>& patterns) const {
+  using OrderedHit = PatternStateAux::OrderedHit;
+  // GlobalPatternFinder::isPhiCompatible
+  auto isPhiCompatible = [&](const PatternStateAux& pat,
+                             const HitPayload& hit) {
+    const Acts::Vector3 pos{hit.globalPosition(gctx)};
+    if (pat.nPhiLayers > 0) {
+      return !(std::abs(pat.angleToBendPlane(pos)) > m_cfg.finder.phiTolerance);
+    }
+    return pat.sector.insideSector(Acts::VectorHelpers::phi(pos));
+  };
   // The pattern line in the group of a phi hit, from its eta hits or from
   // the closest eta hits around it
-  auto computePatternLineInGroup = [&](PatternState& pat,
+  auto computePatternLineInGroup = [&](PatternStateAux& pat,
                                        const HitPayload& phiHit) -> bool {
     const auto phiHitGroup{PatternTopology::groupIndex(phiHit)};
     const auto& groupHits{pat.hitsPerGroup[phiHitGroup]};
@@ -232,19 +254,14 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
     return !pat.useBeamspot;
   };
 
-  std::vector<PatternState> survivingPatterns{};
+  std::vector<PatternStateAux> survivingPatterns{};
   survivingPatterns.reserve(patterns.size());
-  for (PatternState& pat : patterns) {
+  for (PatternStateAux& pat : patterns) {
     std::optional<PatternTopology::GroupIdx> patternLineGroup{std::nullopt};
 
     auto projOntoPhiPlane = [&pat](const Acts::Vector3& pos) -> Acts::Vector3 {
-      return pos - pos.dot(pat.bendPlaneNorm) * pat.bendPlaneNorm;
-    };
-    auto phiPull = [&](const HitPayload& hit) {
-      return std::abs(Acts::detail::difference_periodic(
-                 Acts::VectorHelpers::phi(hit.globalPosition(gctx)), pat.patPhi,
-                 2. * std::numbers::pi)) /
-             std::sqrt(hit.phiVariance(gctx));
+      return pos - (pos.dot(pat.bendPlaneNorm) - pat.patPhiOffset) *
+                       pat.bendPlaneNorm;
     };
 
     auto phiHitsPerGroup{onlyPhiProvider.getPhiOnlyHits(pat, gctx)};
@@ -258,7 +275,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
             })) {
           continue;
         }
-        if (!pat.isPhiCompatible(gctx, newHit)) {
+        if (!isPhiCompatible(pat, newHit)) {
           continue;
         }
         if (!patternLineGroup || *patternLineGroup != group) {
@@ -293,14 +310,15 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
             stripIntersect > (stripProjLength + margin)) {
           continue;
         }
-        // One phi hit per layer, the one closest to the pattern phi
+        // One phi hit per layer, the one closest to the bending plane
         if (const auto it = std::ranges::find_if(
                 pat.phiOnlyHits,
                 [&](const HitPayload& h) {
                   return PatternTopology::sameLayer(h, newHit);
                 });
             it != pat.phiOnlyHits.end()) {
-          if (phiPull(*it) < phiPull(newHit)) {
+          if (std::abs(pat.angleToBendPlane(it->globalPosition(gctx))) <
+              std::abs(pat.angleToBendPlane(newHitPos))) {
             continue;
           }
           *it = std::move(newHit);
@@ -308,7 +326,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
           pat.phiOnlyHits.push_back(std::move(newHit));
           pat.nPhiLayers++;
         }
-        pat.updatePatternPhi(gctx);
+        pat.updatePatternPhi(gctx, beamspot);
       }
     }
     if (pat.nPhiLayers < m_cfg.finder.minPhiLayers) {
@@ -353,7 +371,7 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config& patCfg{finderCfg.finder};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
-  patCfg.nPhiSigma = m_cfg.nPhiSigma;
+  patCfg.phiTolerance = m_cfg.phiTolerance;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
   patCfg.minPrecisionLayers = m_cfg.minPrecisionLayers;
   patCfg.minPhiLayers = m_cfg.minPhiLayers;
@@ -408,7 +426,7 @@ ProcessCode CudaGlobalPatternFinderAlgorithm::execute(
     }
     pattern.theta = candidate.patTheta;
     pattern.phi = candidate.patPhi;
-    pattern.sector = candidate.expSect.sector();
+    pattern.sector = candidate.sector.sector();
     pattern.nPrecisionLayers = candidate.nPrecisionLayers;
     pattern.nTriggerLayers = candidate.nTriggerLayers;
     pattern.nPhiLayers = candidate.nPhiLayers;

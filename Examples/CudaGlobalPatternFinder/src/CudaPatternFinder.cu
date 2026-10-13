@@ -96,21 +96,22 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
   lists.seedStatus[seed] = prepareSeed(hits, lists, cfg, seed);
 }
 
-/// One pattern while it is built: PatternState with its hits, the last
+/// One pattern while it is built: PatternStateAux with its hits, the last
 /// inserted hit, the last hit of the previous layer and the line anchor held
 /// as positions in the seed's sorted candidate list. A position names both
 /// the hit and its global layer, as the CPU's OrderedHit does
 struct Pattern {
   Math::Vector3 linePos{};
   Math::Vector3 lineDir{};
-  Math::Vector3 bendPlaneNorm{};
+  /// The bending plane: patPhi, patPhiOffset, bendPlaneNorm and bendPlaneCov
+  Math::BendPlane plane{};
   double leverArm{0.};
   double meanNormResidual2{0.};
   double lastResidual{0.};
   double lastResSigma{0.};
-  double patPhi{0.};
   double patTheta{0.};
-  double patPhiCov{0.};
+  std::uint32_t nDoF{0u};
+  std::uint8_t lastNDoF{0u};
   std::uint16_t lastInsertedHit{0u};
   std::uint16_t prevLayerHit{0u};
   std::uint16_t lineAnchorHit{0u};
@@ -126,16 +127,16 @@ struct Pattern {
   __device__ std::uint32_t nBendingLayers() const {
     return nPrecisionLayers + nTriggerLayers;
   }
-  __device__ double meanResidual2() const {
-    return meanNormResidual2 / nBendingLayers();
-  }
+  /// PatternStateAux::getMeanResidual2 of a pattern not finalized yet
+  __device__ double meanResidual2() const { return meanNormResidual2 / nDoF; }
 };
 
-/// The result of PatternState's line test
+/// The result of the line test of GlobalPatternFinder
 enum class Decision : std::uint8_t { addHit, branchPattern, rejectHit };
 struct LineTest {
   double residual{0.};
   double sigma{0.};
+  std::uint8_t nDof{0u};
   Decision decision{Decision::rejectHit};
 };
 
@@ -146,10 +147,13 @@ struct PatternInfo {
   std::int8_t sector{0};
   double patTheta{0.};
   double patPhi{0.};
+  double patPhiOffset{0.};
+  /// Transverse distance of the line anchor hit from the beam line
+  double anchorRadius{0.};
   std::uint32_t nPhiLayers{0u};
   std::uint32_t nPrecisionLayers{0u};
   std::uint32_t nTriggerLayers{0u};
-  /// PatternState::getMeanResidual2
+  /// PatternStateAux::getMeanResidual2
   double meanResidual2{0.};
   std::uint32_t nHits{0u};
 
@@ -158,7 +162,8 @@ struct PatternInfo {
   }
 };
 
-/// PatternState::countGroups: the number of groups with at least minHits hits
+/// PatternStateAux::countGroups: the number of groups with at least minHits
+/// hits
 template <typename RowOf>
 __device__ std::uint32_t countGroups(const CudaHitPayloadArrays& hits,
                                      std::uint32_t nHits, RowOf rowOf,
@@ -186,7 +191,8 @@ __device__ bool isBetter(const PatternInfo& a, const PatternInfo& b) {
   const int nPrecLayDiff{static_cast<int>(a.nPrecisionLayers) -
                          static_cast<int>(b.nPrecisionLayers)};
   if ((nLayerDiff == 0 && nPrecLayDiff == 0) ||
-      (std::abs(nLayerDiff) < 3 && resDiff > 0.1)) {
+      (std::abs(nLayerDiff) < 3 && resDiff > 0.1 &&
+       (resA < resB ? resA : resB) > 1.)) {
     return resA < resB;
   }
   if (nLayerDiff == 0) {
@@ -220,17 +226,21 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
   if (std::abs(a.patTheta - b.patTheta) > 2. * cfg.maxThetaSizeOverlap) {
     return false;
   }
-  if (a.nPhiLayers > 0u && b.nPhiLayers > 0u) {
-    if (std::abs(Math::differencePeriodic(a.patPhi, b.patPhi, 2. * Math::pi)) >
-        5. * Math::pi / 180.) {
+  // The phi of both patterns at a common radius, where the first one lives
+  const double refR{a.anchorRadius};
+  const double phiA{a.patPhi + a.patPhiOffset / refR};
+  const double phiB{b.patPhi + b.patPhiOffset / refR};
+  if (a.nPhiLayers > 1u && b.nPhiLayers > 1u) {
+    if (std::abs(Math::differencePeriodic(phiA, phiB, 2. * Math::pi)) >
+        2. * cfg.phiTolerance) {
       return false;
     }
   } else if (a.nPhiLayers > 0u) {
-    if (!Sector::inside(b.sector, a.patPhi)) {
+    if (!Sector::inside(b.sector, phiA)) {
       return false;
     }
   } else if (b.nPhiLayers > 0u) {
-    if (!Sector::inside(a.sector, b.patPhi)) {
+    if (!Sector::inside(a.sector, phiB)) {
       return false;
     }
   }
@@ -355,55 +365,44 @@ struct SeedBuilder {
     return [this, hitPos](std::uint32_t i) { return rows[hitPos[i]]; };
   }
   __device__ PatternInfo info(const Pattern& pat) const {
-    return PatternInfo{pat.sector,           pat.patTheta,
-                       pat.patPhi,           pat.nPhiLayers,
-                       pat.nPrecisionLayers, pat.nTriggerLayers,
-                       pat.meanResidual2(),  pat.nHits};
+    return PatternInfo{
+        .sector = pat.sector,
+        .patTheta = pat.patTheta,
+        .patPhi = pat.plane.phi,
+        .patPhiOffset = pat.plane.offset,
+        .anchorRadius = Math::perp(hit(pat.lineAnchorHit).position),
+        .nPhiLayers = pat.nPhiLayers,
+        .nPrecisionLayers = pat.nPrecisionLayers,
+        .nTriggerLayers = pat.nTriggerLayers,
+        .meanResidual2 = pat.meanResidual2(),
+        .nHits = pat.nHits};
   }
-  /// PatternState::countGroups
+  /// PatternStateAux::countGroups
   __device__ std::uint32_t countGroups(const Pattern& pat, bool onlyGood) {
     return ::countGroups(hits, pat.nHits, rowsOf(pat),
                          onlyGood ? cfg.minGroupLayers : 1u);
   }
 
-  /// PatternState::updatePatternPhi. The phi hits are summed group by group,
-  /// in the order they entered each group, as on the CPU
+  /// PatternStateAux::updatePatternPhi. The phi hits are visited group by
+  /// group, in the order they entered each group, as on the CPU
   __device__ void updatePatternPhi(Pattern& pat) {
-    namespace Sector = Math::ExpandedSector;
-    if (pat.nPhiLayers == 0u) {
-      pat.patPhi = Sector::phi(pat.sector);
-      pat.patPhiCov = Math::square(Sector::size(pat.sector)) / 3.;
-    } else {
-      double sumSin{0.};
-      double sumCos{0.};
-      double sumWeight{0.};
-      const std::uint16_t* hitPos{hitsOf(pat)};
+    const std::uint16_t* hitPos{hitsOf(pat)};
+    auto forEachPhiHit = [&](auto&& fn) {
       for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
         for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
           const std::uint16_t pos{hitPos[i]};
-          if (group(pos) != g || !measuresPhi(pos)) {
-            continue;
+          if (group(pos) == g && measuresPhi(pos)) {
+            const Math::Hit h{hit(pos)};
+            fn(h);
           }
-          const Math::Hit h{hit(pos)};
-          // The CPU throws on a phi hit without phi variance
-          if (h.phiVariance < Math::epsilon) {
-            continue;
-          }
-          const double w{1. / h.phiVariance};
-          const double phi{Math::phi(h.position)};
-          sumSin += w * std::sin(phi);
-          sumCos += w * std::cos(phi);
-          sumWeight += w;
         }
       }
-      pat.patPhi = std::atan2(sumSin, sumCos);
-      pat.patPhiCov = 1. / sumWeight;
-    }
-    pat.bendPlaneNorm =
-        Math::directionFromPhiTheta(pat.patPhi + Math::pi / 2., Math::pi / 2.);
+    };
+    pat.plane = Math::fitBendPlane(pat.nPhiLayers, pat.plane.phi, pat.sector,
+                                   cfg.beamspot, forEachPhiHit);
   }
 
-  /// PatternState::moveLineAnchorHit: the anchor is the hit closest in layer
+  /// PatternStateAux::moveLineAnchorHit: the anchor is the hit closest in layer
   /// to the reference hit, in the group closest to it other than its own
   __device__ void moveLineAnchorHit(Pattern& pat, std::uint16_t refHit) {
     if (countGroups(pat, false) < 2u) {
@@ -445,14 +444,16 @@ struct SeedBuilder {
     }
   }
 
-  /// PatternState::updateLineParameters
+  /// PatternStateAux::updateLineParameters
   __device__ void updateLineParameters(Pattern& pat) {
     if (!pat.needLineUpdate) {
       return;
     }
     const Math::Line line{Math::lineThroughHits(
-        Math::projectToPhiPlane(hit(pat.lineAnchorHit), pat.bendPlaneNorm),
-        Math::projectToPhiPlane(hit(pat.lastInsertedHit), pat.bendPlaneNorm),
+        Math::projectToPhiPlane(hit(pat.lineAnchorHit), pat.plane.normal,
+                                pat.plane.offset),
+        Math::projectToPhiPlane(hit(pat.lastInsertedHit), pat.plane.normal,
+                                pat.plane.offset),
         cfg.minHitDistance4Line, cfg.beamspot)};
     pat.linePos = line.position;
     pat.lineDir = line.direction;
@@ -461,16 +462,13 @@ struct SeedBuilder {
     pat.needLineUpdate = false;
   }
 
-  /// PatternState::isPhiCompatible
+  /// GlobalPatternFinder::isPhiCompatible
   __device__ bool isPhiCompatible(const Pattern& pat, const Math::Hit& h) {
-    const double testPhi{Math::phi(h.position)};
     if (pat.nPhiLayers > 0u) {
-      const double deltaPhiSigma{std::sqrt(pat.patPhiCov + h.phiVariance)};
-      const double deltaPhi{
-          Math::differencePeriodic(pat.patPhi, testPhi, 2. * Math::pi)};
-      return !(std::abs(deltaPhi) > cfg.nPhiSigma * deltaPhiSigma);
+      return !(std::abs(Math::angleToBendPlane(pat.plane, h.position)) >
+               cfg.phiTolerance);
     }
-    return Math::ExpandedSector::inside(pat.sector, testPhi);
+    return Math::ExpandedSector::inside(pat.sector, Math::phi(h.position));
   }
 
   /// GlobalPatternFinder::checkLineCompatibility
@@ -482,15 +480,15 @@ struct SeedBuilder {
     auto makeResult = [&](Decision decision) {
       const Math::LineResidual res{Math::lineResidual(
           Math::Line{pat.linePos, pat.lineDir, pat.leverArm, pat.useBeamspot},
-          pat.bendPlaneNorm, pat.patPhiCov, pat.nPhiLayers,
-          hit(pat.lineAnchorHit), hit(pat.lastInsertedHit), testHit,
-          cfg.beamspot)};
-      LineTest out{res.residual, res.sigma, Decision::rejectHit};
-      double accWindow{cfg.nResidualSigma * res.sigma};
+          pat.plane, pat.nPhiLayers, hit(pat.lineAnchorHit),
+          hit(pat.lastInsertedHit), testHit, cfg.beamspot)};
+      LineTest out{res.residual, res.sigma, res.nDof, Decision::rejectHit};
+      double accWindow{(res.nDof == 1u ? cfg.nResidualSigma : cfg.cut2Dof) *
+                       res.sigma};
       if (pat.useBeamspot || group(test) != group(pat.lastInsertedHit) ||
           (group(test) != group(pat.prevLayerHit) &&
            globLayer(test) == globLayer(pat.lastInsertedHit))) {
-        accWindow *= 2.;
+        accWindow *= cfg.loosenAcceptanceFactor;
       }
       if (res.residual < accWindow) {
         out.decision = decision;
@@ -510,9 +508,9 @@ struct SeedBuilder {
     return makeResult(Decision::branchPattern);
   }
 
-  /// PatternState::addHit
-  __device__ void addHit(Pattern& pat, std::uint16_t test, double residual,
-                         double sigma) {
+  /// PatternStateAux::addHit
+  __device__ void addHit(Pattern& pat, std::uint16_t test,
+                         const LineTest& res) {
     if (pat.nHits == maxHits) {
       overflow |= CudaPatternOverflow::hits;
       return;
@@ -531,19 +529,21 @@ struct SeedBuilder {
     pat.prevLayerHit = pat.lastInsertedHit;
     pat.lastInsertedHit = test;
 
-    pat.meanNormResidual2 += Math::square(residual / sigma);
-    pat.lastResSigma = sigma;
-    pat.lastResidual = residual;
+    pat.meanNormResidual2 += Math::square(res.residual / res.sigma);
+    pat.nDoF += res.nDof;
+    pat.lastResSigma = res.sigma;
+    pat.lastResidual = res.residual;
+    pat.lastNDoF = res.nDof;
     if (isNewGroup) {
       moveLineAnchorHit(pat, test);
     }
     pat.needLineUpdate = true;
   }
 
-  /// PatternState::overWriteHit: the last inserted hit is replaced by a hit
-  /// on the same layer
+  /// PatternStateAux::overWriteHit: the last inserted hit is replaced by a
+  /// hit on the same layer
   __device__ void overWriteHit(Pattern& pat, std::uint16_t test,
-                               double residual, double sigma) {
+                               const LineTest& res) {
     const std::uint16_t last{pat.lastInsertedHit};
     if (isPrecision(last) != isPrecision(test)) {
       if (isPrecision(test)) {
@@ -563,10 +563,13 @@ struct SeedBuilder {
       ++pat.nPhiLayers;
       updatePhi = true;
     }
-    pat.meanNormResidual2 += Math::square(residual / sigma) -
+    pat.meanNormResidual2 += Math::square(res.residual / res.sigma) -
                              Math::square(pat.lastResidual / pat.lastResSigma);
-    pat.lastResSigma = sigma;
-    pat.lastResidual = residual;
+    pat.nDoF += static_cast<std::uint32_t>(static_cast<int>(res.nDof) -
+                                           static_cast<int>(pat.lastNDoF));
+    pat.lastResSigma = res.sigma;
+    pat.lastResidual = res.residual;
+    pat.lastNDoF = res.nDof;
 
     std::uint16_t* hitPos{hitsOf(pat)};
     for (std::uint16_t i = pat.nHits; i-- > 0u;) {
@@ -677,7 +680,7 @@ struct SeedBuilder {
           const bool lowConfidence{res.sigma > cfg.lowConfidenceResSigma &&
                                    res.residual / res.sigma > 2.};
           if (!lowConfidence) {
-            addHit(pat, test, res.residual, res.sigma);
+            addHit(pat, test, res);
             break;
           }
           // Keep both the pattern with the hit and the one without, unless
@@ -692,7 +695,7 @@ struct SeedBuilder {
           }
           if (!exists) {
             if (Pattern * fork{push(pat, to, nOut)}; fork != nullptr) {
-              addHit(*fork, test, res.residual, res.sigma);
+              addHit(*fork, test, res);
             }
           }
           break;
@@ -706,7 +709,7 @@ struct SeedBuilder {
           }
           if (!exists) {
             if (Pattern * branch{push(pat, to, nOut)}; branch != nullptr) {
-              overWriteHit(*branch, test, res.residual, res.sigma);
+              overWriteHit(*branch, test, res);
             }
           }
           break;
@@ -745,7 +748,7 @@ struct SeedBuilder {
     return current;
   }
 
-  /// The constructor of PatternState
+  /// The constructor of PatternStateAux
   __device__ void makeSeedPattern(Pattern& pat, std::uint16_t seedPos,
                                   std::int8_t sector) {
     pat = Pattern{};
@@ -826,9 +829,15 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
     return cudaInvalidHitPosition;
   };
   out.sector[slot] = pat.sector;
-  out.patPhi[slot] = pat.patPhi;
+  out.patPhi[slot] = pat.plane.phi;
   out.patTheta[slot] = pat.patTheta;
-  out.patPhiCov[slot] = pat.patPhiCov;
+  out.patPhiOffset[slot] = pat.plane.offset;
+  out.bendPlaneCovPhiPhi[slot] = pat.plane.covPhiPhi;
+  out.bendPlaneCovSS[slot] = pat.plane.covSS;
+  out.bendPlaneCovPhiS[slot] = pat.plane.covPhiS;
+  out.nDoF[slot] = pat.nDoF;
+  out.lastNDoF[slot] = pat.lastNDoF;
+  out.anchorRadius[slot] = Math::perp(builder.hit(pat.lineAnchorHit).position);
   out.meanNormResidual2[slot] = pat.meanNormResidual2;
   out.lastResidual[slot] = pat.lastResidual;
   out.lastResSigma[slot] = pat.lastResSigma;
@@ -839,9 +848,9 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   out.lineDirY[slot] = pat.lineDir.y;
   out.lineDirZ[slot] = pat.lineDir.z;
   out.leverArm[slot] = pat.leverArm;
-  out.bendPlaneNormX[slot] = pat.bendPlaneNorm.x;
-  out.bendPlaneNormY[slot] = pat.bendPlaneNorm.y;
-  out.bendPlaneNormZ[slot] = pat.bendPlaneNorm.z;
+  out.bendPlaneNormX[slot] = pat.plane.normal.x;
+  out.bendPlaneNormY[slot] = pat.plane.normal.y;
+  out.bendPlaneNormZ[slot] = pat.plane.normal.z;
   out.nPrecisionLayers[slot] = pat.nPrecisionLayers;
   out.nTriggerLayers[slot] = pat.nTriggerLayers;
   out.nPhiLayers[slot] = pat.nPhiLayers;
@@ -928,7 +937,7 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
   std::uint32_t nOut{0u};
   for (std::uint32_t k = 0u; k < nResult; ++k) {
     Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
-    pat.meanNormResidual2 /= pat.nBendingLayers();
+    pat.meanNormResidual2 /= pat.nDoF;
     if (builder.passPatternCuts(pat)) {
       builder.copy(pat, builder.pattern(SeedBuilder::regionResult, nOut++));
     }
@@ -967,7 +976,13 @@ __device__ void copyRecord(const CudaPatternRecordArrays& from,
   to.sector[toSlot] = from.sector[fromSlot];
   to.patPhi[toSlot] = from.patPhi[fromSlot];
   to.patTheta[toSlot] = from.patTheta[fromSlot];
-  to.patPhiCov[toSlot] = from.patPhiCov[fromSlot];
+  to.patPhiOffset[toSlot] = from.patPhiOffset[fromSlot];
+  to.bendPlaneCovPhiPhi[toSlot] = from.bendPlaneCovPhiPhi[fromSlot];
+  to.bendPlaneCovSS[toSlot] = from.bendPlaneCovSS[fromSlot];
+  to.bendPlaneCovPhiS[toSlot] = from.bendPlaneCovPhiS[fromSlot];
+  to.nDoF[toSlot] = from.nDoF[fromSlot];
+  to.lastNDoF[toSlot] = from.lastNDoF[fromSlot];
+  to.anchorRadius[toSlot] = from.anchorRadius[fromSlot];
   to.meanNormResidual2[toSlot] = from.meanNormResidual2[fromSlot];
   to.lastResidual[toSlot] = from.lastResidual[fromSlot];
   to.lastResSigma[toSlot] = from.lastResSigma[fromSlot];
@@ -1001,14 +1016,16 @@ __device__ void copyRecord(const CudaPatternRecordArrays& from,
 /// A finalized pattern record seen by the comparisons
 __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
                                   std::uint32_t slot) {
-  return PatternInfo{r.sector[slot],
-                     r.patTheta[slot],
-                     r.patPhi[slot],
-                     r.nPhiLayers[slot],
-                     r.nPrecisionLayers[slot],
-                     r.nTriggerLayers[slot],
-                     r.meanNormResidual2[slot],
-                     r.nHits[slot]};
+  return PatternInfo{.sector = r.sector[slot],
+                     .patTheta = r.patTheta[slot],
+                     .patPhi = r.patPhi[slot],
+                     .patPhiOffset = r.patPhiOffset[slot],
+                     .anchorRadius = r.anchorRadius[slot],
+                     .nPhiLayers = r.nPhiLayers[slot],
+                     .nPrecisionLayers = r.nPrecisionLayers[slot],
+                     .nTriggerLayers = r.nTriggerLayers[slot],
+                     .meanResidual2 = r.meanNormResidual2[slot],
+                     .nHits = r.nHits[slot]};
 }
 
 /// Takes the patterns of one batch of seeds into the event's patterns, one

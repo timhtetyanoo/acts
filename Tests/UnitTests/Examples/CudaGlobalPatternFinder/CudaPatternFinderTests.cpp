@@ -34,8 +34,8 @@ using namespace Acts;
 namespace Math = ActsExamples::CudaPatternMath;
 
 using MuonId = ActsExamples::MuonSpacePoint::MuonId;
-using PatternState = ActsExamples::GlobalPatternFinder_t::PatternState;
-using OrderedHit = PatternState::OrderedHit;
+using PatternStateAux = ActsExamples::GlobalPatternFinder_t::PatternStateAux;
+using OrderedHit = PatternStateAux::OrderedHit;
 
 namespace {
 ActsExamples::MuonSpacePoint makeSpacePoint(MuonId::StationName station,
@@ -176,7 +176,7 @@ ActsExamples::CudaPatternRecordContainer buildLinePatterns(
   ActsExamples::CudaPatternRecordContainer patterns{lists.nSeeds(), capacity,
                                                     16u};
   const auto cudaCfg = ActsExamples::makeCudaPatternFinderConfig(
-      lineConfig(), PatternState::BeamspotInfo{});
+      lineConfig(), PatternStateAux::BeamspotInfo{});
 
   ActsExamples::CudaStream stream;
   payloads.moveToDevice(stream.get());
@@ -208,8 +208,8 @@ LineResult findLinePatterns(const GeometryContext& gctx, const LineHits& hits,
   lists.moveToDevice(stream.get());
   const auto event = ActsExamples::findCudaPatternsInEta(
       payloads, lists,
-      ActsExamples::makeCudaPatternFinderConfig(lineConfig(),
-                                                PatternState::BeamspotInfo{}),
+      ActsExamples::makeCudaPatternFinderConfig(
+          lineConfig(), PatternStateAux::BeamspotInfo{}),
       sizes, stream.get());
 
   LineResult result{.overflow = event.overflow(0u)};
@@ -306,55 +306,148 @@ CpuSeed prepareSeedOnCpu(
 BOOST_AUTO_TEST_SUITE(CudaPatternFinderSuite)
 
 BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
+  using BendPlaneCov = PatternStateAux::BendPlaneCov;
   const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
   const Hits hits{gctx};
   const auto logger = getDefaultLogger("CudaPatternMath", Logging::WARNING);
-  const PatternState::Config cfg{};
-  const PatternState::BeamspotInfo beamspot{Vector3{0., 0., 10.}, 1., 100.};
+  const PatternStateAux::Config cfg{};
+  const PatternStateAux::BeamspotInfo beamspot{Vector3{0., 0., 10.}, 1., 100.};
   const Math::Beamspot deviceBeamspot{toMath(beamspot.position),
                                       beamspot.radius, beamspot.length};
 
+  // The variance of every hit along a few directions, projected and not
+  for (std::size_t h = 0; h < hits.payloads.size(); ++h) {
+    for (const Vector3& c :
+         {Vector3{1., 0., 0.}, Vector3{1., 2., 3.}.normalized()}) {
+      for (const bool projected : {false, true}) {
+        BOOST_TEST_CONTEXT("hit " << h << ", projected " << projected) {
+          BOOST_CHECK_EQUAL(
+              PatternStateAux::intrinsicVariance(gctx, hits.payloads[h], c,
+                                                 projected),
+              Math::intrinsicVariance(hits.device[h], toMath(c), projected));
+        }
+      }
+    }
+  }
+
   // Anchor and last hit far apart, then close enough to need the beam spot
   for (const auto [anchor, last] : {std::pair{0u, 2u}, std::pair{1u, 3u}}) {
-    PatternState pat{gctx, OrderedHit{&hits.payloads[anchor], 0u}, 4, &cfg,
-                     logger.get()};
-    const double phi{std::atan2(hits.payloads[1].position.y(),
-                                hits.payloads[1].position.x())};
-    pat.bendPlaneNorm = Vector3{-std::sin(phi), std::cos(phi), 0.};
+    PatternStateAux pat{gctx, OrderedHit{&hits.payloads[anchor], 0u},
+                        4,    beamspot,
+                        &cfg, logger.get()};
+    // A bending plane off the origin, with a correlated covariance
+    pat.patPhi = std::atan2(hits.payloads[1].position.y(),
+                            hits.payloads[1].position.x());
+    pat.bendPlaneNorm =
+        Vector3{-std::sin(pat.patPhi), std::cos(pat.patPhi), 0.};
+    pat.patPhiOffset = 25.;
+    pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiPhi)] = 1.e-4;
+    pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::eSS)] = 4.;
+    pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiS)] = -1.e-2;
     pat.lineAnchorHit = OrderedHit{&hits.payloads[anchor], 0u};
     pat.lastInsertedHit = OrderedHit{&hits.payloads[last], 5u};
     pat.needLineUpdate = true;
     pat.updateLineParameters(gctx, beamspot);
 
-    const Math::Vector3 norm{toMath(pat.bendPlaneNorm)};
+    const Math::BendPlane plane{
+        .phi = pat.patPhi,
+        .offset = pat.patPhiOffset,
+        .normal = toMath(pat.bendPlaneNorm),
+        .covPhiPhi =
+            pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiPhi)],
+        .covSS = pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::eSS)],
+        .covPhiS = pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiS)]};
     const Math::Line line{Math::lineThroughHits(
-        Math::projectToPhiPlane(hits.device[anchor], norm),
-        Math::projectToPhiPlane(hits.device[last], norm),
+        Math::projectToPhiPlane(hits.device[anchor], plane.normal,
+                                plane.offset),
+        Math::projectToPhiPlane(hits.device[last], plane.normal, plane.offset),
         cfg.minHitDistance4Line, deviceBeamspot)};
 
     BOOST_TEST_CONTEXT("anchor " << anchor << ", last " << last) {
       BOOST_CHECK(same(pat.projToPhiPlane(gctx, hits.payloads[last]),
-                       Math::projectToPhiPlane(hits.device[last], norm)));
+                       Math::projectToPhiPlane(hits.device[last], plane.normal,
+                                               plane.offset)));
       BOOST_CHECK_EQUAL(pat.useBeamspot, line.useBeamspot);
       BOOST_CHECK(same(pat.linePos, line.position));
       BOOST_CHECK(same(pat.lineDir, line.direction));
       BOOST_CHECK_EQUAL(pat.leverArm, line.leverArm);
+      BOOST_CHECK_EQUAL(pat.angleToBendPlane(hits.payloads[6].position),
+                        Math::angleToBendPlane(plane, hits.device[6].position));
 
       // The residual of every other hit against the line, with and without a
       // phi measurement in the pattern
       for (unsigned nPhiLayers : {0u, 1u}) {
         pat.nPhiLayers = nPhiLayers;
-        pat.patPhiCov = 1.e-4;
         for (std::size_t test = 0; test < hits.payloads.size(); ++test) {
           const auto cpu = pat.computeLineResidual(
               gctx, OrderedHit{&hits.payloads[test], 6u}, beamspot);
           const auto device = Math::lineResidual(
-              line, norm, pat.patPhiCov, nPhiLayers, hits.device[anchor],
-              hits.device[last], hits.device[test], deviceBeamspot);
+              line, plane, nPhiLayers, hits.device[anchor], hits.device[last],
+              hits.device[test], deviceBeamspot);
           BOOST_CHECK_EQUAL(cpu.residual, device.residual);
           BOOST_CHECK_EQUAL(cpu.sigma, device.sigma);
+          BOOST_CHECK_EQUAL(static_cast<int>(cpu.nDof),
+                            static_cast<int>(device.nDof));
         }
       }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(CudaBendPlaneFitMatchesCpu) {
+  using BendPlaneCov = PatternStateAux::BendPlaneCov;
+  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
+  const Hits hits{gctx};
+  const auto logger = getDefaultLogger("CudaPatternMath", Logging::WARNING);
+  const PatternStateAux::Config cfg{};
+  const PatternStateAux::BeamspotInfo beamspot{Vector3{1., -2., 10.}, 2., 100.};
+  const Math::Beamspot deviceBeamspot{toMath(beamspot.position),
+                                      beamspot.radius, beamspot.length};
+  constexpr std::int8_t sector{10};
+
+  // No phi hit, one, then the three phi hits of the fixture (rows 1, 4, 6)
+  for (const std::vector<std::uint32_t>& phiRows :
+       {std::vector<std::uint32_t>{}, std::vector<std::uint32_t>{4u},
+        std::vector<std::uint32_t>{1u, 4u, 6u}}) {
+    PatternStateAux pat{gctx,   OrderedHit{&hits.payloads[0], 0u},
+                        sector, beamspot,
+                        &cfg,   logger.get()};
+    for (const std::uint32_t row : phiRows) {
+      pat.hitsPerGroup[ActsExamples::PatternTopology::groupIndex(
+                           hits.payloads[row])]
+          .push_back(OrderedHit{&hits.payloads[row], 0u});
+    }
+    pat.nPhiLayers = phiRows.size();
+    const double previousPhi{0.3};
+    pat.patPhi = previousPhi;
+    pat.updatePatternPhi(gctx, beamspot);
+
+    // The device visits the same hits, group by group
+    auto forEachPhiHit = [&](auto&& fn) {
+      for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
+        for (const std::uint32_t row : phiRows) {
+          if (Math::groupIndex(hits.device[row]) == g) {
+            fn(hits.device[row]);
+          }
+        }
+      }
+    };
+    const Math::BendPlane plane{
+        Math::fitBendPlane(static_cast<std::uint32_t>(phiRows.size()),
+                           previousPhi, sector, deviceBeamspot, forEachPhiHit)};
+
+    BOOST_TEST_CONTEXT(phiRows.size() << " phi hits") {
+      BOOST_CHECK_EQUAL(pat.patPhi, plane.phi);
+      BOOST_CHECK_EQUAL(pat.patPhiOffset, plane.offset);
+      BOOST_CHECK(same(pat.bendPlaneNorm, plane.normal));
+      BOOST_CHECK_EQUAL(
+          pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiPhi)],
+          plane.covPhiPhi);
+      BOOST_CHECK_EQUAL(pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::eSS)],
+                        plane.covSS);
+      BOOST_CHECK_EQUAL(
+          pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiS)],
+          plane.covPhiS);
     }
   }
 }
@@ -417,7 +510,7 @@ BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
   lists.moveToDevice(stream.get());
   ActsExamples::prepareCudaSeeds(payloads, lists,
                                  ActsExamples::makeCudaPatternFinderConfig(
-                                     cfg, PatternState::BeamspotInfo{}),
+                                     cfg, PatternStateAux::BeamspotInfo{}),
                                  stream.get());
   lists.moveToHost(stream.get());
   stream.synchronize();
@@ -474,10 +567,15 @@ BOOST_AUTO_TEST_CASE(CudaPatternBuildingFindsLine) {
   const LineHits hits{gctx, false};
   const auto patterns = buildLinePatterns(gctx, hits, 4u);
 
-  // Every seed on the line finds the line, without the outlier
+  // The seeds on the BI and BM layers find the line, without the outlier.
+  // From a BO seed the line misses the minimum layer requirement, as in Core
   for (std::uint32_t seed = 0u; seed < LineHits::nOnLine; ++seed) {
     BOOST_TEST_CONTEXT("seed " << seed) {
       BOOST_CHECK(!patterns.overflow(seed));
+      if (seed >= LineHits::nOnLine - 2u) {
+        BOOST_CHECK_EQUAL(patterns.nPatterns(seed), 0u);
+        continue;
+      }
       BOOST_REQUIRE_EQUAL(patterns.nPatterns(seed), 1u);
       const auto slot = patterns.slot(seed, 0u);
       std::vector<std::uint32_t> found{patterns.hitIndices(slot).begin(),

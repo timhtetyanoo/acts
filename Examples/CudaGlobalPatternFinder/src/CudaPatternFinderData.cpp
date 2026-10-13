@@ -41,7 +41,6 @@ constexpr auto hitPayloadColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.etaCovariance, device.etaCovariance);
   visit(host.phiCovariance, device.phiCovariance);
   visit(host.driftCovariance, device.driftCovariance);
-  visit(host.phiVariance, device.phiVariance);
 
   visit(host.geometryId, device.geometryId);
 
@@ -84,7 +83,13 @@ constexpr auto patternSlotColumns = [](auto& host, auto& device, auto&& visit) {
 
   visit(host.patPhi, device.patPhi);
   visit(host.patTheta, device.patTheta);
-  visit(host.patPhiCov, device.patPhiCov);
+  visit(host.patPhiOffset, device.patPhiOffset);
+  visit(host.bendPlaneCovPhiPhi, device.bendPlaneCovPhiPhi);
+  visit(host.bendPlaneCovSS, device.bendPlaneCovSS);
+  visit(host.bendPlaneCovPhiS, device.bendPlaneCovPhiS);
+  visit(host.nDoF, device.nDoF);
+  visit(host.lastNDoF, device.lastNDoF);
+  visit(host.anchorRadius, device.anchorRadius);
 
   visit(host.meanNormResidual2, device.meanNormResidual2);
   visit(host.lastResidual, device.lastResidual);
@@ -254,7 +259,6 @@ void CudaHitPayloadContainer::setHit(size_type index,
   m_host.etaCovariance[index] = row.etaCovariance;
   m_host.phiCovariance[index] = row.phiCovariance;
   m_host.driftCovariance[index] = row.driftCovariance;
-  m_host.phiVariance[index] = row.phiVariance;
 
   m_host.geometryId[index] = row.geometryId;
 
@@ -285,7 +289,6 @@ CudaHitPayloadRow CudaHitPayloadContainer::hit(size_type index) const {
   row.etaCovariance = m_host.etaCovariance[index];
   row.phiCovariance = m_host.phiCovariance[index];
   row.driftCovariance = m_host.driftCovariance[index];
-  row.phiVariance = m_host.phiVariance[index];
 
   row.geometryId = m_host.geometryId[index];
   row.stationKey = m_host.stationKey[index];
@@ -671,7 +674,13 @@ void CudaPatternRecordContainer::setPattern(size_type patternSlot,
 
   m_host.patPhi[p] = row.patPhi;
   m_host.patTheta[p] = row.patTheta;
-  m_host.patPhiCov[p] = row.patPhiCov;
+  m_host.patPhiOffset[p] = row.patPhiOffset;
+  m_host.bendPlaneCovPhiPhi[p] = row.bendPlaneCovPhiPhi;
+  m_host.bendPlaneCovSS[p] = row.bendPlaneCovSS;
+  m_host.bendPlaneCovPhiS[p] = row.bendPlaneCovPhiS;
+  m_host.nDoF[p] = row.nDoF;
+  m_host.lastNDoF[p] = row.lastNDoF;
+  m_host.anchorRadius[p] = row.anchorRadius;
 
   m_host.meanNormResidual2[p] = row.meanNormResidual2;
   m_host.lastResidual[p] = row.lastResidual;
@@ -715,7 +724,13 @@ CudaPatternRecordRow CudaPatternRecordContainer::pattern(
 
   row.patPhi = m_host.patPhi[p];
   row.patTheta = m_host.patTheta[p];
-  row.patPhiCov = m_host.patPhiCov[p];
+  row.patPhiOffset = m_host.patPhiOffset[p];
+  row.bendPlaneCovPhiPhi = m_host.bendPlaneCovPhiPhi[p];
+  row.bendPlaneCovSS = m_host.bendPlaneCovSS[p];
+  row.bendPlaneCovPhiS = m_host.bendPlaneCovPhiS[p];
+  row.nDoF = m_host.nDoF[p];
+  row.lastNDoF = m_host.lastNDoF[p];
+  row.anchorRadius = m_host.anchorRadius[p];
 
   row.meanNormResidual2 = m_host.meanNormResidual2[p];
   row.lastResidual = m_host.lastResidual[p];

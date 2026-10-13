@@ -60,38 +60,34 @@ struct CudaHitFlags {
 /// the surface or the space point, so everything that depends on them is here:
 ///
 ///  - the position and the sensor direction;
-///  - the intrinsic variance along a direction c, which depends on c and hence
-///    cannot be a single number: it needs the measurement directions and the
-///    covariances,
-///      straw:  driftCovariance * (|c|^2 - (s.c)^2) [+ (s.c)^2 * phiCovariance]
-///      strip:  etaCovariance * (e.c)^2 [+ phiCovariance * (p.c)^2]
-///    with s the sensor direction, e and p the two measurement directions;
-///  - the variance of the hit in phi, the identifier of its measurement
-///    surface for the overlap test and the station and layer numbers that the
-///    layer ordering is made of.
+///  - what PatternStateAux::intrinsicVariance reads to contract the hit
+///    covariance along a direction: the space point covariance, the drift
+///    variance of a straw and the measured directions of a strip
+///    (stripMeasurementDirections);
+///  - the identifier of its measurement surface for the overlap test and the
+///    station and layer numbers that the layer ordering is made of.
 struct CudaHitPayloadRow {
   /// @brief Global position of the hit
   Acts::Vector3 position{Acts::Vector3::Zero()};
   /// @brief Global direction of the wire or of the strip
   Acts::Vector3 sensorDirection{Acts::Vector3::Zero()};
-  /// @brief Direction of the precision measurement of a strip. Zero for a straw
+  /// @brief Primary measured direction of a strip, the first of
+  ///        stripMeasurementDirections. Zero for a straw
   Acts::Vector3 etaMeasurementDirection{Acts::Vector3::Zero()};
-  /// @brief Direction of the second measurement of a strip that measures phi
-  ///        too. Zero otherwise
+  /// @brief Secondary measured direction of a strip that measures phi too,
+  ///        the second of stripMeasurementDirections. Zero otherwise
   Acts::Vector3 phiMeasurementDirection{Acts::Vector3::Zero()};
 
   /// @brief Local y coordinate of the space point, which breaks the ties
   ///        between hits of the same layer and tells measurements apart
   double localPositionY{0.};
-  /// @brief Space point covariance of the precision coordinate
+  /// @brief Space point covariance of the bending (precision) coordinate
   double etaCovariance{0.};
-  /// @brief Space point covariance of the non-precision coordinate
+  /// @brief Space point covariance of the non-bending coordinate
   double phiCovariance{0.};
   /// @brief Straw: variance of the drift circle, drift radius squared plus
-  ///        the precision covariance. Zero for a strip
+  ///        the bending covariance. Zero for a strip
   double driftCovariance{0.};
-  /// @brief Variance of the hit in phi [rad^2]
-  double phiVariance{0.};
 
   /// @brief Geometry identifier of the measurement surface
   std::uint64_t geometryId{0u};
@@ -132,7 +128,6 @@ struct CudaHitPayloadArrays {
   double* etaCovariance = nullptr;
   double* phiCovariance = nullptr;
   double* driftCovariance = nullptr;
-  double* phiVariance = nullptr;
 
   std::uint64_t* geometryId = nullptr;
 
@@ -166,7 +161,6 @@ struct CudaHitPayloadHostData {
   std::vector<double> etaCovariance;
   std::vector<double> phiCovariance;
   std::vector<double> driftCovariance;
-  std::vector<double> phiVariance;
 
   std::vector<std::uint64_t> geometryId;
 
@@ -506,26 +500,37 @@ struct CudaPatternOverflow {
   static constexpr std::uint8_t hits = 1u << 1u;
   /// @brief The event had more accepted patterns than its slots
   static constexpr std::uint8_t eventPatterns = 1u << 2u;
-  /// @brief More seeds of a batch overflowed than the retry has entries for
-  static constexpr std::uint8_t retrySeeds = 1u << 3u;
 };
 
 /// @brief One pattern as plain numbers, the way the host container takes and
-///        returns it. This is PatternState without the host pointers.
+///        returns it. This is PatternStateAux without the host pointers.
 struct CudaPatternRecordRow {
   /// @brief Expanded sector index of the pattern
   std::int8_t sector{0};
-  /// @brief Pattern phi and theta, and the variance of phi
+  /// @brief Pattern phi and theta, and the offset of the bending plane from
+  ///        the origin along its normal
   double patPhi{0.};
   double patTheta{0.};
-  double patPhiCov{0.};
+  double patPhiOffset{0.};
+  /// @brief Covariance of the bending plane's phi and offset:
+  ///        PatternStateAux::BendPlaneCov ePhiPhi, eSS and ePhiS
+  double bendPlaneCovPhiPhi{0.};
+  double bendPlaneCovSS{0.};
+  double bendPlaneCovPhiS{0.};
   /// @brief While the pattern is built, the sum over its eta hits of the
   ///        squared residual over uncertainty. Divided by the number of
-  ///        bending layers once the pattern is finalized, as on the CPU
+  ///        degrees of freedom once the pattern is finalized, as on the CPU
   double meanNormResidual2{0.};
-  /// @brief Residual and uncertainty of the last inserted hit
+  /// @brief Degrees of freedom of the residuals of the pattern
+  std::uint32_t nDoF{0u};
+  /// @brief Residual, uncertainty and degrees of freedom of the last inserted
+  ///        hit
   double lastResidual{0.};
   double lastResSigma{0.};
+  std::uint8_t lastNDoF{0u};
+  /// @brief Transverse distance of the line anchor hit from the beam line, the
+  ///        radius at which the overlap test compares the phi of two patterns
+  double anchorRadius{0.};
   /// @brief Position and direction of the pattern line, in the bending plane
   Acts::Vector3 linePos{Acts::Vector3::Zero()};
   Acts::Vector3 lineDir{Acts::Vector3::Zero()};
@@ -571,7 +576,13 @@ struct CudaPatternRecordArrays {
 
   double* patPhi = nullptr;
   double* patTheta = nullptr;
-  double* patPhiCov = nullptr;
+  double* patPhiOffset = nullptr;
+  double* bendPlaneCovPhiPhi = nullptr;
+  double* bendPlaneCovSS = nullptr;
+  double* bendPlaneCovPhiS = nullptr;
+  std::uint32_t* nDoF = nullptr;
+  std::uint8_t* lastNDoF = nullptr;
+  double* anchorRadius = nullptr;
 
   double* meanNormResidual2 = nullptr;
   double* lastResidual = nullptr;
@@ -634,7 +645,13 @@ struct CudaPatternRecordHostData {
 
   std::vector<double> patPhi;
   std::vector<double> patTheta;
-  std::vector<double> patPhiCov;
+  std::vector<double> patPhiOffset;
+  std::vector<double> bendPlaneCovPhiPhi;
+  std::vector<double> bendPlaneCovSS;
+  std::vector<double> bendPlaneCovPhiS;
+  std::vector<std::uint32_t> nDoF;
+  std::vector<std::uint8_t> lastNDoF;
+  std::vector<double> anchorRadius;
 
   std::vector<double> meanNormResidual2;
   std::vector<double> lastResidual;
@@ -781,11 +798,12 @@ class CudaPatternRecordContainer {
   void checkHit(size_type patternSlot, size_type local) const;
 };
 
-/// @brief Position of the precision coordinate in MuonSpacePoint::covariance()
-constexpr std::size_t cudaHitEtaCovarianceIndex = 0u;
-/// @brief Position of the non-precision coordinate in
+/// @brief Position of the bending (precision) coordinate in
+///        MuonSpacePoint::covariance(), CompSpacePointAuxiliaries::ResidualIdx
+constexpr std::size_t cudaHitEtaCovarianceIndex = 1u;
+/// @brief Position of the non-bending coordinate in
 ///        MuonSpacePoint::covariance()
-constexpr std::size_t cudaHitPhiCovarianceIndex = 1u;
+constexpr std::size_t cudaHitPhiCovarianceIndex = 0u;
 
 /// @brief Evaluates, on the host, everything the pattern finder reads from a
 ///        hit, so that a kernel needs neither the surface nor the space point.
@@ -810,7 +828,6 @@ CudaHitPayloadRow makeCudaHitPayloadRow(const Acts::GeometryContext& gctx,
   row.localPositionY = sp.localPosition().y();
   row.etaCovariance = sp.covariance()[cudaHitEtaCovarianceIndex];
   row.phiCovariance = sp.covariance()[cudaHitPhiCovarianceIndex];
-  row.phiVariance = hit.phiVariance(gctx);
 
   row.geometryId = sp.geometryId().value();
   row.stationKey = stationKey(sp.id());
@@ -839,22 +856,16 @@ CudaHitPayloadRow makeCudaHitPayloadRow(const Acts::GeometryContext& gctx,
   row.sensorDirection = hit.globalSensorDirection(gctx);
 
   if (sp.isStraw()) {
-    // The straw keeps the variance of its drift circle in the member that is
-    // the strip angle for the strips
-    row.driftCovariance = hit.stripAngle;
+    // PatternStateAux::intrinsicVariance: the drift circle
+    row.driftCovariance = Acts::square(sp.driftRadius()) +
+                          sp.covariance()[cudaHitEtaCovarianceIndex];
     return row;
   }
 
-  const auto& surfLinearTrf =
-      hit.surface->localToGlobalTransform(gctx).linear();
-  if (sp.id().measuresPhi()) {
-    row.etaMeasurementDirection =
-        hit.nonOrthogonalStrips ? Acts::Vector3{row.sensorDirection.cross(
-                                      surfLinearTrf.col(Acts::eZ))}
-                                : Acts::Vector3{surfLinearTrf.col(Acts::eX)};
-    row.phiMeasurementDirection = surfLinearTrf.col(Acts::eY);
-  } else {
-    row.etaMeasurementDirection = surfLinearTrf.col(Acts::eX);
+  const auto [primary, secondary] = hit.stripMeasurementDirections(gctx);
+  row.etaMeasurementDirection = primary;
+  if (secondary) {
+    row.phiMeasurementDirection = *secondary;
   }
   return row;
 }

@@ -67,23 +67,6 @@ ActsExamples::MuonSpacePoint makeSpacePoint(
   return sp;
 }
 
-/// @brief The intrinsic variance along a direction, from the columns of a row
-double varianceFromRow(const ActsExamples::CudaHitPayloadRow& row,
-                       const Vector3& direction) {
-  const bool measuresPhi{(row.flags & CudaHitFlags::measuresPhi) != 0u};
-  if ((row.flags & CudaHitFlags::straw) != 0u) {
-    const double dotProdSq{square(row.sensorDirection.dot(direction))};
-    const double etaTerm{row.driftCovariance *
-                         (direction.squaredNorm() - dotProdSq)};
-    return measuresPhi ? etaTerm + dotProdSq * row.phiCovariance : etaTerm;
-  }
-  const double etaTerm{row.etaCovariance *
-                       square(row.etaMeasurementDirection.dot(direction))};
-  return measuresPhi
-             ? etaTerm + row.phiCovariance *
-                             square(row.phiMeasurementDirection.dot(direction))
-             : etaTerm;
-}
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(EventDataSuite)
@@ -202,7 +185,6 @@ BOOST_AUTO_TEST_CASE(CudaHitPayloadRowRoundTrip) {
   row.etaCovariance = 0.09;
   row.phiCovariance = 4.0;
   row.driftCovariance = 0.5;
-  row.phiVariance = 1.e-4;
   row.geometryId = 11u;
   row.stationKey = 5u;
   row.station = 6u;
@@ -251,7 +233,6 @@ BOOST_AUTO_TEST_CASE(CudaHitPayloadRowRoundTrip) {
   BOOST_CHECK_EQUAL(back.etaCovariance, row.etaCovariance);
   BOOST_CHECK_EQUAL(back.phiCovariance, row.phiCovariance);
   BOOST_CHECK_EQUAL(back.driftCovariance, row.driftCovariance);
-  BOOST_CHECK_EQUAL(back.phiVariance, row.phiVariance);
   BOOST_CHECK_EQUAL(back.geometryId, row.geometryId);
   BOOST_CHECK_EQUAL(back.flags, row.flags);
 }
@@ -290,19 +271,20 @@ BOOST_AUTO_TEST_CASE(CudaHitPayloadRowFromHitPayload) {
                                         CudaHitFlags::precision);
   BOOST_CHECK_EQUAL(stripRow.flags,
                     CudaHitFlags::measuresEta | CudaHitFlags::measuresPhi);
-  BOOST_CHECK_EQUAL(stripRow.phiVariance, strip.phiVariance(gctx));
-
-  // The rows hold what is needed to evaluate the variance of the CPU hits
-  const std::array<Vector3, 2> directions{Vector3{1., 0., 0.},
-                                          Vector3{1., 2., 3.}.normalized()};
-  for (const Vector3& direction : directions) {
-    BOOST_CHECK_CLOSE_FRACTION(varianceFromRow(strawRow, direction),
-                               straw.intrinsicVariance(gctx, direction),
-                               1.e-12);
-    BOOST_CHECK_CLOSE_FRACTION(varianceFromRow(stripRow, direction),
-                               strip.intrinsicVariance(gctx, direction),
-                               1.e-12);
-  }
+  // What PatternStateAux::intrinsicVariance reads: the covariance in the
+  // ACTS order (non-bending at 0, bending at 1), the drift circle of the straw
+  // and the measured directions of the strip
+  const auto& strawCov = bucket[0].covariance();
+  const auto& stripCov = bucket[1].covariance();
+  BOOST_CHECK_EQUAL(strawRow.driftCovariance,
+                    square(bucket[0].driftRadius()) + strawCov[1]);
+  BOOST_CHECK_EQUAL(strawRow.phiCovariance, strawCov[0]);
+  BOOST_CHECK_EQUAL(stripRow.etaCovariance, stripCov[1]);
+  BOOST_CHECK_EQUAL(stripRow.phiCovariance, stripCov[0]);
+  const auto [primary, secondary] = strip.stripMeasurementDirections(gctx);
+  BOOST_REQUIRE(secondary.has_value());
+  BOOST_CHECK(stripRow.etaMeasurementDirection == primary);
+  BOOST_CHECK(stripRow.phiMeasurementDirection == *secondary);
 }
 
 BOOST_AUTO_TEST_CASE(CudaCandidateListHostConstruction) {

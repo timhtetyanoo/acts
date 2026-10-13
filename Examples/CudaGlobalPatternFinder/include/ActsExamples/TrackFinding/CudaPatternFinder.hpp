@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <numbers>
 
 #include <cuda_runtime.h>
 
@@ -105,7 +106,6 @@ struct Hit {
   double etaCovariance{0.};
   double phiCovariance{0.};
   double driftCovariance{0.};
-  double phiVariance{0.};
   std::uint32_t stationKey{0u};
   std::uint8_t station{0u};
   std::uint8_t locLayer{0u};
@@ -130,7 +130,6 @@ __host__ __device__ inline Hit loadHit(const CudaHitPayloadArrays& hits,
   hit.etaCovariance = hits.etaCovariance[row];
   hit.phiCovariance = hits.phiCovariance[row];
   hit.driftCovariance = hits.driftCovariance[row];
-  hit.phiVariance = hits.phiVariance[row];
   hit.stationKey = hits.stationKey[row];
   hit.station = hits.station[row];
   hit.locLayer = hits.locLayer[row];
@@ -152,7 +151,6 @@ inline Hit makeHit(const CudaHitPayloadRow& row) {
   hit.etaCovariance = row.etaCovariance;
   hit.phiCovariance = row.phiCovariance;
   hit.driftCovariance = row.driftCovariance;
-  hit.phiVariance = row.phiVariance;
   hit.stationKey = row.stationKey;
   hit.station = row.station;
   hit.locLayer = row.locLayer;
@@ -160,50 +158,52 @@ inline Hit makeHit(const CudaHitPayloadRow& row) {
   return hit;
 }
 
-/// @brief HitPayload::intrinsicVariance: the hit position covariance
-///        contracted along a direction. Not defined for a phi-only hit, where
-///        the CPU throws; it returns zero here, and a phi-only hit never
-///        reaches the pattern building.
+/// @brief PatternStateAux::intrinsicVariance: the hit covariance contracted
+///        along a direction. A projected hit has its position along the
+///        sensor taken by the projection, so the measurement along the sensor
+///        drops out
 __host__ __device__ inline double intrinsicVariance(const Hit& hit,
-                                                    const Vector3& c) {
-  const bool measuresPhi{(hit.flags & CudaHitFlags::measuresPhi) != 0u};
+                                                    const Vector3& c,
+                                                    bool isProjected) {
   if ((hit.flags & CudaHitFlags::straw) != 0u) {
-    const double dotProdSq{square(dot(hit.sensorDirection, c))};
-    const double etaTerm{hit.driftCovariance * (dot(c, c) - dotProdSq)};
-    if (measuresPhi) {
-      return etaTerm + dotProdSq * hit.phiCovariance;
+    const double discVar{hit.driftCovariance};
+    if (isProjected) {
+      return discVar * dot(c, c);
     }
-    return etaTerm;
+    const double vDotRsq{square(dot(hit.sensorDirection, c))};
+    return discVar * (dot(c, c) - vDotRsq) + vDotRsq * hit.phiCovariance;
   }
-  if ((hit.flags & CudaHitFlags::measuresEta) == 0u) {
-    return 0.;
+  // A strip measures phi as well exactly when it has a second direction
+  const bool hasSecond{(hit.flags & CudaHitFlags::measuresPhi) != 0u};
+  const double bendTerm{hit.etaCovariance *
+                        square(dot(hit.etaMeasurementDirection, c))};
+  if (isProjected && !hasSecond) {
+    return bendTerm;
   }
-  const double etaTerm{hit.etaCovariance *
-                       square(dot(hit.etaMeasurementDirection, c))};
-  if (measuresPhi) {
-    return etaTerm +
-           hit.phiCovariance * square(dot(hit.phiMeasurementDirection, c));
-  }
-  return etaTerm;
+  return bendTerm +
+         (hasSecond
+              ? hit.phiCovariance * square(dot(hit.phiMeasurementDirection, c))
+              : hit.phiCovariance * square(dot(hit.sensorDirection, c)));
 }
 
-/// @brief PatternState::projToPhiPlane: the hit moved along its sensor onto
-///        the bending plane through the origin, Acts::PlanarHelper::
-///        intersectPlane. A sensor parallel to the plane has no intersection;
-///        the CPU then takes the position of an invalid intersection, which
-///        is the origin, and so does this
-__host__ __device__ inline Vector3 projectToPhiPlane(
-    const Hit& hit, const Vector3& bendPlaneNorm) {
-  const double offset{dot(Vector3{}, bendPlaneNorm)};
-  const double normDot{dot(bendPlaneNorm, hit.sensorDirection)};
+/// @brief PatternStateAux::projToPhiPlane: the hit moved along its sensor
+///        onto the bending plane, the plane of normal n through offset * n,
+///        Acts::PlanarHelper::intersectPlane. A sensor parallel to the plane
+///        has no intersection; the CPU then takes the position of an invalid
+///        intersection, which is the origin, and so does this
+__host__ __device__ inline Vector3 projectToPhiPlane(const Hit& hit,
+                                                     const Vector3& n,
+                                                     double planeOffset) {
+  const double offset{dot(planeOffset * n, n)};
+  const double normDot{dot(n, hit.sensorDirection)};
   if (std::abs(normDot) < DBL_EPSILON) {
     return Vector3{};
   }
-  const double path{(offset - dot(hit.position, bendPlaneNorm)) / normDot};
+  const double path{(offset - dot(hit.position, n)) / normDot};
   return hit.position + path * hit.sensorDirection;
 }
 
-/// @brief The pattern line, as PatternState holds it
+/// @brief The pattern line, as PatternStateAux holds it
 struct Line {
   Vector3 position{};
   Vector3 direction{};
@@ -211,16 +211,16 @@ struct Line {
   bool useBeamspot{false};
 };
 
-/// @brief The beam spot, PatternState::BeamspotInfo
+/// @brief The beam spot, PatternStateAux::BeamspotInfo
 struct Beamspot {
   Vector3 position{};
   double radius{0.};
   double length{0.};
 };
 
-/// @brief PatternState::updateLineParameters: the line through the projected
-///        anchor and last hit, or through the beam spot when the two are
-///        closer than minHitDistance
+/// @brief PatternStateAux::updateLineParameters: the line through the
+///        projected anchor and last hit, or through the beam spot when the two
+///        are closer than minHitDistance
 /// @param anchor The anchor hit projected onto the bending plane
 /// @param last The last hit projected onto the bending plane
 __host__ __device__ inline Line lineThroughHits(const Vector3& anchor,
@@ -242,31 +242,45 @@ __host__ __device__ inline Line lineThroughHits(const Vector3& anchor,
   return line;
 }
 
-/// @brief Residual of a test hit against the pattern line and its uncertainty
+/// @brief The bending plane of a pattern: its phi, its offset from the origin
+///        along the normal n = (-sin phi, cos phi, 0) and the covariance of
+///        phi and offset, PatternStateAux::BendPlaneCov ePhiPhi, eSS, ePhiS
+struct BendPlane {
+  double phi{0.};
+  double offset{0.};
+  Vector3 normal{};
+  double covPhiPhi{0.};
+  double covSS{0.};
+  double covPhiS{0.};
+};
+
+/// @brief Residual of a test hit against the pattern line, its uncertainty
+///        and its degrees of freedom, PatternStateAux::LineTestRes
 struct LineResidual {
   double residual{0.};
   double sigma{0.};
+  std::uint8_t nDof{0u};
 };
 
-/// @brief PatternState::computeLineResidual
+/// @brief PatternStateAux::computeLineResidual
 /// @param line The pattern line
-/// @param bendPlaneNorm The normal of the bending plane
-/// @param patPhiCov The variance of the pattern phi
+/// @param plane The bending plane of the pattern
 /// @param nPhiLayers The number of phi layers of the pattern
 /// @param anchor The line anchor hit
 /// @param last The last inserted hit
 /// @param test The hit tested against the line
 /// @param beamspot The beam spot
 __host__ __device__ inline LineResidual lineResidual(
-    const Line& line, const Vector3& bendPlaneNorm, double patPhiCov,
-    std::uint32_t nPhiLayers, const Hit& anchor, const Hit& last,
-    const Hit& test, const Beamspot& beamspot) {
+    const Line& line, const BendPlane& plane, std::uint32_t nPhiLayers,
+    const Hit& anchor, const Hit& last, const Hit& test,
+    const Beamspot& beamspot) {
   LineResidual res{};
 
   const bool projectTestHit{(test.flags & CudaHitFlags::measuresPhi) == 0u ||
                             nPhiLayers == 0u};
-  const Vector3 testPos{projectTestHit ? projectToPhiPlane(test, bendPlaneNorm)
-                                       : test.position};
+  const Vector3 testPos{
+      projectTestHit ? projectToPhiPlane(test, plane.normal, plane.offset)
+                     : test.position};
   const Vector3 K{testPos - line.position};
   const double KdotD{dot(K, line.direction)};
 
@@ -274,33 +288,35 @@ __host__ __device__ inline LineResidual lineResidual(
   res.residual = norm(R);
   if (res.residual < epsilon) {
     res.residual = DBL_MAX;
-    res.sigma = 0.;
     return res;
   }
   const Vector3 resDir{R / res.residual};
   const double alpha{KdotD / line.leverArm};
 
   double phiPlaneDerivativeAcc{0.};
+  double phiDisplDerivativeAcc{0.};
   double residualCovAcc{0.};
 
   auto covarianceTerm = [&](const Hit& hit, const Vector3& pos,
                             const double preFactor, bool isProjected) {
     if (!isProjected) {
-      residualCovAcc += square(preFactor) * intrinsicVariance(hit, resDir);
+      residualCovAcc +=
+          square(preFactor) * intrinsicVariance(hit, resDir, false);
       return;
     }
     const Vector3& sensorDir{hit.sensorDirection};
     const double projFactor{dot(sensorDir, resDir) /
-                            dot(sensorDir, bendPlaneNorm)};
-    const Vector3 trfDir{resDir - projFactor * bendPlaneNorm};
+                            dot(sensorDir, plane.normal)};
+    const Vector3 trfDir{resDir - projFactor * plane.normal};
 
-    residualCovAcc += square(preFactor) * intrinsicVariance(hit, trfDir);
-    phiPlaneDerivativeAcc += preFactor * perp(pos) * projFactor;
+    residualCovAcc += square(preFactor) * intrinsicVariance(hit, trfDir, true);
+    phiPlaneDerivativeAcc += preFactor * projFactor * perp(pos);
+    phiDisplDerivativeAcc += preFactor * projFactor;
   };
 
   if (line.useBeamspot) {
-    const double covS1 = beamspot.length * square(resDir.z) +
-                         beamspot.radius * (1 - square(resDir.z));
+    const double covS1 = square(beamspot.length) * square(resDir.z) +
+                         square(beamspot.radius) * (1 - square(resDir.z));
     residualCovAcc += square(alpha - 1) * covS1;
   } else {
     covarianceTerm(anchor, line.position, alpha - 1, true);
@@ -311,9 +327,30 @@ __host__ __device__ inline LineResidual lineResidual(
 
   covarianceTerm(test, testPos, 1., projectTestHit);
 
-  res.sigma =
-      std::sqrt(residualCovAcc + square(phiPlaneDerivativeAcc) * patPhiCov);
+  const double projSigmaTerm{square(phiPlaneDerivativeAcc) * plane.covPhiPhi +
+                             square(phiDisplDerivativeAcc) * plane.covSS +
+                             2 * phiPlaneDerivativeAcc * phiDisplDerivativeAcc *
+                                 plane.covPhiS};
+
+  res.sigma = std::sqrt(residualCovAcc + projSigmaTerm);
+  res.nDof = projectTestHit ? 1u : 2u;
   return res;
+}
+
+/// @brief PatternStateAux::angleToBendPlane: the angle between a point and
+///        the bending plane, as seen from the origin
+__host__ __device__ inline double angleToBendPlane(const BendPlane& plane,
+                                                   const Vector3& pos) {
+  const double dist{dot(plane.normal, pos) - plane.offset};
+  const double rho{plane.normal.y * pos.x - plane.normal.x * pos.y};
+  return std::atan2(dist, rho);
+}
+
+/// @brief PatternStateAux::phiAtRadius: the approximate azimuth of the
+///        bending plane at a transverse distance from the beam line
+__host__ __device__ inline double phiAtRadius(const BendPlane& plane,
+                                              double radius) {
+  return plane.phi + plane.offset / radius;
 }
 
 /// @brief Station and layer numbers, as Muon::MuonStationIndex numbers them
@@ -510,6 +547,127 @@ __host__ __device__ inline bool isNeighbour(int sector1, int sector2) {
 }
 }  // namespace ExpandedSector
 
+/// @brief PatternStateAux::updatePatternPhi: the bending plane from the phi
+///        measuring hits of a pattern and the beam spot. Without phi hits it
+///        is the centre of the sector, through the origin; with one, the line
+///        through the hit and the beam spot; with more, the weighted straight
+///        line fit of the hits and the beam spot in the transverse plane.
+/// @param nPhiLayers The number of phi layers of the pattern
+/// @param previousPhi The pattern phi so far, which fixes the fit weights
+/// @param sector The expanded sector of the pattern
+/// @param beamspot The beam spot
+/// @param forEachPhiHit Calls its argument with every phi measuring hit of
+///        the pattern, group by group, in the order they were added
+/// @return The bending plane. A fit without weight or without a defined
+///         direction, where the CPU throws, gives non-finite values
+template <typename ForEachPhiHit>
+__host__ __device__ inline BendPlane fitBendPlane(
+    std::uint32_t nPhiLayers, double previousPhi, int sector,
+    const Beamspot& beamspot, ForEachPhiHit&& forEachPhiHit) {
+  BendPlane plane{};
+  // The solution closest to the sector's direction
+  auto alignPhiAndStore = [&](double newPatPhi) {
+    const double refPhi{ExpandedSector::phi(sector)};
+    while (newPatPhi - refPhi > pi / 2.) {
+      newPatPhi -= pi;
+    }
+    while (newPatPhi - refPhi < -pi / 2.) {
+      newPatPhi += pi;
+    }
+    plane.phi = newPatPhi;
+    plane.normal = Vector3{-std::sin(plane.phi), std::cos(plane.phi), 0.};
+  };
+  if (nPhiLayers == 0u) {
+    alignPhiAndStore(ExpandedSector::phi(sector));
+    plane.offset = 0.;
+    plane.covPhiPhi = square(ExpandedSector::size(sector)) / 3.;
+    plane.covSS = 0.;
+    plane.covPhiS = 0.;
+    return plane;
+  }
+  if (nPhiLayers == 1u) {
+    // A copy: the visitor may hand over a hit that lives only for the call
+    Hit phiHit{};
+    forEachPhiHit([&](const Hit& hit) { phiHit = hit; });
+    const double bsX{beamspot.position.x};
+    const double bsY{beamspot.position.y};
+    const double dX{phiHit.position.x - bsX};
+    const double dY{phiHit.position.y - bsY};
+    alignPhiAndStore(std::atan2(dY, dX));
+    plane.offset = dot(plane.normal, beamspot.position);
+
+    const double eRX{plane.normal.y};
+    const double eRY{-plane.normal.x};
+    const double lever{dX * eRX + dY * eRY};
+    const double rhoBS{bsX * eRX + bsY * eRY};
+    const double rhoHit{rhoBS + lever};
+
+    const double varBS{square(beamspot.radius)};
+    const double varHit{intrinsicVariance(phiHit, plane.normal, false)};
+    const double invL2{1. / square(lever)};
+
+    plane.covPhiPhi = (varHit + varBS) * invL2;
+    plane.covPhiS = -(rhoBS * varHit + rhoHit * varBS) * invL2;
+    plane.covSS = (square(rhoBS) * varHit + square(rhoHit) * varBS) * invL2;
+    return plane;
+  }
+
+  const Vector3 n0{-std::sin(previousPhi), std::cos(previousPhi), 0.};
+  const double bsX{beamspot.position.x};
+  const double bsY{beamspot.position.y};
+  double weightSum{0.};
+  double Sxx{0.};
+  double Sxy{0.};
+  double Syy{0.};
+  double centroidX{0.};
+  double centroidY{0.};
+  forEachPhiHit([&](const Hit& hit) {
+    const double variance{intrinsicVariance(hit, n0, false)};
+    if (variance < epsilon) {
+      return;
+    }
+    const double weight{1. / variance};
+    const double dX{hit.position.x - bsX};
+    const double dY{hit.position.y - bsY};
+    const double wdX{weight * dX};
+    const double wdY{weight * dY};
+
+    weightSum += weight;
+    centroidX += wdX;
+    centroidY += wdY;
+    Sxx += wdX * dX;
+    Sxy += wdX * dY;
+    Syy += wdY * dY;
+  });
+  weightSum += 1. / square(beamspot.radius);
+
+  const double weightSumInv{1. / weightSum};
+  centroidX *= weightSumInv;
+  centroidY *= weightSumInv;
+
+  const double Mxx{Sxx - weightSum * square(centroidX)};
+  const double Mxy{Sxy - weightSum * centroidX * centroidY};
+  const double Myy{Syy - weightSum * square(centroidY)};
+
+  const double eigenvalSeparation{
+      std::sqrt(square(Mxx - Myy) + square(2. * Mxy))};
+  const double eigenValSeparationInv{1. / eigenvalSeparation};
+
+  alignPhiAndStore(0.5 * std::atan2(2. * Mxy, Mxx - Myy));
+
+  centroidX += bsX;
+  centroidY += bsY;
+  plane.offset = plane.normal.x * centroidX + plane.normal.y * centroidY;
+  const double eRX{plane.normal.y};
+  const double eRY{-plane.normal.x};
+  const double rhoCentroid{centroidX * eRX + centroidY * eRY};
+
+  plane.covPhiPhi = eigenValSeparationInv;
+  plane.covPhiS = -rhoCentroid * eigenValSeparationInv;
+  plane.covSS = square(rhoCentroid) * eigenValSeparationInv + weightSumInv;
+  return plane;
+}
+
 }  // namespace ActsExamples::CudaPatternMath
 
 namespace ActsExamples {
@@ -518,7 +676,11 @@ namespace ActsExamples {
 ///        read
 struct CudaPatternFinderConfig {
   double nResidualSigma{3.};
-  double nPhiSigma{3.};
+  /// @brief The residual cut of a hit with two degrees of freedom, as
+  ///        GlobalPatternFinder computes it from nResidualSigma
+  double cut2Dof{0.};
+  double phiTolerance{3. * CudaPatternMath::pi / 180.};
+  double loosenAcceptanceFactor{2.};
   double minHitDistance4Line{40.};
   double maxThetaSizeOverlap{0.05};
   double lowConfidenceResSigma{50.};
@@ -583,7 +745,10 @@ CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
                                                     const Beamspot& beamspot) {
   return CudaPatternFinderConfig{
       .nResidualSigma = cfg.nResidualSigma,
-      .nPhiSigma = cfg.nPhiSigma,
+      .cut2Dof = std::sqrt(
+          -2. * std::log(std::erfc(cfg.nResidualSigma / std::numbers::sqrt2))),
+      .phiTolerance = cfg.phiTolerance,
+      .loosenAcceptanceFactor = cfg.loosenAcceptanceFactor,
       .minHitDistance4Line = cfg.minHitDistance4Line,
       .maxThetaSizeOverlap = cfg.maxThetaSizeOverlap,
       .lowConfidenceResSigma = cfg.lowConfidenceResSigma,
@@ -671,7 +836,7 @@ namespace ActsExamples {
 class CudaGlobalPatternFinder {
  public:
   using OutputPattern = GlobalPatternFinder_t::OutputPattern;
-  using PatternState = GlobalPatternFinder_t::PatternState;
+  using PatternStateAux = GlobalPatternFinder_t::PatternStateAux;
   using BeamspotInfo = GlobalPatternFinder_t::BeamspotInfo;
 
   struct Config {
@@ -701,16 +866,18 @@ class CudaGlobalPatternFinder {
       CudaPatternFinderTiming* timing = nullptr) const;
 
  private:
-  /// @brief A pattern found on the device as the CPU's PatternState
-  PatternState makePatternState(const Acts::GeometryContext& gctx,
-                                const std::vector<HitPayload>& payloads,
-                                const CudaPatternRecordContainer& event,
-                                std::size_t slot) const;
+  /// @brief A pattern found on the device as the CPU's PatternStateAux
+  PatternStateAux makePatternState(const Acts::GeometryContext& gctx,
+                                   const std::vector<HitPayload>& payloads,
+                                   const CudaPatternRecordContainer& event,
+                                   std::size_t slot,
+                                   const BeamspotInfo& beamspot) const;
 
   /// @brief GlobalPatternFinder::addPhiOnlyHits
   void addPhiOnlyHits(const Acts::GeometryContext& gctx,
+                      const BeamspotInfo& beamspot,
                       const OnlyPhiHitsProvider& onlyPhiProvider,
-                      std::vector<PatternState>& patterns) const;
+                      std::vector<PatternStateAux>& patterns) const;
 
   const Acts::Logger& logger() const { return *m_logger; }
 

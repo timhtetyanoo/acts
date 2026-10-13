@@ -22,7 +22,7 @@ PYBIND11_MODULE(ActsExamplesPythonBindingsCudaGlobalPatternFinder, cuda) {
       CudaGlobalPatternFinderAlgorithm, cuda,
       "CudaGlobalPatternFinderAlgorithm", inSpacePoints, outPatterns,
       trackingGeometry, useMdtHits, seedFromMdt, seedFromInner,
-      thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, nPhiSigma,
+      thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, phiTolerance,
       minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
       meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
       minHitDistance4Line, beamSpotRadius, beamSpotLength, batchSize,
