@@ -118,7 +118,7 @@ void addTrackFinding(py::module& mex) {
       GlobalPatternFinderAlgorithm, mex, "GlobalPatternFinderAlgorithm",
       inSpacePoints, outPatterns, trackingGeometry, useMdtHits, seedFromMdt,
       seedFromInner, thetaSearchWindow, nResidualSigma, lowConfidenceResSigma,
-      nPhiSigma, minTriggerLayers, minPrecisionLayers, minPhiLayers,
+      phiTolerance, minTriggerLayers, minPrecisionLayers, minPhiLayers,
       minStationLayers, meanNormRes2Cut, maxSeedAttempts,
       maxMissLayersInStation, minHitDistance4Line, beamSpotRadius,
       beamSpotLength);

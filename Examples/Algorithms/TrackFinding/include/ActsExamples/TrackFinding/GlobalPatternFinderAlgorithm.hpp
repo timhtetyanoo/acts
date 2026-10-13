@@ -181,15 +181,11 @@ struct HitPayload {
   const Acts::Vector3& globalPosition(const Acts::GeometryContext& gctx) const;
   /// @brief Retrieve the sensor direction
   Acts::Vector3 globalSensorDirection(const Acts::GeometryContext& gctx) const;
-  /// @brief Hit contribution contribution to the residual variance
-  /// due to its intrinsic position uncertainty.
-  /// @param contractionVector The contraction vector to compute the residual variance
-  /// @param isProjected Whether the hit has been projected
-  /// @return Residual variance contribution
-  double intrinsicVariance(const Acts::GeometryContext& gctx,
-                           const Acts::Vector3& contractionVector) const;
-  /// @brief Retrieve the phi variance of the hit
-  double phiVariance(const Acts::GeometryContext& gctx) const;
+  /// @brief The measured directions of a strip: the primary one, orthogonal
+  ///         to the sensor direction, and the second one of a two-dimensional
+  ///         strip measurement
+  Acts::Experimental::detail::StripMeasurementDirections
+  stripMeasurementDirections(const Acts::GeometryContext& gctx) const;
   /// @brief Returns whether the hit is a precision hit
   bool isPrecision() const { return isPrecisionFlag; }
 
@@ -203,8 +199,6 @@ struct HitPayload {
   ///         of the hit, i.e. the measuring, the sensor and the normal
   ///         direction
   const Acts::Surface* surface{nullptr};
-  /// @brief Cached angular covariance [rad^2] of the hit in the phi angle
-  double phiCov{0.};
   /// @brief Strip angle when the strips are non-orthogonal
   double stripAngle{0.};
   /// @brief Station index
@@ -279,19 +273,19 @@ static_assert(
     Acts::Experimental::detail::PatternSeedSelector<SeedSelector, HitPayload>);
 
 struct OnlyPhiHitsProvider {
-  using PatternState = GlobalPatternFinder_t::PatternState;
+  using PatternStateAux = GlobalPatternFinder_t::PatternStateAux;
   using PhiHitsPerGroup =
       std::array<std::vector<HitPayload>, PatternTopology::nGroups>;
   /// @brief Get the phi-only hits compatible with the pattern
-  PhiHitsPerGroup getPhiOnlyHits(const PatternState& pattern,
+  PhiHitsPerGroup getPhiOnlyHits(const PatternStateAux& pattern,
                                  const Acts::GeometryContext& gctx) const;
   /// @brief Tracking geometry to look up the measurement surfaces of the
   ///         collected phi-only hits
   const Acts::TrackingGeometry* trackingGeometry{nullptr};
 };
-static_assert(Acts::Experimental::detail::OnlyPhiHitsProvider<
-              OnlyPhiHitsProvider, HitPayload, PatternTopology,
-              GlobalPatternFinder_t::PatternState>);
+static_assert(
+    Acts::Experimental::detail::OnlyPhiHitsProvider<
+        OnlyPhiHitsProvider, HitPayload, PatternTopology, ExpandedSector>);
 
 /// @brief Transformation from the sector frame, in which the space points are
 ///        expressed, into the global frame. The space point carries the
@@ -379,8 +373,9 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
     double nResidualSigma{3.};
     /// @brief Residual uncertainty to consider the hit as low confidence
     double lowConfidenceResSigma{50.0};
-    /// @brief Number of standard deviations to consider for phi compatibility veto. The residual will be used to determine the acceptance.
-    double nPhiSigma{5.};
+    /// @brief Maximum angle [rad] of a hit to the pattern's bending plane for
+    ///         the hit to be phi compatible with the pattern
+    double phiTolerance{3. * Acts::UnitConstants::degree};
     /// @brief Requirement on trigger layers in the bending direction to accept a pattern
     unsigned minTriggerLayers{2};
     /// @brief Requirement on precision layers in the bending direction to accept a pattern
