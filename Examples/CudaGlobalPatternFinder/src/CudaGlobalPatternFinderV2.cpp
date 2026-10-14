@@ -135,6 +135,18 @@ CudaGlobalPatternFinder::surfaceTable(const Acts::GeometryContext& gctx) const {
                                cudaMemcpyHostToDevice));
     ACTS_DEBUG(__func__ << "() " << ids.size()
                         << " measurement surfaces on the device");
+    // The memory the pattern building takes from, a share of what the device
+    // has free once the table is there
+    if (m_cfg.workspaceFraction > 0.) {
+      std::size_t free{0u};
+      std::size_t total{0u};
+      ACTS_CUDA_CHECK(cudaMemGetInfo(&free, &total));
+      m_arenaBytes = static_cast<std::size_t>(m_cfg.workspaceFraction *
+                                              static_cast<double>(free));
+      ACTS_INFO("Pattern building memory: " << m_arenaBytes / (1u << 20u)
+                                            << " MiB of " << free / (1u << 20u)
+                                            << " MiB free on the device");
+    }
   });
   return m_surfaces;
 }
@@ -156,7 +168,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
   // The global positions of the hits the finding uses and the search tree
   // over them, as GlobalPatternFinderAlgorithm::constructTree
   const auto treeStart = Clock::now();
-  std::vector<std::uint32_t> usedSpacePoint{};
+  // Per row: the bucket and the space point, for the payloads of the kept
+  // patterns; per bucket: its rows
   std::vector<std::uint32_t> usedBucket{};
   std::vector<double> positionX{};
   std::vector<double> positionY{};
@@ -165,10 +178,13 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
   std::vector<double> bucketRotation(9u * spacePoints.size(), 0.);
   std::vector<Acts::Transform3> bucketTransform(spacePoints.size(),
                                                 Acts::Transform3::Identity());
+  std::vector<std::uint32_t> bucketBegin(spacePoints.size(), 0u);
+  std::vector<std::uint32_t> bucketEnd(spacePoints.size(), 0u);
   RowTree::vector_t treeEntries{};
-  std::uint32_t flatIndex{0u};
   for (std::size_t k = 0u; k < spacePoints.size(); ++k) {
     const MuonSpacePointBucket& bucket{spacePoints[k]};
+    bucketBegin[k] = static_cast<std::uint32_t>(usedPointer.size());
+    bucketEnd[k] = bucketBegin[k];
     if (bucket.empty()) {
       continue;
     }
@@ -178,14 +194,12 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
     storeRotation(localToGlobal.linear(), bucketRotation.data() + 9u * k);
     std::optional<std::uint16_t> msSector{};
     for (const MuonSpacePoint& sp : bucket) {
-      const std::uint32_t spIndex{flatIndex++};
       // Only-phi hits are not in the tree, and MDT hits only if asked for
       if (!sp.id().measuresEta() || (!m_cfg.useMdtHits && sp.isStraw())) {
         continue;
       }
-      const auto row = static_cast<std::uint32_t>(usedSpacePoint.size());
+      const auto row = static_cast<std::uint32_t>(usedPointer.size());
       const Acts::Vector3 pos{localToGlobal * sp.localPosition()};
-      usedSpacePoint.push_back(spIndex);
       usedBucket.push_back(static_cast<std::uint32_t>(k));
       positionX.push_back(pos.x());
       positionY.push_back(pos.y());
@@ -218,6 +232,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
         treeEntries.emplace_back(coords, row);
       }
     }
+    bucketEnd[k] = static_cast<std::uint32_t>(usedPointer.size());
   }
   const RowTree tree{std::move(treeEntries)};
   if (timing != nullptr) {
@@ -257,13 +272,30 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
   if (lists.empty()) {
     return {};
   }
-  CudaMuonSpacePointContainer flatSpacePoints{spacePoints};
+  // The used hits only, row r being space point r; every bucket keeps its
+  // number, those without used hits as empty ranges
+  CudaMuonSpacePointContainer flatSpacePoints{usedPointer.size()};
+  for (std::size_t row = 0u; row < usedPointer.size(); ++row) {
+    const MuonSpacePoint& sp{*usedPointer[row]};
+    flatSpacePoints.setGeometryId(row, sp.geometryId().value());
+    flatSpacePoints.setId(row, sp.id().toInt());
+    flatSpacePoints.defineCoordinates(row, sp.localPosition(),
+                                      sp.sensorDirection(), sp.toNextSensor());
+    flatSpacePoints.setRadius(row, sp.driftRadius());
+    flatSpacePoints.setTime(row, sp.time());
+    const auto& covariance = sp.covariance();
+    flatSpacePoints.setCovariance(row, covariance[0], covariance[1],
+                                  covariance[2]);
+  }
+  for (std::size_t k = 0u; k < spacePoints.size(); ++k) {
+    flatSpacePoints.addBucket(bucketBegin[k], bucketEnd[k]);
+  }
   if (timing != nullptr) {
     timing->fillUs = microseconds(Clock::now() - fillStart);
   }
 
-  // Up to the device: the space points, the used hits and the lists; the
-  // payloads are built there
+  // Up to the device: the used hits, their positions, the bucket rotations
+  // and the lists; the payloads are built there
   CudaStream stream;
   std::array<cudaEvent_t, 2> uploadMarks{};
   if (timing != nullptr) {
@@ -273,29 +305,25 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
     ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[0], stream.get()));
   }
   flatSpacePoints.moveToDevice(stream.get());
-  const PoolBuffer<std::uint32_t> deviceSpacePoint{usedSpacePoint,
-                                                   stream.get()};
-  const PoolBuffer<std::uint32_t> deviceBucket{usedBucket, stream.get()};
   const PoolBuffer<double> devicePositionX{positionX, stream.get()};
   const PoolBuffer<double> devicePositionY{positionY, stream.get()};
   const PoolBuffer<double> devicePositionZ{positionZ, stream.get()};
   const PoolBuffer<double> deviceBucketRotation{bucketRotation, stream.get()};
   lists.moveToDevice(stream.get());
   CudaHitPayloadContainer hits{};
-  hits.allocateDevice(usedSpacePoint.size(), stream.get());
+  hits.allocateDevice(usedPointer.size(), stream.get());
   const PoolBuffer<std::uint32_t> missingSurfaces{1u, stream.get()};
   ACTS_CUDA_CHECK(cudaMemsetAsync(missingSurfaces.get(), 0,
                                   sizeof(std::uint32_t), stream.get()));
   buildCudaHitPayloads(
       flatSpacePoints.deviceArrays(),
       CudaUsedHitArrays{
-          .spacePoint = deviceSpacePoint.get(),
-          .bucket = deviceBucket.get(),
           .positionX = devicePositionX.get(),
           .positionY = devicePositionY.get(),
           .positionZ = devicePositionZ.get(),
           .bucketRotation = deviceBucketRotation.get(),
-          .nHits = static_cast<std::uint32_t>(usedSpacePoint.size())},
+          .nHits = static_cast<std::uint32_t>(usedPointer.size()),
+          .nBuckets = static_cast<std::uint32_t>(spacePoints.size())},
       CudaSurfaceTableArrays{.geometryId = surfaces.geometryId,
                              .rotation = surfaces.rotation,
                              .nSurfaces = surfaces.nSurfaces},
@@ -304,9 +332,13 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
     ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream.get()));
   }
 
+  CudaPatternFinderSizes sizes{m_cfg.sizes};
+  if (m_arenaBytes > 0u) {
+    sizes.workspaceBytes = m_arenaBytes;
+  }
   const CudaPatternRecordContainer event{findCudaPatternsInEtaV2(
-      hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot),
-      m_cfg.sizes, stream.get(), timing)};
+      hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
+      stream.get(), timing)};
   std::uint32_t nMissing{0u};
   ACTS_CUDA_CHECK(cudaMemcpyAsync(&nMissing, missingSurfaces.get(),
                                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
@@ -335,7 +367,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatternsV2(
   // The payloads of the hits of the kept patterns, on the host, for the
   // phi-only hits and the conversion
   const auto tailStart = Clock::now();
-  std::vector<std::optional<HitPayload>> payloads(usedSpacePoint.size());
+  std::vector<std::optional<HitPayload>> payloads(usedPointer.size());
   auto payloadOf = [&](std::uint32_t row) -> const HitPayload& {
     std::optional<HitPayload>& payload{payloads[row]};
     if (!payload) {

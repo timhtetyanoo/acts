@@ -10,9 +10,11 @@
 
 #include "ActsExamples/Utilities/CudaUtilities.hpp"
 
+#include <algorithm>
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -150,44 +152,61 @@ void zeroDeviceColumn(T* deviceColumn, std::size_t size, cudaStream_t stream) {
   ACTS_CUDA_CHECK(cudaMemsetAsync(deviceColumn, 0, size * sizeof(T), stream));
 }
 
-/// Takes a device column from the device's memory pool, in the order of the
-/// stream. The containers are rebuilt every event, and the pool hands back
-/// what was freed instead of allocating and synchronizing anew
+/// The bytes of a column of `count` elements inside a block, kept aligned
 template <typename T>
-void allocateColumn(T*& deviceColumn, std::size_t size, cudaStream_t stream) {
-  if (size == 0) {
-    return;
-  }
-  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&deviceColumn),
-                                  size * sizeof(T), stream));
+std::size_t blockBytes(const T* /*column*/, std::size_t count) {
+  return (count * sizeof(T) + 15u) & ~std::size_t{15u};
 }
 
-/// Returns a device column to the pool. The containers are released once the
-/// work on their columns has completed, so the release does not need the
+/// Points the columns of a list into a block, each with count(hostColumn)
+/// elements, from the cursor on; adds their bytes to `bytes` if the block is
+/// still to be allocated (block == nullptr)
+template <typename Columns, typename Host, typename Device, typename Count>
+void carveColumns(Columns&& columns, Host& host, Device& device, char* block,
+                  std::size_t& cursor, Count count) {
+  columns(host, device, [&](auto& hostColumn, auto& deviceColumn) {
+    const std::size_t n{count(hostColumn)};
+    if (block != nullptr) {
+      deviceColumn = n > 0u
+                         ? reinterpret_cast<
+                               std::remove_reference_t<decltype(deviceColumn)>>(
+                               block + cursor)
+                         : nullptr;
+    }
+    cursor += blockBytes(deviceColumn, n);
+  });
+}
+
+/// All device columns of a list in one block from the device's memory pool,
+/// in the order of the stream: one allocation instead of one per column, for
+/// containers that are rebuilt every event. Returns the block, which the
+/// container releases at once
+template <typename Columns, typename Host, typename Device>
+void* allocateColumns(Columns&& columns, Host& host, Device& device,
+                      cudaStream_t stream) {
+  auto hostSize = [](const auto& hostColumn) { return hostColumn.size(); };
+  std::size_t bytes{0u};
+  carveColumns(columns, host, device, nullptr, bytes, hostSize);
+  if (bytes == 0u) {
+    return nullptr;
+  }
+  char* block{nullptr};
+  ACTS_CUDA_CHECK(
+      cudaMallocAsync(reinterpret_cast<void**>(&block), bytes, stream));
+  std::size_t cursor{0u};
+  carveColumns(columns, host, device, block, cursor, hostSize);
+  return block;
+}
+
+/// Returns a block of columns to the pool. The containers are released once
+/// the work on their columns has completed, so the release does not need the
 /// stream that used them
-template <typename T>
-void freeColumn(T*& deviceColumn) noexcept {
-  if (deviceColumn != nullptr) {
+inline void freeBlock(void*& block) noexcept {
+  if (block != nullptr) {
     // Called from noexcept destructors, so a failure cannot be reported
-    (void)cudaFreeAsync(deviceColumn, cudaStreamPerThread);
-    deviceColumn = nullptr;
+    (void)cudaFreeAsync(block, cudaStreamPerThread);
+    block = nullptr;
   }
-}
-
-/// The column functions applied to every column of a list
-template <typename Columns, typename Host, typename Device>
-void allocateColumns(Columns&& columns, const Host& host, Device& device,
-                     cudaStream_t stream) {
-  columns(host, device, [stream](const auto& hostColumn, auto& deviceColumn) {
-    allocateColumn(deviceColumn, hostColumn.size(), stream);
-  });
-}
-
-template <typename Columns, typename Host, typename Device>
-void freeColumns(Columns&& columns, const Host& host, Device& device) noexcept {
-  columns(host, device, [](const auto& /*hostColumn*/, auto& deviceColumn) {
-    freeColumn(deviceColumn);
-  });
 }
 
 template <typename Columns, typename Host, typename Device>
@@ -224,6 +243,7 @@ CudaHitPayloadContainer::CudaHitPayloadContainer(
     : m_size{std::exchange(other.m_size, 0)},
       m_host{std::move(other.m_host)},
       m_device{std::exchange(other.m_device, {})},
+      m_block{std::exchange(other.m_block, nullptr)},
       m_onDevice{std::exchange(other.m_onDevice, false)} {}
 
 CudaHitPayloadContainer& CudaHitPayloadContainer::operator=(
@@ -234,6 +254,7 @@ CudaHitPayloadContainer& CudaHitPayloadContainer::operator=(
     m_size = std::exchange(other.m_size, 0);
     m_host = std::move(other.m_host);
     m_device = std::exchange(other.m_device, {});
+    m_block = std::exchange(other.m_block, nullptr);
     m_onDevice = std::exchange(other.m_onDevice, false);
   }
 
@@ -357,7 +378,7 @@ std::uint8_t CudaHitPayloadContainer::locLayer(size_type index) const {
 void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(hitPayloadColumns, m_host, m_device, stream);
+  m_block = allocateColumns(hitPayloadColumns, m_host, m_device, stream);
   copyColumnsToDevice(hitPayloadColumns, m_host, m_device, stream);
 
   m_onDevice = true;
@@ -367,11 +388,16 @@ void CudaHitPayloadContainer::allocateDevice(size_type size,
                                              cudaStream_t stream) {
   clearDevice();
   m_size = size;
-  hitPayloadColumns(m_host, m_device,
-                    [size, stream](auto& hostColumn, auto& deviceColumn) {
-                      hostColumn.clear();
-                      allocateColumn(deviceColumn, size, stream);
-                    });
+  m_host = {};
+  auto all = [size](const auto& /*hostColumn*/) { return size; };
+  std::size_t bytes{0u};
+  carveColumns(hitPayloadColumns, m_host, m_device, nullptr, bytes, all);
+  char* block{nullptr};
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&block),
+                                  std::max<std::size_t>(bytes, 1u), stream));
+  std::size_t cursor{0u};
+  carveColumns(hitPayloadColumns, m_host, m_device, block, cursor, all);
+  m_block = block;
   m_onDevice = true;
 }
 
@@ -384,7 +410,7 @@ void CudaHitPayloadContainer::moveToHost(cudaStream_t stream) {
 }
 
 void CudaHitPayloadContainer::clearDevice() noexcept {
-  freeColumns(hitPayloadColumns, m_host, m_device);
+  freeBlock(m_block);
 
   m_device = {};
   m_onDevice = false;
@@ -403,6 +429,7 @@ CudaCandidateListContainer::CudaCandidateListContainer(
     CudaCandidateListContainer&& other) noexcept
     : m_host{std::move(other.m_host)},
       m_device{std::exchange(other.m_device, {})},
+      m_block{std::exchange(other.m_block, nullptr)},
       m_onDevice{std::exchange(other.m_onDevice, false)} {
   other.m_host = {};
 }
@@ -414,6 +441,7 @@ CudaCandidateListContainer& CudaCandidateListContainer::operator=(
 
     m_host = std::move(other.m_host);
     m_device = std::exchange(other.m_device, {});
+    m_block = std::exchange(other.m_block, nullptr);
     m_onDevice = std::exchange(other.m_onDevice, false);
     other.m_host = {};
   }
@@ -544,7 +572,7 @@ std::span<const std::uint16_t> CudaCandidateListContainer::candidateGlobLayers(
 void CudaCandidateListContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(candidateColumns, m_host, m_device, stream);
+  m_block = allocateColumns(candidateColumns, m_host, m_device, stream);
   copyColumnsToDevice(candidateInputColumns, m_host, m_device, stream);
   // Zeroed, so that a seed the kernel has not reached reads as pending
   candidateOutputColumns(
@@ -566,7 +594,7 @@ void CudaCandidateListContainer::moveToHost(cudaStream_t stream) {
 }
 
 void CudaCandidateListContainer::clearDevice() noexcept {
-  freeColumns(candidateColumns, m_host, m_device);
+  freeBlock(m_block);
 
   m_device = {};
   m_onDevice = false;
@@ -631,18 +659,26 @@ CudaPatternRecordContainer CudaPatternRecordContainer::onDevice(
   const size_type slots{records.nSlots()};
   const size_type hitSlots{slots * maxHitsPerPattern};
   CudaPatternRecordArrays& device{records.m_device};
-  patternSlotColumns(records.m_host, device,
-                     [&](auto& /*hostColumn*/, auto& deviceColumn) {
-                       allocateColumn(deviceColumn, slots, stream);
-                     });
-  patternHitColumns(records.m_host, device,
-                    [&](auto& /*hostColumn*/, auto& deviceColumn) {
-                      allocateColumn(deviceColumn, hitSlots, stream);
-                    });
-  patternSeedColumns(records.m_host, device,
-                     [&](auto& /*hostColumn*/, auto& deviceColumn) {
-                       allocateColumn(deviceColumn, nSeeds, stream);
-                     });
+  auto bySlot = [slots](const auto& /*hostColumn*/) { return slots; };
+  auto byHit = [hitSlots](const auto& /*hostColumn*/) { return hitSlots; };
+  auto bySeed = [nSeeds](const auto& /*hostColumn*/) { return nSeeds; };
+  // Every column in one block
+  char* block{nullptr};
+  for (int pass = 0; pass < 2; ++pass) {
+    std::size_t cursor{0u};
+    carveColumns(patternSlotColumns, records.m_host, device, block, cursor,
+                 bySlot);
+    carveColumns(patternHitColumns, records.m_host, device, block, cursor,
+                 byHit);
+    carveColumns(patternSeedColumns, records.m_host, device, block, cursor,
+                 bySeed);
+    if (pass == 0) {
+      ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&block),
+                                      std::max<std::size_t>(cursor, 1u),
+                                      stream));
+    }
+  }
+  records.m_block = block;
   zeroDeviceColumn(device.nPatterns, nSeeds, stream);
   zeroDeviceColumn(device.overflow, nSeeds, stream);
   zeroDeviceColumn(device.status, slots, stream);
@@ -676,6 +712,7 @@ CudaPatternRecordContainer::CudaPatternRecordContainer(
       m_maxHitsPerPattern{std::exchange(other.m_maxHitsPerPattern, 0)},
       m_host{std::move(other.m_host)},
       m_device{std::exchange(other.m_device, {})},
+      m_block{std::exchange(other.m_block, nullptr)},
       m_onDevice{std::exchange(other.m_onDevice, false)} {}
 
 CudaPatternRecordContainer& CudaPatternRecordContainer::operator=(
@@ -688,6 +725,7 @@ CudaPatternRecordContainer& CudaPatternRecordContainer::operator=(
     m_maxHitsPerPattern = std::exchange(other.m_maxHitsPerPattern, 0);
     m_host = std::move(other.m_host);
     m_device = std::exchange(other.m_device, {});
+    m_block = std::exchange(other.m_block, nullptr);
     m_onDevice = std::exchange(other.m_onDevice, false);
   }
 
@@ -894,7 +932,7 @@ std::span<const std::uint32_t> CudaPatternRecordContainer::hitIndices(
 void CudaPatternRecordContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
-  allocateColumns(patternColumns, m_host, m_device, stream);
+  m_block = allocateColumns(patternColumns, m_host, m_device, stream);
   // A kernel reads these before it writes them; everything else of a slot is
   // valid only once the slot is counted in nPatterns
   zeroDeviceColumn(m_device.nPatterns, m_nSeeds, stream);
@@ -916,7 +954,7 @@ void CudaPatternRecordContainer::moveToHost(cudaStream_t stream) {
 }
 
 void CudaPatternRecordContainer::clearDevice() noexcept {
-  freeColumns(patternColumns, m_host, m_device);
+  freeBlock(m_block);
 
   m_device = {};
   m_onDevice = false;

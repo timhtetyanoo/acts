@@ -410,6 +410,7 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   finderCfg.version = m_cfg.version;
   finderCfg.trackingGeometry = m_cfg.trackingGeometry;
   finderCfg.useMdtHits = m_cfg.useMdtHits;
+  finderCfg.workspaceFraction = m_cfg.workspaceFraction;
   m_finder = std::make_unique<CudaGlobalPatternFinder>(
       std::move(finderCfg), this->logger().clone("CudaGlobalPatternFinder"));
 }

@@ -824,20 +824,19 @@ struct CudaSurfaceTableArrays {
   std::uint32_t nSurfaces{0u};
 };
 
-/// @brief The space points of an event that the pattern finding uses, one row
-///        per hit payload: the index of its space point in the
-///        CudaMuonSpacePointContainer, its bucket, its global position, which
-///        the host computes for the search tree, and the rotation of each
-///        bucket into the global frame, column major, rotation[9 * b, 9 * b +
-///        9). The arrays are not owned.
+/// @brief The positions of the hits the pattern finding uses, which the host
+///        computes for the search tree, and the rotation of each bucket into
+///        the global frame, column major, rotation[9 * b, 9 * b + 9). Row r is
+///        space point r of the CudaMuonSpacePointContainer, which holds these
+///        hits only; its bucket ranges number the buckets. The arrays are not
+///        owned.
 struct CudaUsedHitArrays {
-  const std::uint32_t* spacePoint{nullptr};
-  const std::uint32_t* bucket{nullptr};
   const double* positionX{nullptr};
   const double* positionY{nullptr};
   const double* positionZ{nullptr};
   const double* bucketRotation{nullptr};
   std::uint32_t nHits{0u};
+  std::uint32_t nBuckets{0u};
 };
 
 /// @brief Builds the hit payloads on the device, one thread per hit, from the
@@ -861,17 +860,23 @@ void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
 ///
 /// The seed checks run a warp per seed: the group count as a reduction, the
 /// sort by layer as a sorting network and the layer numbers as a prefix sum.
-/// Each seed is then built by a warp,
-/// one layer at a time: every hit of a layer is tested against every pattern
-/// at once, with the line the pattern had before the layer, and each
-/// compatible hit gives a pattern of its own. The backward passes of all
-/// forward patterns run side by side. The overlaps, inside a seed and among
-/// all the patterns of the event, are resolved by priority (more good groups,
-/// more bending layers, more precision layers, smaller residual, then the
-/// index) rather than in seed order, and the skip rule is not applied. Inputs
-/// and overflow reporting are those of findCudaPatternsInEta. Only the kept
-/// patterns are copied back: the returned records hold them alone, in seed
-/// order, as the slots of entry 0.
+/// Every seed is then built by a warp, all seeds at once, one layer at a
+/// time: every hit of a layer is tested against every pattern at once, with
+/// the line the pattern had before the layer, and each compatible hit gives a
+/// pattern of its own. The backward passes of all forward patterns run side
+/// by side. The overlaps, inside a seed and among all the patterns of the
+/// event, are resolved by priority (more good groups, more bending layers,
+/// more precision layers, smaller residual, then the index) rather than in
+/// seed order, and the skip rule is not applied.
+///
+/// The seeds take their memory from one arena of sizes.workspaceBytes as
+/// they need it; a pattern's hit slots are sized by the layers of its seed's
+/// list, so they cannot overflow. When the arena runs short at a layer, the
+/// seed keeps the best of that layer's patterns that fit, by the same
+/// priority, and the patterns overflow bit is set. The event's patterns are
+/// sized by what the seeds produced. Only the kept patterns are copied back:
+/// the returned records hold them alone, in seed order, as the slots of entry
+/// 0. sizes.batchSize and sizes.maxHitsPerPattern are not used.
 CudaPatternRecordContainer findCudaPatternsInEtaV2(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
     const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
@@ -915,6 +920,10 @@ class CudaGlobalPatternFinder {
     ///        once, and whether MDT hits take part
     std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
     bool useMdtHits{true};
+    /// @brief Version 2: the share of the device's free memory the pattern
+    ///        building takes, measured at the first event. Zero takes
+    ///        sizes.workspaceBytes instead
+    double workspaceFraction{0.5};
   };
 
   explicit CudaGlobalPatternFinder(
@@ -987,6 +996,9 @@ class CudaGlobalPatternFinder {
   const SurfaceTable& surfaceTable(const Acts::GeometryContext& gctx) const;
   mutable SurfaceTable m_surfaces{};
   mutable std::once_flag m_surfacesOnce{};
+  /// @brief The bytes of the pattern building of version 2, from
+  ///        workspaceFraction; zero takes sizes.workspaceBytes
+  mutable std::size_t m_arenaBytes{0u};
 
   /// @brief GlobalPatternFinder::addPhiOnlyHits
   void addPhiOnlyHits(const Acts::GeometryContext& gctx,
@@ -1021,6 +1033,9 @@ class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
     /// @brief Version of the device pattern finding, 1 or 2, see
     ///        CudaGlobalPatternFinder::Config
     unsigned version{1u};
+    /// @brief Version 2: share of the device's free memory for the pattern
+    ///        building, see CudaGlobalPatternFinder::Config
+    double workspaceFraction{0.5};
     /// @brief Key of the CudaPatternFinderTiming of each event in the event
     ///        store; nothing is written if empty
     std::string outTiming{};

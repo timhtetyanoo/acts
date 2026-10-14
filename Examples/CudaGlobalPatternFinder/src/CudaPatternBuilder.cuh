@@ -241,11 +241,20 @@ struct SeedBuilder {
   std::uint32_t maxHits;
   /// CudaPatternOverflow bits of what did not fit
   std::uint8_t overflow{0u};
+  /// Zero: the patterns and their hits are the two arrays above. Otherwise
+  /// the bytes of one slot that holds a pattern followed by its maxHits hit
+  /// positions, wherever the slot is (version 2)
+  std::uint32_t slotStride{0u};
 
   __device__ Pattern& pattern(std::uint32_t region, std::uint32_t k) {
     return patterns[region * capacity + k];
   }
   __device__ std::uint16_t* hitsOf(const Pattern& pat) {
+    if (slotStride != 0u) {
+      return reinterpret_cast<std::uint16_t*>(
+          const_cast<char*>(reinterpret_cast<const char*>(&pat)) +
+          sizeof(Pattern));
+    }
     return patternHits + (&pat - patterns) * maxHits;
   }
   __device__ Math::Hit hit(std::uint16_t pos) const {

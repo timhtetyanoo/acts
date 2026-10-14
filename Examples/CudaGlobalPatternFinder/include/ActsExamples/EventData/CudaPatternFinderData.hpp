@@ -274,6 +274,8 @@ class CudaHitPayloadContainer {
   size_type m_size = 0;
   CudaHitPayloadHostData m_host{};
   CudaHitPayloadArrays m_device{};
+  /// @brief The one device allocation all columns live in
+  void* m_block = nullptr;
   bool m_onDevice = false;
 
   void checkIndex(size_type index) const;
@@ -467,6 +469,8 @@ class CudaCandidateListContainer {
  private:
   CudaCandidateHostData m_host{};
   CudaCandidateArrays m_device{};
+  /// @brief The one device allocation all columns live in
+  void* m_block = nullptr;
   bool m_onDevice = false;
 
   void checkSeed(size_type seed) const;
@@ -816,6 +820,8 @@ class CudaPatternRecordContainer {
   size_type m_maxHitsPerPattern = 0;
   CudaPatternRecordHostData m_host{};
   CudaPatternRecordArrays m_device{};
+  /// @brief The one device allocation all columns live in
+  void* m_block = nullptr;
   bool m_onDevice = false;
 
   size_type hitSlot(size_type patternSlot, size_type local) const;

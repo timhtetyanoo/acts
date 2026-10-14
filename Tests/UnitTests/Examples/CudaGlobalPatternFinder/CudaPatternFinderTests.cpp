@@ -655,18 +655,22 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingReportsOverflow) {
       const auto ample = findLinePatterns(gctx, hits, {}, version);
       BOOST_CHECK_EQUAL(ample.overflow, 0u);
       BOOST_CHECK_EQUAL(ample.accepted.size(), 1u);
-
-      // A workspace with room for one pattern per region and seed: the seeds
-      // whose pattern branches have no patterns and are reported, and the
-      // seed on the layer of the second hit, which does not branch, still
-      // finds the line
-      const auto small =
-          findLinePatterns(gctx, hits, {.workspaceBytes = 1u}, version);
-      BOOST_CHECK_EQUAL(small.overflow,
-                        ActsExamples::CudaPatternOverflow::patterns);
-      BOOST_CHECK_EQUAL(small.accepted.size(), 1u);
     }
   }
+
+  // Version 1, a workspace with room for one pattern per region and seed: the
+  // seeds whose pattern branches have no patterns and are reported, and the
+  // seed on the layer of the second hit, which does not branch, still finds
+  // the line
+  const auto small = findLinePatterns(gctx, hits, {.workspaceBytes = 1u}, 1u);
+  BOOST_CHECK_EQUAL(small.overflow,
+                    ActsExamples::CudaPatternOverflow::patterns);
+  BOOST_CHECK_EQUAL(small.accepted.size(), 1u);
+
+  // Version 2, no memory at all: nothing is built, and it is reported
+  const auto none = findLinePatterns(gctx, hits, {.workspaceBytes = 8u}, 2u);
+  BOOST_CHECK_EQUAL(none.overflow, ActsExamples::CudaPatternOverflow::patterns);
+  BOOST_CHECK(none.accepted.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
