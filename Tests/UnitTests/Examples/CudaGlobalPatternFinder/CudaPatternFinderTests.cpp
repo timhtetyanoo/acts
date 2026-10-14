@@ -167,29 +167,6 @@ ActsExamples::CudaCandidateListContainer makeLineLists(const LineHits& hits) {
   return lists;
 }
 
-/// @brief Runs the seed preparation and the pattern building of the line
-ActsExamples::CudaPatternRecordContainer buildLinePatterns(
-    const GeometryContext& gctx, const LineHits& hits, std::size_t capacity) {
-  auto payloads =
-      ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
-  auto lists = makeLineLists(hits);
-  ActsExamples::CudaPatternRecordContainer patterns{lists.nSeeds(), capacity,
-                                                    16u};
-  const auto cudaCfg = ActsExamples::makeCudaPatternFinderConfig(
-      lineConfig(), PatternStateAux::BeamspotInfo{});
-
-  ActsExamples::CudaStream stream;
-  payloads.moveToDevice(stream.get());
-  lists.moveToDevice(stream.get());
-  patterns.moveToDevice(stream.get());
-  ActsExamples::prepareCudaSeeds(payloads, lists, cudaCfg, stream.get());
-  ActsExamples::buildCudaPatterns(payloads, lists, cudaCfg, 0u, patterns,
-                                  stream.get());
-  patterns.moveToHost(stream.get());
-  stream.synchronize();
-  return patterns;
-}
-
 /// @brief The result of the pattern finding in eta of the line: the hit rows
 ///        of each accepted pattern, sorted, and what did not fit
 struct LineResult {
@@ -197,24 +174,20 @@ struct LineResult {
   std::uint8_t overflow{0u};
 };
 
-/// @brief Runs the whole pattern finding in eta of the line, with version 1
-///        or 2 of the device pattern finding
+/// @brief Runs the whole pattern finding in eta of the line
 LineResult findLinePatterns(const GeometryContext& gctx, const LineHits& hits,
-                            const ActsExamples::CudaPatternFinderSizes& sizes,
-                            unsigned version = 1u) {
+                            const ActsExamples::CudaPatternFinderSizes& sizes) {
   auto payloads =
       ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
   auto lists = makeLineLists(hits);
   ActsExamples::CudaStream stream;
   payloads.moveToDevice(stream.get());
   lists.moveToDevice(stream.get());
-  const auto cudaCfg = ActsExamples::makeCudaPatternFinderConfig(
-      lineConfig(), PatternStateAux::BeamspotInfo{});
-  const auto event = version == 2u
-                         ? ActsExamples::findCudaPatternsInEtaV2(
-                               payloads, lists, cudaCfg, sizes, stream.get())
-                         : ActsExamples::findCudaPatternsInEta(
-                               payloads, lists, cudaCfg, sizes, stream.get());
+  const auto event = ActsExamples::findCudaPatternsInEta(
+      payloads, lists,
+      ActsExamples::makeCudaPatternFinderConfig(
+          lineConfig(), PatternStateAux::BeamspotInfo{}),
+      sizes, stream.get());
 
   LineResult result{.overflow = event.overflow(0u)};
   for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
@@ -562,58 +535,6 @@ BOOST_AUTO_TEST_CASE(CudaExpandedSectorMatchesCpu) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(CudaPatternBuildingFindsLine) {
-  if (!hasCudaDevice()) {
-    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
-    return;
-  }
-  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
-  const LineHits hits{gctx, false};
-  const auto patterns = buildLinePatterns(gctx, hits, 4u);
-
-  // The seeds on the BI and BM layers find the line, without the outlier.
-  // From a BO seed the line misses the minimum layer requirement, as in Core
-  for (std::uint32_t seed = 0u; seed < LineHits::nOnLine; ++seed) {
-    BOOST_TEST_CONTEXT("seed " << seed) {
-      BOOST_CHECK(!patterns.overflow(seed));
-      if (seed >= LineHits::nOnLine - 2u) {
-        BOOST_CHECK_EQUAL(patterns.nPatterns(seed), 0u);
-        continue;
-      }
-      BOOST_REQUIRE_EQUAL(patterns.nPatterns(seed), 1u);
-      const auto slot = patterns.slot(seed, 0u);
-      std::vector<std::uint32_t> found{patterns.hitIndices(slot).begin(),
-                                       patterns.hitIndices(slot).end()};
-      std::ranges::sort(found);
-      const std::vector<std::uint32_t> expected{lineRows()};
-      BOOST_CHECK_EQUAL_COLLECTIONS(found.begin(), found.end(),
-                                    expected.begin(), expected.end());
-      BOOST_CHECK_EQUAL(patterns.pattern(slot).nTriggerLayers,
-                        LineHits::nOnLine);
-    }
-  }
-}
-
-BOOST_AUTO_TEST_CASE(CudaPatternBuildingOverflow) {
-  if (!hasCudaDevice()) {
-    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
-    return;
-  }
-  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
-  // The second hit on the first BM layer branches the pattern of the first
-  // seed in two
-  const LineHits hits{gctx, true};
-
-  const auto small = buildLinePatterns(gctx, hits, 1u);
-  BOOST_CHECK(small.overflow(0u));
-  BOOST_CHECK_EQUAL(small.nPatterns(0u), 0u);
-
-  // With room for both branches, the overlap removal keeps one of them
-  const auto large = buildLinePatterns(gctx, hits, 4u);
-  BOOST_CHECK(!large.overflow(0u));
-  BOOST_CHECK_EQUAL(large.nPatterns(0u), 1u);
-}
-
 BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
   if (!hasCudaDevice()) {
     BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
@@ -623,21 +544,11 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
   const LineHits hits{gctx, false};
   const std::vector<std::uint32_t> expected{lineRows()};
 
-  // All six seeds find the line; it is accepted once, whatever the batches,
-  // in both versions
-  for (const unsigned version : {1u, 2u}) {
-    for (const std::size_t batchSize : {1u, 4u, 64u}) {
-      BOOST_TEST_CONTEXT("version " << version << ", batch size "
-                                    << batchSize) {
-        const auto accepted =
-            findLinePatterns(gctx, hits, {.batchSize = batchSize}, version)
-                .accepted;
-        BOOST_REQUIRE_EQUAL(accepted.size(), 1u);
-        BOOST_CHECK_EQUAL_COLLECTIONS(accepted[0].begin(), accepted[0].end(),
-                                      expected.begin(), expected.end());
-      }
-    }
-  }
+  // All six seeds find the line; it is accepted once
+  const auto accepted = findLinePatterns(gctx, hits, {}).accepted;
+  BOOST_REQUIRE_EQUAL(accepted.size(), 1u);
+  BOOST_CHECK_EQUAL_COLLECTIONS(accepted[0].begin(), accepted[0].end(),
+                                expected.begin(), expected.end());
 }
 
 BOOST_AUTO_TEST_CASE(CudaPatternFindingReportsOverflow) {
@@ -648,27 +559,14 @@ BOOST_AUTO_TEST_CASE(CudaPatternFindingReportsOverflow) {
   const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
   const LineHits hits{gctx, true};
 
-  for (const unsigned version : {1u, 2u}) {
-    BOOST_TEST_CONTEXT("version " << version) {
-      // A workspace with room for both branches of every seed: the line is
-      // found and nothing overflows
-      const auto ample = findLinePatterns(gctx, hits, {}, version);
-      BOOST_CHECK_EQUAL(ample.overflow, 0u);
-      BOOST_CHECK_EQUAL(ample.accepted.size(), 1u);
-    }
-  }
+  // Room for both branches of every seed: the line is found and nothing
+  // overflows
+  const auto ample = findLinePatterns(gctx, hits, {});
+  BOOST_CHECK_EQUAL(ample.overflow, 0u);
+  BOOST_CHECK_EQUAL(ample.accepted.size(), 1u);
 
-  // Version 1, a workspace with room for one pattern per region and seed: the
-  // seeds whose pattern branches have no patterns and are reported, and the
-  // seed on the layer of the second hit, which does not branch, still finds
-  // the line
-  const auto small = findLinePatterns(gctx, hits, {.workspaceBytes = 1u}, 1u);
-  BOOST_CHECK_EQUAL(small.overflow,
-                    ActsExamples::CudaPatternOverflow::patterns);
-  BOOST_CHECK_EQUAL(small.accepted.size(), 1u);
-
-  // Version 2, no memory at all: nothing is built, and it is reported
-  const auto none = findLinePatterns(gctx, hits, {.workspaceBytes = 8u}, 2u);
+  // No memory at all: nothing is built, and it is reported
+  const auto none = findLinePatterns(gctx, hits, {.workspaceBytes = 8u});
   BOOST_CHECK_EQUAL(none.overflow, ActsExamples::CudaPatternOverflow::patterns);
   BOOST_CHECK(none.accepted.empty());
 }

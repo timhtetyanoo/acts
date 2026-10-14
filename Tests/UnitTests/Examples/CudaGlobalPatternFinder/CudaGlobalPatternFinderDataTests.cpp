@@ -16,9 +16,6 @@
 ///          ACTS_GPF_OUTPUT      pattern output file, optional
 ///          ACTS_GPF_TIMING      per event timing csv, optional
 ///          ACTS_GPF_MAX_EVENTS  event cap, optional
-///          ACTS_GPF_BATCH_SIZE  seeds built at once on the device, optional
-///          ACTS_GPF_CUDA_VERSION  1 or 2, the device pattern finding,
-///                               optional (default 1)
 ///          ACTS_GPF_WORKSPACE_MB  device memory of the pattern building in
 ///                               MiB instead of a share of the free memory,
 ///                               optional
@@ -123,11 +120,6 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
   finderCfg.outPatterns = "MuonGlobalPatterns";
   finderCfg.outTiming = "CudaPatternFinderTiming";
   finderCfg.trackingGeometry = trackingGeometry;
-  finderCfg.batchSize =
-      countFromEnv("ACTS_GPF_BATCH_SIZE", finderCfg.batchSize);
-  finderCfg.version = static_cast<unsigned>(
-      countFromEnv("ACTS_GPF_CUDA_VERSION", finderCfg.version));
-  BOOST_TEST_MESSAGE("Device pattern finding version " << finderCfg.version);
   if (const std::size_t workspaceMB{countFromEnv("ACTS_GPF_WORKSPACE_MB", 0u)};
       workspaceMB > 0u) {
     finderCfg.workspaceBytes = workspaceMB << 20u;
@@ -159,7 +151,7 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
     timingFile << "event,nSpacePoints,nBuckets,nPatterns,totalTime_us,"
                   "treeTime_us,fillTime_us,uploadTime_us,kernelTime_us,"
                   "downloadTime_us,tailTime_us,nSeeds,nCandidates,"
-                  "nPatternsInEta,capacityPerSeed,overflow\n";
+                  "nPatternsInEta,largestBeam,overflow\n";
   }
 
   /// The patterns are written out for the offline validation, if asked for
@@ -227,8 +219,8 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
                  << stages.uploadUs << ',' << stages.kernelsUs << ','
                  << stages.downloadUs << ',' << stages.tailUs << ','
                  << stages.nSeeds << ',' << stages.nCandidates << ','
-                 << stages.nPatternsInEta << ',' << stages.capacityPerSeed
-                 << ',' << static_cast<int>(stages.overflow) << '\n';
+                 << stages.nPatternsInEta << ',' << stages.largestBeam << ','
+                 << static_cast<int>(stages.overflow) << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);

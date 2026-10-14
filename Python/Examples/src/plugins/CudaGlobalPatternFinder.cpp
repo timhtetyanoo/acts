@@ -25,7 +25,6 @@ PYBIND11_MODULE(ActsExamplesPythonBindingsCudaGlobalPatternFinder, cuda) {
       thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, phiTolerance,
       minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
       meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
-      minHitDistance4Line, beamSpotRadius, beamSpotLength, batchSize,
-      workspaceBytes, maxHitsPerPattern, maxPatterns, version,
+      minHitDistance4Line, beamSpotRadius, beamSpotLength, workspaceBytes,
       workspaceFraction, outTiming);
 }

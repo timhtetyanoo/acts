@@ -25,8 +25,6 @@ def runGlobalPatternFinder(
     skip: int = 0,
     timingDir: str = "",
     timingFile: str = "timing.csv",
-    batchSize: int = 1024,
-    version: int = 1,
 ):
     # The muon space points are stored in the frame of their spectrometer sector.
     # Reaching the global frame needs the measurement surfaces, which are read
@@ -71,8 +69,6 @@ def runGlobalPatternFinder(
         inSpacePoints=spReader.config.outputSpacePoints,
         outPatterns="MuonGlobalPatterns",
         trackingGeometry=trackingGeometry,
-        batchSize=batchSize,
-        version=version,
         level=logLevel,
     )
     s.addAlgorithm(patternFinder)
@@ -134,17 +130,6 @@ if "__main__" == __name__:
         help="Name of the file the per algorithm wall time is written to",
     )
     p.add_argument(
-        "--batchSize", default=1024, type=int,
-        help="Seeds built at once on the device before their patterns are "
-             "accepted",
-    )
-    p.add_argument(
-        "--version", default=1, type=int, choices=[1, 2],
-        help="Version of the device pattern finding: 1 builds a seed per "
-             "thread in seed order, 2 builds it layer by layer per warp and "
-             "accepts the patterns by priority",
-    )
-    p.add_argument(
         "--logLevel",
         default="INFO",
         choices=["VERBOSE", "DEBUG", "INFO", "WARNING", "ERROR"],
@@ -162,6 +147,4 @@ if "__main__" == __name__:
         skip=args.skip,
         timingDir=args.timingDir,
         timingFile=args.timingFile,
-        batchSize=args.batchSize,
-        version=args.version,
     )
