@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <format>
 #include <numbers>
 #include <optional>
@@ -31,38 +32,6 @@
 namespace ActsExamples {
 
 namespace {
-
-/// A device buffer from the memory pool, released with the object once the
-/// work of the event has completed
-template <typename T>
-class PoolBuffer {
- public:
-  PoolBuffer(std::size_t size, cudaStream_t stream) {
-    if (size > 0u) {
-      ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&m_data),
-                                      size * sizeof(T), stream));
-    }
-  }
-  PoolBuffer(const std::vector<T>& host, cudaStream_t stream)
-      : PoolBuffer(host.size(), stream) {
-    if (!host.empty()) {
-      ACTS_CUDA_CHECK(cudaMemcpyAsync(m_data, host.data(),
-                                      host.size() * sizeof(T),
-                                      cudaMemcpyHostToDevice, stream));
-    }
-  }
-  PoolBuffer(const PoolBuffer&) = delete;
-  PoolBuffer& operator=(const PoolBuffer&) = delete;
-  ~PoolBuffer() {
-    if (m_data != nullptr) {
-      (void)cudaFreeAsync(m_data, cudaStreamPerThread);
-    }
-  }
-  T* get() const { return m_data; }
-
- private:
-  T* m_data{nullptr};
-};
 
 /// The search tree over the rows of the hits the finding uses
 using RowTree = Acts::KDTree<2, std::uint32_t, double, std::array, 50>;
@@ -92,6 +61,42 @@ void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
 }
 
 }  // namespace
+
+/// What one event needs on the device side, kept between events: the stream,
+/// page-locked memory for the copies up and back, and the device block of
+/// the inputs. Events running at the same time take different ones
+struct CudaGlobalPatternFinder::Workspace {
+  CudaStream stream{};
+  CudaPinnedBuffer upload{};
+  CudaDeviceBuffer device{};
+  CudaPinnedBuffer readback{};
+};
+
+std::unique_ptr<CudaGlobalPatternFinder::Workspace>
+CudaGlobalPatternFinder::acquireWorkspace() const {
+  {
+    const std::lock_guard lock{m_workspaceMutex};
+    if (!m_workspaces.empty()) {
+      std::unique_ptr<Workspace> workspace{std::move(m_workspaces.back())};
+      m_workspaces.pop_back();
+      return workspace;
+    }
+  }
+  return std::make_unique<Workspace>();
+}
+
+void CudaGlobalPatternFinder::releaseWorkspace(
+    std::unique_ptr<Workspace> workspace) const {
+  if (workspace == nullptr) {
+    return;
+  }
+  const std::lock_guard lock{m_workspaceMutex};
+  m_workspaces.push_back(std::move(workspace));
+}
+
+CudaGlobalPatternFinder::WorkspaceReturn::~WorkspaceReturn() {
+  finder.releaseWorkspace(std::move(workspace));
+}
 
 CudaGlobalPatternFinder::~CudaGlobalPatternFinder() {
   if (m_surfaces.geometryId != nullptr) {
@@ -275,78 +280,115 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   if (lists.empty()) {
     return {};
   }
-  // The used hits only, row r being space point r; every bucket keeps its
-  // number, those without used hits as empty ranges
-  CudaMuonSpacePointContainer flatSpacePoints{usedPointer.size()};
-  for (std::size_t row = 0u; row < usedPointer.size(); ++row) {
-    const MuonSpacePoint& sp{*usedPointer[row]};
-    flatSpacePoints.setGeometryId(row, sp.geometryId().value());
-    flatSpacePoints.setId(row, sp.id().toInt());
-    flatSpacePoints.defineCoordinates(row, sp.localPosition(),
-                                      sp.sensorDirection(), sp.toNextSensor());
-    flatSpacePoints.setRadius(row, sp.driftRadius());
-    flatSpacePoints.setTime(row, sp.time());
-    const auto& covariance = sp.covariance();
-    flatSpacePoints.setCovariance(row, covariance[0], covariance[1],
-                                  covariance[2]);
-  }
-  for (std::size_t k = 0u; k < spacePoints.size(); ++k) {
-    flatSpacePoints.addBucket(bucketBegin[k], bucketEnd[k]);
-  }
+  // Up to the device in one copy, from page-locked memory kept between
+  // events: the columns of the used hits that the payloads read (row r being
+  // space point r, every bucket keeping its number), their positions, the
+  // bucket rotations and the lists. The payloads, which the device builds,
+  // follow the copied part in the same device block
+  std::unique_ptr<Workspace> workspace{acquireWorkspace()};
+  const WorkspaceReturn giveBack{*this, workspace};
+  const cudaStream_t stream{workspace->stream.get()};
+  const auto nUsed = static_cast<std::uint32_t>(usedPointer.size());
+  const auto nBuckets = static_cast<std::uint32_t>(spacePoints.size());
+  CudaMuonSpacePointArrays deviceSpacePoints{};
+  CudaUsedHitArrays used{.nHits = nUsed, .nBuckets = nBuckets};
+  std::uint32_t* deviceMissing{nullptr};
+  CudaHitPayloadContainer hits{};
+  std::size_t uploadBytes{0u};
+  auto stage = [&](CudaStagedBlock& block) {
+    const bool fill{block.host != nullptr};
+    auto column = [&](auto*& device, std::size_t n) {
+      using T = std::remove_cv_t<std::remove_pointer_t<
+          std::remove_reference_t<decltype(device)>>>;
+      const auto [host, dev] = block.take<T>(n);
+      device = dev;
+      return host;
+    };
+    auto copy = [&](auto*& device, const auto& values) {
+      auto* host = column(device, values.size());
+      if (fill && host != nullptr) {
+        std::ranges::copy(values, host);
+      }
+    };
+    auto* geometryId = column(deviceSpacePoints.geometryId, nUsed);
+    auto* muonId = column(deviceSpacePoints.muonId, nUsed);
+    auto* localPositionY = column(deviceSpacePoints.localPositionY, nUsed);
+    auto* toNextSensorX = column(deviceSpacePoints.toNextSensorX, nUsed);
+    auto* toNextSensorY = column(deviceSpacePoints.toNextSensorY, nUsed);
+    auto* toNextSensorZ = column(deviceSpacePoints.toNextSensorZ, nUsed);
+    auto* covariance0 = column(deviceSpacePoints.covariance0, nUsed);
+    auto* covariance1 = column(deviceSpacePoints.covariance1, nUsed);
+    auto* driftRadius = column(deviceSpacePoints.driftRadius, nUsed);
+    if (fill) {
+      for (std::uint32_t row = 0u; row < nUsed; ++row) {
+        const MuonSpacePoint& sp{*usedPointer[row]};
+        geometryId[row] = sp.geometryId().value();
+        muonId[row] = sp.id().toInt();
+        localPositionY[row] = sp.localPosition().y();
+        toNextSensorX[row] = sp.toNextSensor().x();
+        toNextSensorY[row] = sp.toNextSensor().y();
+        toNextSensorZ[row] = sp.toNextSensor().z();
+        covariance0[row] = sp.covariance()[0];
+        covariance1[row] = sp.covariance()[1];
+        driftRadius[row] = sp.driftRadius();
+      }
+    }
+    copy(deviceSpacePoints.bucketStart, bucketBegin);
+    copy(used.positionX, positionX);
+    copy(used.positionY, positionY);
+    copy(used.positionZ, positionZ);
+    copy(used.bucketRotation, bucketRotation);
+    lists.stageForDevice(block);
+    // Zero, as the host block holds it
+    auto* missing = column(deviceMissing, 1u);
+    if (fill) {
+      *missing = 0u;
+    }
+    uploadBytes = block.cursor;
+    hits.placeOnDevice(nUsed, block);
+  };
+  CudaStagedBlock sizing{};
+  stage(sizing);
+  // The number of hits without a surface comes back after the block
+  const std::size_t missingAt{(sizing.cursor + 15u) & ~std::size_t{15u}};
+  CudaStagedBlock block{
+      .host = workspace->upload.reserve(missingAt + sizeof(std::uint32_t)),
+      .device = workspace->device.reserve(sizing.cursor)};
+  stage(block);
+  auto* nMissing = reinterpret_cast<std::uint32_t*>(block.host + missingAt);
   if (timing != nullptr) {
     timing->fillUs = microseconds(Clock::now() - fillStart);
   }
 
-  // Up to the device: the used hits, their positions, the bucket rotations
-  // and the lists; the payloads are built there
-  CudaStream stream;
   std::array<cudaEvent_t, 2> uploadMarks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : uploadMarks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
     }
-    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[0], stream.get()));
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[0], stream));
   }
-  flatSpacePoints.moveToDevice(stream.get());
-  const PoolBuffer<double> devicePositionX{positionX, stream.get()};
-  const PoolBuffer<double> devicePositionY{positionY, stream.get()};
-  const PoolBuffer<double> devicePositionZ{positionZ, stream.get()};
-  const PoolBuffer<double> deviceBucketRotation{bucketRotation, stream.get()};
-  lists.moveToDevice(stream.get());
-  CudaHitPayloadContainer hits{};
-  hits.allocateDevice(usedPointer.size(), stream.get());
-  const PoolBuffer<std::uint32_t> missingSurfaces{1u, stream.get()};
-  ACTS_CUDA_CHECK(cudaMemsetAsync(missingSurfaces.get(), 0,
-                                  sizeof(std::uint32_t), stream.get()));
-  buildCudaHitPayloads(
-      flatSpacePoints.deviceArrays(),
-      CudaUsedHitArrays{
-          .positionX = devicePositionX.get(),
-          .positionY = devicePositionY.get(),
-          .positionZ = devicePositionZ.get(),
-          .bucketRotation = deviceBucketRotation.get(),
-          .nHits = static_cast<std::uint32_t>(usedPointer.size()),
-          .nBuckets = static_cast<std::uint32_t>(spacePoints.size())},
-      CudaSurfaceTableArrays{.geometryId = surfaces.geometryId,
-                             .rotation = surfaces.rotation,
-                             .nSurfaces = surfaces.nSurfaces},
-      hits.deviceArrays(), missingSurfaces.get(), stream.get());
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(block.device, block.host, uploadBytes,
+                                  cudaMemcpyHostToDevice, stream));
+  buildCudaHitPayloads(deviceSpacePoints, used,
+                       CudaSurfaceTableArrays{.geometryId = surfaces.geometryId,
+                                              .rotation = surfaces.rotation,
+                                              .nSurfaces = surfaces.nSurfaces},
+                       hits.deviceArrays(), deviceMissing, stream);
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(nMissing, deviceMissing,
+                                  sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                                  stream));
   if (timing != nullptr) {
-    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream.get()));
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream));
   }
 
   CudaPatternFinderSizes sizes{m_cfg.sizes};
   if (m_arenaBytes > 0u) {
     sizes.workspaceBytes = m_arenaBytes;
   }
+  // Waits for the stream, so the count of hits without a surface is there
   const CudaPatternRecordContainer event{findCudaPatternsInEta(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
-      stream.get(), timing)};
-  std::uint32_t nMissing{0u};
-  ACTS_CUDA_CHECK(cudaMemcpyAsync(&nMissing, missingSurfaces.get(),
-                                  sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
-                                  stream.get()));
-  ACTS_CUDA_CHECK(cudaStreamSynchronize(stream.get()));
+      stream, timing, &workspace->readback)};
   if (timing != nullptr) {
     float ms{0.f};
     ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
@@ -355,10 +397,10 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       ACTS_CUDA_CHECK(cudaEventDestroy(mark));
     }
   }
-  if (nMissing != 0u) {
+  if (*nMissing != 0u) {
     throw std::runtime_error(std::format(
         "CudaGlobalPatternFinder: {} hits have no measurement surface",
-        nMissing));
+        *nMissing));
   }
   if (const std::uint8_t overflow{event.overflow(0u)}; overflow != 0u) {
     ACTS_WARNING(__func__ << "() Patterns did not fit the device buffers "

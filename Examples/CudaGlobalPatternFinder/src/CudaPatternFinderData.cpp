@@ -11,6 +11,7 @@
 #include "ActsExamples/Utilities/CudaUtilities.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -71,6 +72,7 @@ constexpr auto candidateOutputColumns = [](auto& host, auto& device,
   visit(host.seedStatus, device.seedStatus);
   visit(host.seedPosition, device.seedPosition);
   visit(host.candidateGlobLayer, device.candidateGlobLayer);
+  visit(host.candidateInfo, device.candidateInfo);
 };
 
 constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
@@ -475,6 +477,7 @@ void CudaCandidateListContainer::addSeed(
   m_host.seedStatus.push_back(CudaSeedStatus::pending);
   m_host.seedPosition.push_back(0u);
   m_host.candidateGlobLayer.resize(m_host.candidateIndices.size(), 0u);
+  m_host.candidateInfo.resize(m_host.candidateIndices.size(), 0u);
 }
 
 void CudaCandidateListContainer::setSeed(size_type seed,
@@ -994,6 +997,127 @@ void CudaPatternRecordContainer::checkHit(size_type patternSlot,
        << " is out of range for maxHitsPerPattern " << m_maxHitsPerPattern;
     throw std::out_of_range(ss.str());
   }
+}
+
+CudaPinnedBuffer::~CudaPinnedBuffer() {
+  if (m_data != nullptr) {
+    (void)cudaFreeHost(m_data);
+  }
+}
+
+char* CudaPinnedBuffer::reserve(std::size_t bytes) {
+  if (bytes > m_size) {
+    if (m_data != nullptr) {
+      ACTS_CUDA_CHECK(cudaFreeHost(m_data));
+      m_data = nullptr;
+    }
+    const std::size_t size{std::max(bytes, 2u * m_size)};
+    m_size = 0u;
+    ACTS_CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_data), size));
+    m_size = size;
+  }
+  return m_data;
+}
+
+CudaDeviceBuffer::~CudaDeviceBuffer() {
+  if (m_data != nullptr) {
+    (void)cudaFree(m_data);
+  }
+}
+
+char* CudaDeviceBuffer::reserve(std::size_t bytes) {
+  if (bytes > m_size) {
+    if (m_data != nullptr) {
+      ACTS_CUDA_CHECK(cudaFree(m_data));
+      m_data = nullptr;
+    }
+    const std::size_t size{std::max(bytes, 2u * m_size)};
+    m_size = 0u;
+    ACTS_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_data), size));
+    m_size = size;
+  }
+  return m_data;
+}
+
+void CudaHitPayloadContainer::placeOnDevice(size_type size,
+                                            CudaStagedBlock& block) {
+  const bool place{block.host != nullptr};
+  if (place) {
+    clearDevice();
+    m_size = size;
+    m_host = {};
+  }
+  hitPayloadColumns(m_host, m_device,
+                    [&](auto& /*hostColumn*/, auto& deviceColumn) {
+                      using T = std::remove_pointer_t<
+                          std::remove_reference_t<decltype(deviceColumn)>>;
+                      const auto columns = block.take<T>(size);
+                      if (place) {
+                        deviceColumn = columns.second;
+                      }
+                    });
+  m_onDevice = m_onDevice || place;
+}
+
+void CudaCandidateListContainer::stageForDevice(CudaStagedBlock& block) {
+  const bool place{block.host != nullptr};
+  if (place) {
+    clearDevice();
+  }
+  candidateInputColumns(
+      m_host, m_device, [&](const auto& hostColumn, auto& deviceColumn) {
+        using T = typename std::remove_reference_t<
+            decltype(hostColumn)>::value_type;
+        const auto [host, device] = block.take<T>(hostColumn.size());
+        if (place) {
+          if (host != nullptr) {
+            std::memcpy(host, hostColumn.data(), hostColumn.size() * sizeof(T));
+          }
+          deviceColumn = device;
+        }
+      });
+  // Zeroed, so that a seed the kernel has not reached reads as pending
+  candidateOutputColumns(
+      m_host, m_device, [&](const auto& hostColumn, auto& deviceColumn) {
+        using T = typename std::remove_reference_t<
+            decltype(hostColumn)>::value_type;
+        const auto [host, device] = block.take<T>(hostColumn.size());
+        if (place) {
+          if (host != nullptr) {
+            std::memset(host, 0, hostColumn.size() * sizeof(T));
+          }
+          deviceColumn = device;
+        }
+      });
+  if (place) {
+    m_device.nSeeds = static_cast<std::uint32_t>(nSeeds());
+    m_device.nCandidates = static_cast<std::uint32_t>(nCandidates());
+    m_onDevice = true;
+  }
+}
+
+void CudaPatternRecordContainer::copyFromHostCopy(
+    const CudaPatternRecordArrays& source, const char* deviceBase,
+    const char* hostCopy) {
+  if (source.maxHitsPerPattern != m_maxHitsPerPattern) {
+    throw std::invalid_argument(
+        "CudaPatternRecordContainer::copyFromHostCopy: the hit slots per "
+        "pattern differ");
+  }
+  CudaPatternRecordArrays& sourceColumns{
+      const_cast<CudaPatternRecordArrays&>(source)};
+  patternColumns(m_host, sourceColumns,
+                 [&](auto& hostColumn, const auto& deviceColumn) {
+                   if (hostColumn.empty()) {
+                     return;
+                   }
+                   const char* at{
+                       hostCopy +
+                       (reinterpret_cast<const char*>(deviceColumn) -
+                        deviceBase)};
+                   std::memcpy(hostColumn.data(), at,
+                               hostColumn.size() * sizeof(hostColumn[0]));
+                 });
 }
 
 }  // namespace ActsExamples

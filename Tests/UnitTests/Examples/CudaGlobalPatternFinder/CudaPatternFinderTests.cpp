@@ -218,6 +218,27 @@ Math::Vector3 toMath(const Vector3& v) {
   return {v.x(), v.y(), v.z()};
 }
 
+/// @brief The number type of the pattern building kernel
+using Real = Math::Real;
+
+/// @brief A hit in the number type of the pattern building kernel
+Math::HitT<Real> toReal(const Math::Hit& hit) {
+  Math::HitT<Real> out{};
+  out.position = Math::convert<Real>(hit.position);
+  out.sensorDirection = Math::convert<Real>(hit.sensorDirection);
+  out.etaMeasurementDirection = Math::convert<Real>(hit.etaMeasurementDirection);
+  out.phiMeasurementDirection = Math::convert<Real>(hit.phiMeasurementDirection);
+  out.localPositionY = static_cast<Real>(hit.localPositionY);
+  out.etaCovariance = static_cast<Real>(hit.etaCovariance);
+  out.phiCovariance = static_cast<Real>(hit.phiCovariance);
+  out.driftCovariance = static_cast<Real>(hit.driftCovariance);
+  out.stationKey = hit.stationKey;
+  out.station = hit.station;
+  out.locLayer = hit.locLayer;
+  out.flags = hit.flags;
+  return out;
+}
+
 /// @brief Bitwise equality of a CPU and a device vector
 bool same(const Vector3& cpu, const Math::Vector3& device) {
   return cpu.x() == device.x && cpu.y() == device.y && cpu.z() == device.z;
@@ -339,6 +360,13 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
                                 plane.offset),
         Math::projectToPhiPlane(hits.device[last], plane.normal, plane.offset),
         cfg.minHitDistance4Line, deviceBeamspot)};
+    const Math::BendPlaneT<Real> realPlane{
+        .phi = static_cast<Real>(plane.phi),
+        .offset = static_cast<Real>(plane.offset),
+        .normal = Math::convert<Real>(plane.normal),
+        .covPhiPhi = static_cast<Real>(plane.covPhiPhi),
+        .covSS = static_cast<Real>(plane.covSS),
+        .covPhiS = static_cast<Real>(plane.covPhiS)};
 
     BOOST_TEST_CONTEXT("anchor " << anchor << ", last " << last) {
       BOOST_CHECK(same(pat.projToPhiPlane(gctx, hits.payloads[last]),
@@ -365,6 +393,40 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
           BOOST_CHECK_EQUAL(cpu.sigma, device.sigma);
           BOOST_CHECK_EQUAL(static_cast<int>(cpu.nDof),
                             static_cast<int>(device.nDof));
+
+          // The same in the number type of the kernel, to its precision. A hit
+          // on the line, such as the anchor or the last hit itself, has no
+          // residual in either: below Acts::s_epsilon for the CPU, and below
+          // the precision of Real here
+          if (cpu.residual < 1e-6) {
+            continue;
+          }
+          const auto realLine = Math::lineThroughHits(
+              Math::projectToPhiPlane(toReal(hits.device[anchor]),
+                                      realPlane.normal, realPlane.offset),
+              Math::projectToPhiPlane(toReal(hits.device[last]),
+                                      realPlane.normal, realPlane.offset),
+              cfg.minHitDistance4Line, Math::convert<Real>(deviceBeamspot));
+          const auto single = Math::lineResidual(
+              realLine, realPlane, nPhiLayers, toReal(hits.device[anchor]),
+              toReal(hits.device[last]), toReal(hits.device[test]),
+              Math::convert<Real>(deviceBeamspot));
+          BOOST_TEST_CONTEXT("test " << test << ", phi layers " << nPhiLayers
+                                     << ", residual " << cpu.residual
+                                     << ", lever arm " << pat.leverArm) {
+            if (cpu.residual == Math::largest<double>()) {
+              BOOST_CHECK_EQUAL(single.residual, Math::largest<Real>());
+              continue;
+            }
+            BOOST_CHECK_CLOSE(cpu.residual, single.residual, 0.1);
+            // Positions some metres from the origin hold about a micrometre in
+            // single precision, which fixes the direction of a residual of a
+            // few tenths of a millimetre to a part in a thousand; the beam spot
+            // term of the uncertainty magnifies that
+            BOOST_CHECK_CLOSE(cpu.sigma, single.sigma, 5.);
+            BOOST_CHECK_EQUAL(static_cast<int>(cpu.nDof),
+                              static_cast<int>(single.nDof));
+          }
         }
       }
     }

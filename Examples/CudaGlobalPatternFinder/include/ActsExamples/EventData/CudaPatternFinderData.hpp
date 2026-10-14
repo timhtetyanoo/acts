@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -38,6 +39,62 @@ inline std::uint32_t stationKey(const MuonSpacePoint::MuonId& id) noexcept {
 
   return (side << 24u) | (station << 16u) | id.sector();
 }
+
+/// @brief Page-locked host memory kept between events, which the device
+///        copies to and from without a staging copy and without blocking the
+///        host. It grows to the largest request and does not shrink.
+class CudaPinnedBuffer {
+ public:
+  CudaPinnedBuffer() = default;
+  CudaPinnedBuffer(const CudaPinnedBuffer&) = delete;
+  CudaPinnedBuffer& operator=(const CudaPinnedBuffer&) = delete;
+  ~CudaPinnedBuffer();
+  /// @brief At least `bytes` bytes; the content is not kept when it grows
+  char* reserve(std::size_t bytes);
+  char* data() const noexcept { return m_data; }
+
+ private:
+  char* m_data = nullptr;
+  std::size_t m_size = 0;
+};
+
+/// @brief Device memory kept between events. It grows to the largest
+///        request and does not shrink; growing waits for the device.
+class CudaDeviceBuffer {
+ public:
+  CudaDeviceBuffer() = default;
+  CudaDeviceBuffer(const CudaDeviceBuffer&) = delete;
+  CudaDeviceBuffer& operator=(const CudaDeviceBuffer&) = delete;
+  ~CudaDeviceBuffer();
+  /// @brief At least `bytes` bytes; the content is not kept when it grows
+  char* reserve(std::size_t bytes);
+  char* data() const noexcept { return m_data; }
+
+ private:
+  char* m_data = nullptr;
+  std::size_t m_size = 0;
+};
+
+/// @brief Columns laid out at the same offsets in a host and a device
+///        block, so that one copy moves them all. With null blocks it only
+///        counts the bytes.
+struct CudaStagedBlock {
+  char* host = nullptr;
+  char* device = nullptr;
+  std::size_t cursor = 0;
+
+  /// @brief Room for n elements of T, aligned; returns the host and the
+  ///        device address, null while counting
+  template <typename T>
+  std::pair<T*, T*> take(std::size_t n) {
+    const std::size_t at{cursor};
+    cursor += (n * sizeof(T) + 15u) & ~std::size_t{15u};
+    if (host == nullptr || n == 0u) {
+      return {nullptr, nullptr};
+    }
+    return {reinterpret_cast<T*>(host + at), reinterpret_cast<T*>(device + at)};
+  }
+};
 
 /// @brief Bits of the flags column of the hit payload. They are the yes/no
 ///        properties of a hit that the pattern finder branches on.
@@ -257,6 +314,11 @@ class CudaHitPayloadContainer {
   /// @param stream The stream the allocation is ordered on
   void allocateDevice(size_type size, cudaStream_t stream);
 
+  /// @brief The same in device memory the caller owns: the columns of `size`
+  ///        payloads from the device address of `block` on. Without a host
+  ///        block only the bytes are counted.
+  void placeOnDevice(size_type size, CudaStagedBlock& block);
+
   /// @brief Copies all device columns on a CUDA stream.
   /// The method waits only for the supplied stream.
   void moveToHost(cudaStream_t stream);
@@ -305,6 +367,9 @@ struct CudaCandidateArrays {
   std::uint16_t* seedPosition = nullptr;
   /// @brief Output: global layer number of each candidate
   std::uint16_t* candidateGlobLayer = nullptr;
+  /// @brief Output: the group of each candidate in the low three bits, and
+  ///        whether it measures phi (bit 3) and is a precision hit (bit 4)
+  std::uint8_t* candidateInfo = nullptr;
 
   std::uint32_t nSeeds = 0;
   std::uint32_t nCandidates = 0;
@@ -336,6 +401,7 @@ struct CudaCandidateHostData {
   std::vector<std::uint8_t> seedStatus;
   std::vector<std::uint16_t> seedPosition;
   std::vector<std::uint16_t> candidateGlobLayer;
+  std::vector<std::uint8_t> candidateInfo;
 };
 
 /// @brief Values of the seed status column, in the order the CPU seed loop
@@ -452,6 +518,14 @@ class CudaCandidateListContainer {
   /// @brief Copies the input columns on a CUDA stream and zeroes the output
   ///        columns. The method waits only for the supplied stream.
   void moveToDevice(cudaStream_t stream);
+
+  /// @brief The same in memory the caller owns and copies: the input columns
+  ///        are written into the host block and the output columns zeroed
+  ///        there, at the offsets the device columns get in the device
+  ///        block. The device columns are valid once the caller has copied
+  ///        the host block up. Without a host block only the bytes are
+  ///        counted.
+  void stageForDevice(CudaStagedBlock& block);
 
   /// @brief Copies all device columns on a CUDA stream.
   /// The method waits only for the supplied stream.
@@ -733,6 +807,11 @@ class CudaPatternRecordContainer {
   /// The method waits only for the supplied stream.
   void copyFromDevice(const CudaPatternRecordArrays& source,
                       cudaStream_t stream);
+
+  /// @brief The same from a host copy of the device block the source columns
+  ///        live in: column c is read at hostCopy + (c - deviceBase).
+  void copyFromHostCopy(const CudaPatternRecordArrays& source,
+                        const char* deviceBase, const char* hostCopy);
 
   CudaPatternRecordContainer(const CudaPatternRecordContainer&) = delete;
   CudaPatternRecordContainer& operator=(const CudaPatternRecordContainer&) =

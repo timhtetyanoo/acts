@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -27,20 +28,35 @@ namespace {
 using namespace ActsExamples;
 namespace Math = CudaPatternMath;
 
+/// The number type of the pattern building, and its hits, line, bending
+/// plane and beam spot
+using Real = Math::Real;
+using RealHit = Math::HitT<Real>;
+using RealVector3 = Math::Vector3T<Real>;
+
+/// What the building reads of a candidate at every step, packed into a byte
+/// per candidate by the seed checks: the group and two flags
+struct CandidateInfo {
+  static constexpr std::uint8_t groupMask = 0x7u;
+  static constexpr std::uint8_t measuresPhi = 0x8u;
+  static constexpr std::uint8_t precision = 0x10u;
+};
+static_assert(Math::Station::nGroups <= CandidateInfo::groupMask + 1u);
+
 /// One pattern while it is built: PatternStateAux with its hits, the last
 /// inserted hit, the last hit of the previous layer and the line anchor held
 /// as positions in the seed's sorted candidate list. A position names both
 /// the hit and its global layer, as the CPU's OrderedHit does
 struct Pattern {
-  Math::Vector3 linePos{};
-  Math::Vector3 lineDir{};
+  RealVector3 linePos{};
+  RealVector3 lineDir{};
   /// The bending plane: patPhi, patPhiOffset, bendPlaneNorm and bendPlaneCov
-  Math::BendPlane plane{};
-  double leverArm{0.};
-  double sumNormResidual2{0.};
-  double lastResidual{0.};
-  double lastResSigma{0.};
-  double patTheta{0.};
+  Math::BendPlaneT<Real> plane{};
+  Real leverArm{0};
+  Real sumNormResidual2{0};
+  Real lastResidual{0};
+  Real lastResSigma{0};
+  Real patTheta{0};
   std::uint32_t nDoF{0u};
   std::uint8_t lastNDoF{0u};
   std::uint16_t lastInsertedHit{0u};
@@ -62,16 +78,19 @@ struct Pattern {
     return nPrecisionLayers + nTriggerLayers;
   }
   /// PatternStateAux::getMeanResidual2
-  __device__ double meanResidual2() const {
-    return sumNormResidual2 / (nDoF > 1u ? static_cast<double>(nDoF) : 1.);
+  __device__ Real meanResidual2() const {
+    return sumNormResidual2 / (nDoF > 1u ? static_cast<Real>(nDoF) : Real{1});
   }
 };
+
+static_assert(alignof(Pattern) <= 8u,
+              "the slots of patterns are copied in 8-byte words");
 
 /// The result of the line test of GlobalPatternFinder
 enum class Decision : std::uint8_t { addHit, branchPattern, rejectHit };
 struct LineTest {
-  double residual{0.};
-  double sigma{0.};
+  Real residual{0};
+  Real sigma{0};
   std::uint8_t nDof{0u};
   Decision decision{Decision::rejectHit};
 };
@@ -81,16 +100,16 @@ struct LineTest {
 /// pattern's hit list to the payload row
 struct PatternInfo {
   std::int8_t sector{0};
-  double patTheta{0.};
-  double patPhi{0.};
-  double patPhiOffset{0.};
+  Real patTheta{0};
+  Real patPhi{0};
+  Real patPhiOffset{0};
   /// Transverse distance of the line anchor hit from the beam line
-  double anchorRadius{0.};
+  Real anchorRadius{0};
   std::uint32_t nPhiLayers{0u};
   std::uint32_t nPrecisionLayers{0u};
   std::uint32_t nTriggerLayers{0u};
   /// PatternStateAux::getMeanResidual2
-  double meanResidual2{0.};
+  Real meanResidual2{0};
   std::uint32_t nHits{0u};
 
   __device__ std::uint32_t nBendingLayers() const {
@@ -129,16 +148,18 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
   if (!Sector::isNeighbour(a.sector, b.sector)) {
     return false;
   }
-  if (std::abs(a.patTheta - b.patTheta) > cfg.maxThetaSizeOverlap) {
+  if (std::abs(a.patTheta - b.patTheta) >
+      static_cast<Real>(cfg.maxThetaSizeOverlap)) {
     return false;
   }
   // The phi of both patterns at a common radius, where the first one lives
-  const double refR{a.anchorRadius};
-  const double phiA{a.patPhi + a.patPhiOffset / refR};
-  const double phiB{b.patPhi + b.patPhiOffset / refR};
+  const Real refR{a.anchorRadius};
+  const Real phiA{a.patPhi + a.patPhiOffset / refR};
+  const Real phiB{b.patPhi + b.patPhiOffset / refR};
   if (a.nPhiLayers > 1u && b.nPhiLayers > 1u) {
-    if (std::abs(Math::differencePeriodic(phiA, phiB, 2. * Math::pi)) >
-        2. * cfg.phiTolerance) {
+    if (std::abs(Math::differencePeriodic(phiA, phiB,
+                                          static_cast<Real>(2. * Math::pi))) >
+        static_cast<Real>(2. * cfg.phiTolerance)) {
       return false;
     }
   } else if (a.nPhiLayers > 0u) {
@@ -156,34 +177,24 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
            std::abs(hits.localPositionY[row1] - hits.localPositionY[row2]) <
                Math::epsilon;
   };
+  // The hits of a shared by b, per group. The CPU counts them group by
+  // group; two space points of one measurement sit on one surface and so in
+  // one group, so a single pass over the pairs counts the same
+  std::uint32_t nSharedInGroup[Math::Station::nGroups]{};
+  for (std::uint32_t i = 0u; i < a.nHits; ++i) {
+    const std::uint32_t rowA{rowOfA(i)};
+    for (std::uint32_t j = 0u; j < b.nHits; ++j) {
+      if (overlaps(rowA, rowOfB(j))) {
+        ++nSharedInGroup[hits.station[rowA]];
+        break;
+      }
+    }
+  }
   std::uint32_t nSharedHits{0u};
   std::uint32_t nSharedGroups{0u};
   for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
-    std::uint32_t nSharedInGroup{0u};
-    bool inA{false};
-    bool inB{false};
-    for (std::uint32_t j = 0u; j < b.nHits; ++j) {
-      inB = inB || hits.station[rowOfB(j)] == g;
-    }
-    for (std::uint32_t i = 0u; i < a.nHits && inB; ++i) {
-      const std::uint32_t rowA{rowOfA(i)};
-      if (hits.station[rowA] != g) {
-        continue;
-      }
-      inA = true;
-      for (std::uint32_t j = 0u; j < b.nHits; ++j) {
-        const std::uint32_t rowB{rowOfB(j)};
-        if (hits.station[rowB] == g && overlaps(rowA, rowB)) {
-          ++nSharedInGroup;
-          break;
-        }
-      }
-    }
-    if (!inA || !inB) {
-      continue;
-    }
-    nSharedHits += nSharedInGroup;
-    if (nSharedInGroup >= cfg.minGroupLayers) {
+    nSharedHits += nSharedInGroup[g];
+    if (nSharedInGroup[g] >= cfg.minGroupLayers) {
       ++nSharedGroups;
     }
   }
@@ -191,7 +202,8 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
                                   ? a.nBendingLayers()
                                   : b.nBendingLayers()};
   const std::uint32_t minGroups{goodA < goodB ? goodA : goodB};
-  return nSharedHits >= 0.5 * minHits &&
+  // nSharedHits >= 0.5 * minHits, in integers
+  return 2u * nSharedHits >= minHits &&
          nSharedGroups >= (minGroups < 2u ? minGroups : 2u);
 }
 
@@ -203,6 +215,9 @@ struct SeedBuilder {
   const CudaPatternFinderConfig& cfg;
   const std::uint32_t* rows;
   const std::uint16_t* globLayers;
+  /// CandidateInfo of each candidate, read at one place instead of through
+  /// its row
+  const std::uint8_t* infos;
   std::uint32_t maxHits;
   /// CudaPatternOverflow bits of what did not fit
   std::uint8_t overflow{0u};
@@ -212,32 +227,39 @@ struct SeedBuilder {
         const_cast<char*>(reinterpret_cast<const char*>(&pat)) +
         sizeof(Pattern));
   }
-  __device__ Math::Hit hit(std::uint16_t pos) const {
-    return Math::loadHit(hits, rows[pos]);
+  __device__ RealHit hit(std::uint16_t pos) const {
+    return Math::loadHit<Real>(hits, rows[pos]);
+  }
+  /// The beam spot in the number type of the building
+  __device__ Math::BeamspotT<Real> beamspot() const {
+    return Math::convert<Real>(cfg.beamspot);
   }
   __device__ std::uint8_t group(std::uint16_t pos) const {
-    return hits.station[rows[pos]];
+    return infos[pos] & CandidateInfo::groupMask;
   }
   __device__ std::uint16_t globLayer(std::uint16_t pos) const {
     return globLayers[pos];
   }
   __device__ bool measuresPhi(std::uint16_t pos) const {
-    return (hits.flags[rows[pos]] & CudaHitFlags::measuresPhi) != 0u;
+    return (infos[pos] & CandidateInfo::measuresPhi) != 0u;
   }
   __device__ bool isPrecision(std::uint16_t pos) const {
-    return (hits.flags[rows[pos]] & CudaHitFlags::precision) != 0u;
+    return (infos[pos] & CandidateInfo::precision) != 0u;
   }
 
-  /// Copies a pattern and its hits into another slot
+  /// Copies a pattern and its hits into another slot, in 8-byte words: the
+  /// slots start at multiples of 8 and their stride is one, so the words up
+  /// to the last hit stay inside the slot
   __device__ void copy(const Pattern& from, Pattern& to) {
     if (&from == &to) {
       return;
     }
-    to = from;
-    const std::uint16_t* src{hitsOf(from)};
-    std::uint16_t* dst{hitsOf(to)};
-    for (std::uint16_t i = 0u; i < from.nHits; ++i) {
-      dst[i] = src[i];
+    const std::size_t bytes{sizeof(Pattern) +
+                            from.nHits * sizeof(std::uint16_t)};
+    const auto* src = reinterpret_cast<const std::uint64_t*>(&from);
+    auto* dst = reinterpret_cast<std::uint64_t*>(&to);
+    for (std::size_t w = 0u; w < (bytes + 7u) / 8u; ++w) {
+      dst[w] = src[w];
     }
   }
 
@@ -269,19 +291,46 @@ struct SeedBuilder {
   /// group, in the order they entered each group, as on the CPU
   __device__ void updatePatternPhi(Pattern& pat) {
     const std::uint16_t* hitPos{hitsOf(pat)};
+    // The phi hits gathered in one pass over the pattern, then visited group
+    // by group; a pattern with more phi hits than the list holds is visited
+    // straight from its hits
+    constexpr std::uint32_t maxListed{32u};
+    std::uint16_t phiPos[maxListed];
+    std::uint8_t phiGroup[maxListed];
+    std::uint32_t nListed{0u};
+    if (pat.nPhiLayers <= maxListed) {
+      for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
+        const std::uint16_t pos{hitPos[i]};
+        if (measuresPhi(pos)) {
+          phiPos[nListed] = pos;
+          phiGroup[nListed] = group(pos);
+          ++nListed;
+        }
+      }
+    }
+    const bool listed{pat.nPhiLayers <= maxListed};
     auto forEachPhiHit = [&](auto&& fn) {
       for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
+        if (listed) {
+          for (std::uint32_t k = 0u; k < nListed; ++k) {
+            if (phiGroup[k] == g) {
+              const RealHit h{hit(phiPos[k])};
+              fn(h);
+            }
+          }
+          continue;
+        }
         for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
           const std::uint16_t pos{hitPos[i]};
           if (group(pos) == g && measuresPhi(pos)) {
-            const Math::Hit h{hit(pos)};
+            const RealHit h{hit(pos)};
             fn(h);
           }
         }
       }
     };
     pat.plane = Math::fitBendPlane(pat.nPhiLayers, pat.plane.phi, pat.sector,
-                                   cfg.beamspot, forEachPhiHit);
+                                   beamspot(), forEachPhiHit);
   }
 
   /// PatternStateAux::moveLineAnchorHit: the anchor is the hit closest in layer
@@ -331,12 +380,12 @@ struct SeedBuilder {
     if (!pat.needLineUpdate) {
       return;
     }
-    const Math::Line line{Math::lineThroughHits(
+    const Math::LineT<Real> line{Math::lineThroughHits(
         Math::projectToPhiPlane(hit(pat.lineAnchorHit), pat.plane.normal,
                                 pat.plane.offset),
         Math::projectToPhiPlane(hit(pat.lastInsertedHit), pat.plane.normal,
                                 pat.plane.offset),
-        cfg.minHitDistance4Line, cfg.beamspot)};
+        cfg.minHitDistance4Line, beamspot())};
     pat.linePos = line.position;
     pat.lineDir = line.direction;
     pat.leverArm = line.leverArm;
@@ -345,10 +394,10 @@ struct SeedBuilder {
   }
 
   /// GlobalPatternFinder::isPhiCompatible
-  __device__ bool isPhiCompatible(const Pattern& pat, const Math::Hit& h) {
+  __device__ bool isPhiCompatible(const Pattern& pat, const RealHit& h) {
     if (pat.nPhiLayers > 0u) {
       return !(std::abs(Math::angleToBendPlane(pat.plane, h.position)) >
-               cfg.phiTolerance);
+               static_cast<Real>(cfg.phiTolerance));
     }
     return Math::ExpandedSector::inside(pat.sector, Math::phi(h.position));
   }
@@ -359,23 +408,25 @@ struct SeedBuilder {
   }
   /// The same, with the test hit already loaded
   __device__ LineTest checkLine(Pattern& pat, std::uint16_t test,
-                                const Math::Hit& testHit) {
+                                const RealHit& testHit) {
     if ((testHit.flags & CudaHitFlags::measuresPhi) != 0u &&
         !isPhiCompatible(pat, testHit)) {
       return LineTest{};
     }
     auto makeResult = [&](Decision decision) {
-      const Math::LineResidual res{Math::lineResidual(
-          Math::Line{pat.linePos, pat.lineDir, pat.leverArm, pat.useBeamspot},
+      const Math::LineResidualT<Real> res{Math::lineResidual(
+          Math::LineT<Real>{pat.linePos, pat.lineDir, pat.leverArm,
+                            pat.useBeamspot},
           pat.plane, pat.nPhiLayers, hit(pat.lineAnchorHit),
-          hit(pat.lastInsertedHit), testHit, cfg.beamspot)};
+          hit(pat.lastInsertedHit), testHit, beamspot())};
       LineTest out{res.residual, res.sigma, res.nDof, Decision::rejectHit};
-      double accWindow{(res.nDof == 1u ? cfg.nResidualSigma : cfg.cut2Dof) *
-                       res.sigma};
+      Real accWindow{static_cast<Real>(res.nDof == 1u ? cfg.nResidualSigma
+                                                      : cfg.cut2Dof) *
+                     res.sigma};
       if (pat.useBeamspot || testHit.station != group(pat.lastInsertedHit) ||
           (testHit.station != group(pat.prevLayerHit) &&
            globLayer(test) == globLayer(pat.lastInsertedHit))) {
-        accWindow *= cfg.loosenAcceptanceFactor;
+        accWindow *= static_cast<Real>(cfg.loosenAcceptanceFactor);
       }
       if (res.residual < accWindow) {
         out.decision = decision;
@@ -460,7 +511,7 @@ struct SeedBuilder {
   __device__ bool passPatternCuts(const Pattern& pat) {
     return pat.nTriggerLayers >= cfg.minStripEtaLayers &&
            pat.nPrecisionLayers >= cfg.minPrecisionLayers &&
-           !(pat.meanResidual2() > cfg.meanNormRes2Cut) &&
+           !(pat.meanResidual2() > static_cast<Real>(cfg.meanNormRes2Cut)) &&
            countGroups(pat, true) >= cfg.minGroups;
   }
 };
@@ -569,16 +620,16 @@ __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
                                   std::uint32_t slot) {
   return PatternInfo{
       .sector = r.sector[slot],
-      .patTheta = r.patTheta[slot],
-      .patPhi = r.patPhi[slot],
-      .patPhiOffset = r.patPhiOffset[slot],
-      .anchorRadius = r.anchorRadius[slot],
+      .patTheta = static_cast<Real>(r.patTheta[slot]),
+      .patPhi = static_cast<Real>(r.patPhi[slot]),
+      .patPhiOffset = static_cast<Real>(r.patPhiOffset[slot]),
+      .anchorRadius = static_cast<Real>(r.anchorRadius[slot]),
       .nPhiLayers = r.nPhiLayers[slot],
       .nPrecisionLayers = r.nPrecisionLayers[slot],
       .nTriggerLayers = r.nTriggerLayers[slot],
       .meanResidual2 =
-          r.sumNormResidual2[slot] /
-          (r.nDoF[slot] > 1u ? static_cast<double>(r.nDoF[slot]) : 1.),
+          static_cast<Real>(r.sumNormResidual2[slot]) /
+          (r.nDoF[slot] > 1u ? static_cast<Real>(r.nDoF[slot]) : Real{1}),
       .nHits = r.nHits[slot]};
 }
 
@@ -729,7 +780,7 @@ struct EventCounts {
 __device__ __forceinline__ std::uint64_t priorityKey(std::uint32_t good,
                                                      std::uint32_t bending,
                                                      std::uint32_t precision,
-                                                     double meanResidual2) {
+                                                     Real meanResidual2) {
   auto clamp = [](std::uint32_t v, std::uint32_t max) {
     return static_cast<std::uint64_t>(v < max ? v : max);
   };
@@ -768,7 +819,7 @@ struct WarpSeed {
   std::uint32_t stride;
   /// The most chunks of 32 hits one layer of the seed has
   std::uint32_t maxChunks;
-  Math::Hit* chunkHits;
+  RealHit* chunkHits;
   std::uint32_t lane;
 
   /// The two regions, as named fields: an array indexed at run time would
@@ -1114,8 +1165,8 @@ struct WarpSeed {
           continue;
         }
         atomicOr(&acceptMask[i * maxChunks + c], 1u << h);
-        if (res.sigma > b.cfg.lowConfidenceResSigma &&
-            res.residual / res.sigma > 2.) {
+        if (res.sigma > static_cast<Real>(b.cfg.lowConfidenceResSigma) &&
+            res.residual / res.sigma > Real{2}) {
           atomicOr(&lowMask[i * maxChunks + c], 1u << h);
         }
       }
@@ -1364,6 +1415,7 @@ __device__ SeedBuilder seedBuilder(const CudaHitPayloadArrays& hits,
                      .cfg = cfg,
                      .rows = lists.candidateIndices + lists.begin(seed),
                      .globLayers = lists.candidateGlobLayer + lists.begin(seed),
+                     .infos = lists.candidateInfo + lists.begin(seed),
                      .maxHits = maxHits};
 }
 
@@ -1401,9 +1453,9 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
 
   // The hits of the chunk being tested, per warp of the block. Raw storage,
   // since shared memory takes no constructors
-  __shared__ alignas(Math::Hit) unsigned char
-      chunkStorage[warpsPerBlock * lanesPerWarp * sizeof(Math::Hit)];
-  Math::Hit* chunkHits{reinterpret_cast<Math::Hit*>(chunkStorage) +
+  __shared__ alignas(RealHit) unsigned char
+      chunkStorage[warpsPerBlock * lanesPerWarp * sizeof(RealHit)];
+  RealHit* chunkHits{reinterpret_cast<RealHit*>(chunkStorage) +
                        (threadIdx.x / lanesPerWarp) * lanesPerWarp};
   WarpSeed warp{.b = seedBuilder(hits, lists, cfg, seed, maxHits),
                 .arena = arena,
@@ -1442,6 +1494,11 @@ struct EventBuffers {
   std::uint8_t* state{nullptr};
   std::uint8_t* nextState{nullptr};
   std::uint32_t* firstOfSeed{nullptr};
+  std::uint32_t* seedOf{nullptr};
+  std::uint32_t* seedLinks{nullptr};
+  /// The block the compacted records live in, which goes back in one copy
+  char* compactedBase{nullptr};
+  unsigned long long compactedBytes{0u};
   std::uint32_t nPatterns{0u};
   std::uint32_t wordsPerRow{0u};
   std::uint32_t nKept{0u};
@@ -1517,7 +1574,12 @@ __global__ void carveEventKernel(Arena arena, EventCounts* counts,
   auto layout = [&](char* base) {
     unsigned long long cursor{0u};
     carveRecords(out.event, base, cursor, n, maxHits);
+    const unsigned long long compactedStart{cursor};
     carveRecords(out.compacted, base, cursor, n, maxHits);
+    out.compactedBytes = cursor - compactedStart;
+    if (base != nullptr) {
+      out.compactedBase = base + compactedStart;
+    }
     auto take = [&](auto*& column, unsigned long long count) {
       if (base != nullptr) {
         column = reinterpret_cast<std::remove_reference_t<decltype(column)>>(
@@ -1530,6 +1592,8 @@ __global__ void carveEventKernel(Arena arena, EventCounts* counts,
     take(out.state, n);
     take(out.nextState, n);
     take(out.firstOfSeed, nSeeds);
+    take(out.seedOf, n);
+    take(out.seedLinks, static_cast<unsigned long long>(n) * words);
     return cursor;
   };
   if (n > 0u) {
@@ -1559,18 +1623,50 @@ __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
   }
   const CudaPatternRecordArrays event{buffers->event};
   std::uint32_t* firstOfSeed{buffers->firstOfSeed};
+  // The first slot of every seed, an exclusive scan over the block: within
+  // each warp by shuffles, then over the warp totals
+  __shared__ std::uint32_t warpTotals[32];
   __shared__ std::uint32_t nTotal;
+  const std::uint32_t lane{threadIdx.x % lanesPerWarp};
+  const std::uint32_t warp{threadIdx.x / lanesPerWarp};
+  const std::uint32_t nWarps{blockDim.x / lanesPerWarp};
   if (threadIdx.x == 0u) {
-    std::uint32_t sum{0u};
-    for (std::uint32_t s = 0u; s < lists.nSeeds; ++s) {
-      firstOfSeed[s] = sum;
-      sum += results[s].nKept;
-    }
-    nTotal = sum;
-    event.nPatterns[0] = sum;
-    event.overflow[0] = static_cast<std::uint8_t>(counts->overflow);
+    nTotal = 0u;
   }
   __syncthreads();
+  for (std::uint32_t base = 0u; base < lists.nSeeds; base += blockDim.x) {
+    const std::uint32_t s{base + threadIdx.x};
+    const std::uint32_t value{s < lists.nSeeds ? results[s].nKept : 0u};
+    std::uint32_t sum{value};
+    for (std::uint32_t d = 1u; d < lanesPerWarp; d <<= 1u) {
+      const std::uint32_t other{__shfl_up_sync(fullMask, sum, d)};
+      if (lane >= d) {
+        sum += other;
+      }
+    }
+    if (lane == lanesPerWarp - 1u) {
+      warpTotals[warp] = sum;
+    }
+    __syncthreads();
+    std::uint32_t before{nTotal};
+    for (std::uint32_t w = 0u; w < warp; ++w) {
+      before += warpTotals[w];
+    }
+    if (s < lists.nSeeds) {
+      firstOfSeed[s] = before + sum - value;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      for (std::uint32_t w = 0u; w < nWarps; ++w) {
+        nTotal += warpTotals[w];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0u) {
+    event.nPatterns[0] = nTotal;
+    event.overflow[0] = static_cast<std::uint8_t>(counts->overflow);
+  }
   for (std::uint32_t t = threadIdx.x; t < nTotal; t += blockDim.x) {
     std::uint32_t lo{0u};
     std::uint32_t hi{lists.nSeeds};
@@ -1583,6 +1679,7 @@ __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
       }
     }
     const SeedResult& result{results[lo]};
+    buffers->seedOf[t] = lo;
     SeedBuilder builder{seedBuilder(hits, lists, cfg, lo, result.maxHits)};
     const auto& pat = *reinterpret_cast<const Pattern*>(
         result.region +
@@ -1592,13 +1689,17 @@ __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
   }
 }
 
-/// The link of one pair of the event's patterns
+/// The links of one pair of the event's patterns: the overlap link, and the
+/// seed link if the pattern that outranks holds the seed hit of the other
+/// and the two come from different seeds
 __device__ void linkPair(const CudaHitPayloadArrays& hits,
+                         const CudaCandidateArrays& lists,
                          const CudaPatternFinderConfig& cfg,
-                         const CudaPatternRecordArrays& event,
-                         const std::uint32_t* good, std::uint32_t* links,
-                         std::uint32_t wordsPerRow, std::uint32_t i,
+                         const EventBuffers& buffers, std::uint32_t i,
                          std::uint32_t j) {
+  const CudaPatternRecordArrays& event{buffers.event};
+  const std::uint32_t* good{buffers.good};
+  const std::uint32_t wordsPerRow{buffers.wordsPerRow};
   auto rowsOf = [&event](std::uint32_t slot) {
     return [&event, slot](std::uint32_t k) {
       return event.hitIndex[event.hitSlot(slot, k)];
@@ -1609,25 +1710,40 @@ __device__ void linkPair(const CudaHitPayloadArrays& hits,
   const bool iFirst{outranks(infoI, good[i], i, infoJ, good[j], j)};
   const std::uint32_t upper{iFirst ? i : j};
   const std::uint32_t lower{iFirst ? j : i};
+  const std::uint32_t bit{1u << (upper % 32u)};
+  const std::size_t word{static_cast<std::size_t>(lower) * wordsPerRow +
+                         upper / 32u};
   if (areOverlapping(hits, cfg, iFirst ? infoI : infoJ, rowsOf(upper),
                      good[upper], iFirst ? infoJ : infoI, rowsOf(lower),
                      good[lower])) {
-    atomicOr(&links[lower * wordsPerRow + upper / 32u], 1u << (upper % 32u));
+    atomicOr(&buffers.links[word], bit);
+  }
+  const std::uint32_t seedLower{buffers.seedOf[lower]};
+  if (buffers.seedOf[upper] != seedLower) {
+    const std::uint32_t seedRow{lists.seedHitIndex[seedLower]};
+    const auto upperRows = rowsOf(upper);
+    for (std::uint32_t k = 0u; k < event.nHits[upper]; ++k) {
+      if (upperRows(k) == seedRow) {
+        atomicOr(&buffers.seedLinks[word], bit);
+        break;
+      }
+    }
   }
 }
 
 /// The links between the patterns of the event: bit j of row i is set if
 /// pattern j outranks pattern i and overlaps it, by the overlap test of the
-/// pattern that outranks. The threads of the grid stride over the pairs; the
-/// rows must be zeroed
+/// pattern that outranks; in the seed links, if pattern j outranks pattern i
+/// and holds the seed hit of i, as GlobalPatternFinder counts the patterns
+/// that hold a seed. Both only for pairs that pass the cheap sector and theta
+/// test. The threads of the grid stride over the pairs; the rows must be
+/// zeroed
 __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
+                                        CudaCandidateArrays lists,
                                         CudaPatternFinderConfig cfg,
                                         const EventBuffers* buffers) {
   const std::uint32_t n{buffers->nPatterns};
   const CudaPatternRecordArrays event{buffers->event};
-  const std::uint32_t* good{buffers->good};
-  std::uint32_t* links{buffers->links};
-  const std::uint32_t wordsPerRow{buffers->wordsPerRow};
   const std::uint64_t nPairs{static_cast<std::uint64_t>(n) * n};
   for (std::uint64_t pair =
            blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x;
@@ -1638,11 +1754,12 @@ __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
     // The cheap part of the overlap test first
     if (j <= i ||
         !Math::ExpandedSector::isNeighbour(event.sector[i], event.sector[j]) ||
-        std::abs(event.patTheta[i] - event.patTheta[j]) >
-            cfg.maxThetaSizeOverlap) {
+        std::abs(static_cast<Real>(event.patTheta[i]) -
+                 static_cast<Real>(event.patTheta[j])) >
+            static_cast<Real>(cfg.maxThetaSizeOverlap)) {
       continue;
     }
-    linkPair(hits, cfg, event, good, links, wordsPerRow, i, j);
+    linkPair(hits, lists, cfg, *buffers, i, j);
   }
 }
 
@@ -1659,6 +1776,7 @@ __global__ void countEventGroupsKernel(CudaHitPayloadArrays hits,
                                   buffers->wordsPerRow};
   for (unsigned long long w = first; w < nWords; w += stride) {
     buffers->links[w] = 0u;
+    buffers->seedLinks[w] = 0u;
   }
   for (std::uint32_t i = first; i < n; i += stride) {
     buffers->good[i] = countGroups(
@@ -1671,12 +1789,18 @@ __global__ void countEventGroupsKernel(CudaHitPayloadArrays hits,
 }
 
 /// The overlaps among the patterns of the event, by priority, as
-/// WarpSeed::resolveOverlaps does it for a seed, on the links. The dropped
-/// patterns get the status rejected. Runs in one block
-__global__ void resolveEventOverlapsKernel(const EventBuffers* buffers) {
+/// WarpSeed::resolveOverlaps does it for a seed, on the links; and the limit
+/// of GlobalPatternFinder on the patterns that hold a seed, without its order:
+/// a pattern is dropped if its seed hit is in maxSeedAttempts kept patterns
+/// of other seeds that outrank it. The result is that of taking the patterns
+/// one by one in priority order. The dropped patterns get the status
+/// rejected. Runs in one block
+__global__ void resolveEventOverlapsKernel(const EventBuffers* buffers,
+                                           std::uint32_t maxSeedAttempts) {
   const std::uint32_t n{buffers->nPatterns};
   const CudaPatternRecordArrays event{buffers->event};
   const std::uint32_t* links{buffers->links};
+  const std::uint32_t* seedLinks{buffers->seedLinks};
   const std::uint32_t wordsPerRow{buffers->wordsPerRow};
   std::uint8_t* state{buffers->state};
   std::uint8_t* nextState{buffers->nextState};
@@ -1703,6 +1827,19 @@ __global__ void resolveEventOverlapsKernel(const EventBuffers* buffers) {
           isBlocked = isBlocked || state[j] == undecided;
         }
       }
+      std::uint32_t nHolding{0u};
+      for (std::uint32_t w = 0u; w < wordsPerRow && !isDropped; ++w) {
+        std::uint32_t word{seedLinks[i * wordsPerRow + w]};
+        while (word != 0u && !isDropped) {
+          const std::uint32_t j{32u * w +
+                                static_cast<std::uint32_t>(__ffs(word) - 1)};
+          word &= word - 1u;
+          nHolding += state[j] == kept ? 1u : 0u;
+          isDropped = nHolding >= maxSeedAttempts;
+          isBlocked = isBlocked || state[j] == undecided;
+        }
+      }
+      isDropped = isDropped || nHolding >= maxSeedAttempts;
       nextState[i] = isDropped ? dropped : (isBlocked ? undecided : kept);
       anyUndecided = anyUndecided || nextState[i] == undecided;
     }
@@ -1753,6 +1890,7 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
   }
   std::uint32_t* rows{lists.candidateIndices + lists.begin(seed)};
   std::uint16_t* globLayer{lists.candidateGlobLayer + lists.begin(seed)};
+  std::uint8_t* info{lists.candidateInfo + lists.begin(seed)};
   const std::uint32_t n{lists.end(seed) - lists.begin(seed)};
   const std::uint32_t minLayers{cfg.minStripEtaLayers + cfg.minPrecisionLayers};
   auto setStatus = [&](std::uint8_t status) {
@@ -1827,6 +1965,13 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
     }
     if (i < n) {
       globLayer[i] = static_cast<std::uint16_t>(carry + sum);
+      const std::uint8_t flags{hits.flags[rows[i]]};
+      info[i] = static_cast<std::uint8_t>(
+          (hits.station[rows[i]] & CandidateInfo::groupMask) |
+          ((flags & CudaHitFlags::measuresPhi) != 0u ? CandidateInfo::measuresPhi
+                                                     : 0u) |
+          ((flags & CudaHitFlags::precision) != 0u ? CandidateInfo::precision
+                                                   : 0u));
     }
     carry += __shfl_sync(fullMask, sum, lanesPerWarp - 1u);
   }
@@ -2116,7 +2261,8 @@ void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
 CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
     const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
-    cudaStream_t stream, CudaPatternFinderTiming* timing) {
+    cudaStream_t stream, CudaPatternFinderTiming* timing,
+    CudaPinnedBuffer* readback) {
   if (sizes.workspaceBytes == 0u) {
     throw std::invalid_argument(
         "findCudaPatternsInEta: the workspace has to have some memory");
@@ -2132,7 +2278,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     ACTS_CUDA_CHECK(cudaMemPoolSetAttribute(
         pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
   }
-  std::array<cudaEvent_t, 3> marks{};
+  std::array<cudaEvent_t, 5> marks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : marks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
@@ -2163,6 +2309,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   mark(0u);
   // The seed checks
   prepareCudaSeeds(hits, lists, cfg, stream);
+  mark(1u);
 
   // Every seed at once, with the memory of the arena; then the totals, which
   // size the event's patterns
@@ -2185,6 +2332,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     cfg, arena, results, counts);
     ACTS_CUDA_CHECK(cudaGetLastError());
   }
+  mark(2u);
   // The event's buffers, sized on the device by what the seeds produced,
   // then the patterns of every seed, the links of every pair and the rounds
   EventBuffers* eventBuffers{nullptr};
@@ -2198,31 +2346,44 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   countEventGroupsKernel<<<128, 256, 0, stream>>>(hits.deviceArrays(), cfg,
                                                   eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  linkEventPatternsKernel<<<512, 256, 0, stream>>>(hits.deviceArrays(), cfg,
-                                                   eventBuffers);
+  linkEventPatternsKernel<<<512, 256, 0, stream>>>(
+      hits.deviceArrays(), lists.deviceArrays(), cfg, eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  resolveEventOverlapsKernel<<<1, 1024, 0, stream>>>(eventBuffers);
+  resolveEventOverlapsKernel<<<1, 1024, 0, stream>>>(eventBuffers,
+                                                     cfg.maxSeedAttempts);
   ACTS_CUDA_CHECK(cudaGetLastError());
   // Only the kept patterns go back: compacted on the device, their number
   // read, then their slots copied
   compactEventPatternsKernel<<<1, 256, 0, stream>>>(eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  mark(1u);
-  EventBuffers ready{};
-  EventCounts totals{};
-  ACTS_CUDA_CHECK(cudaMemcpyAsync(&ready, eventBuffers, sizeof(EventBuffers),
+  mark(3u);
+  // The counts, then the block of the kept patterns, into page-locked memory
+  CudaPinnedBuffer ownReadback{};
+  CudaPinnedBuffer& pinned{readback != nullptr ? *readback : ownReadback};
+  constexpr std::size_t countsAt{(sizeof(EventBuffers) + 15u) & ~15u};
+  char* small{pinned.reserve(countsAt + sizeof(EventCounts))};
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(small, eventBuffers, sizeof(EventBuffers),
                                   cudaMemcpyDeviceToHost, stream));
-  ACTS_CUDA_CHECK(cudaMemcpyAsync(&totals, counts, sizeof(EventCounts),
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(small + countsAt, counts, sizeof(EventCounts),
                                   cudaMemcpyDeviceToHost, stream));
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  EventBuffers ready{};
+  EventCounts totals{};
+  std::memcpy(&ready, small, sizeof(EventBuffers));
+  std::memcpy(&totals, small + countsAt, sizeof(EventCounts));
   const std::uint32_t maxHits{std::max(totals.maxHits, 1u)};
   CudaPatternRecordContainer kept{1u, ready.nKept, maxHits};
   if (ready.nKept > 0u) {
-    kept.copyFromDevice(ready.compacted, stream);
+    ACTS_CUDA_CHECK(cudaMemcpyAsync(pinned.reserve(ready.compactedBytes),
+                                    ready.compactedBase, ready.compactedBytes,
+                                    cudaMemcpyDeviceToHost, stream));
   }
-  mark(2u);
+  mark(4u);
   release();
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (ready.nKept > 0u) {
+    kept.copyFromHostCopy(ready.compacted, ready.compactedBase, pinned.data());
+  }
   const auto overflow = static_cast<std::uint8_t>(totals.overflow);
   const std::array<std::uint32_t, 1> nKept{ready.nKept};
   kept.setNPatterns(0u, nKept[0]);
@@ -2234,8 +2395,11 @@ CudaPatternRecordContainer findCudaPatternsInEta(
       ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[from], marks[to]));
       return 1000. * ms;
     };
-    timing->kernelsUs = elapsedUs(0u, 1u);
-    timing->downloadUs = elapsedUs(1u, 2u);
+    timing->seedsUs = elapsedUs(0u, 1u);
+    timing->buildUs = elapsedUs(1u, 2u);
+    timing->overlapsUs = elapsedUs(2u, 3u);
+    timing->kernelsUs = elapsedUs(0u, 3u);
+    timing->downloadUs = elapsedUs(3u, 4u);
     timing->largestBeam = totals.largestBeam;
     timing->overflow = overflow;
     timing->nPatternsInEta = nKept[0];
