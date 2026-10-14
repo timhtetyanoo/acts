@@ -162,16 +162,8 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
     ws.overflow[b] = builder.overflow;
     return;
   }
-  // Finalize, keep the patterns that pass the cuts, in order
-  std::uint32_t nOut{0u};
-  for (std::uint32_t k = 0u; k < nResult; ++k) {
-    Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
-    pat.meanNormResidual2 /= pat.nDoF;
-    if (builder.passPatternCuts(pat)) {
-      builder.copy(pat, builder.pattern(SeedBuilder::regionResult, nOut++));
-    }
-  }
-  ws.nResults[b] = nOut;
+  // The quality cuts were applied during the build
+  ws.nResults[b] = nResult;
 }
 
 /// Writes the finalized patterns of every seed of a batch to the records
@@ -198,12 +190,12 @@ __global__ void exportPatternsKernel(CudaHitPayloadArrays hits,
 }
 
 /// Takes the patterns of one batch of seeds into the event's patterns, one
-/// seed after the other in tree order. A seed whose hit is already in
-/// maxSeedAttempts accepted patterns is skipped. A new pattern that overlaps
-/// a better accepted pattern is dropped; otherwise it is accepted and the
-/// accepted patterns it overlaps are dropped. The accepted patterns therefore
-/// never overlap, and no overlap removal over all of them is needed. Runs in
-/// one thread.
+/// seed after the other in tree order, as GlobalPatternFinder::insertIfBest
+/// does into the output patterns. A seed is skipped when maxSeedAttempts
+/// accepted patterns near it in theta and sector contain its hit. A new
+/// pattern that overlaps a better accepted pattern is dropped; otherwise it is
+/// accepted and the accepted patterns it overlaps are dropped. Runs in one
+/// thread.
 ///
 /// The patterns of seed b of the batch are the results of entry b of the
 /// workspace. The CudaPatternOverflow bits of a seed that did not fit are
@@ -242,9 +234,13 @@ __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
     }
     // The skip rule, against the accepted patterns
     const std::uint32_t seedRow{lists.seedHitIndex[seed]};
+    const auto seedSector = static_cast<std::int8_t>(lists.seedSector[seed]);
     std::uint32_t nContaining{0u};
     for (std::uint32_t e = 0u; e < nEvent; ++e) {
-      if (!isAlive(e)) {
+      if (!isAlive(e) ||
+          std::abs(event.patTheta[e] - lists.seedTheta[seed]) >
+              cfg.maxThetaSizeOverlap ||
+          !Math::ExpandedSector::isNeighbour(event.sector[e], seedSector)) {
         continue;
       }
       for (std::uint32_t i = 0u; i < event.nHits[e]; ++i) {
@@ -261,16 +257,16 @@ __global__ void acceptPatternsKernel(CudaHitPayloadArrays hits,
     SeedBuilder builder{ws.builder(hits, lists, cfg, seed, b)};
     for (std::uint32_t k = 0u; k < ws.nResults[b]; ++k) {
       const Pattern& pat{builder.pattern(SeedBuilder::regionResult, k)};
-      // The pattern is finalized: its mean is already divided
-      PatternInfo info{builder.info(pat)};
-      info.meanResidual2 = pat.meanNormResidual2;
+      const PatternInfo info{builder.info(pat)};
       const std::uint32_t good{builder.countGroups(pat, true)};
+      // areOverlapping(other, candidate), as insertIfBest calls it
       auto overlapsWith = [&](std::uint32_t e, std::uint32_t& goodE) {
         goodE =
             countGroups(hits, event.nHits[e], eventRows(e), cfg.minGroupLayers);
-        return areOverlapping(hits, cfg, info, builder.rowsOf(pat), good,
-                              recordInfo(event, e), eventRows(e), goodE);
+        return areOverlapping(hits, cfg, recordInfo(event, e), eventRows(e),
+                              goodE, info, builder.rowsOf(pat), good);
       };
+
       bool beaten{false};
       for (std::uint32_t e = 0u; e < nEvent && !beaten; ++e) {
         std::uint32_t goodE{0u};

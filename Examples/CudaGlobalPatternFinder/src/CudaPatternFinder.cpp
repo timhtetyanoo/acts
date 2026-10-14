@@ -137,7 +137,7 @@ CudaGlobalPatternFinder::finishPatterns(
       }
     }
     out.phiOnlyHits = std::move(pat.phiOnlyHits);
-    out.meanNormResidual2 = pat.meanNormResidual2;
+    out.meanNormResidual2 = pat.getMeanResidual2();
     out.patTheta = pat.patTheta;
     out.patPhi = pat.patPhi;
     out.nPrecisionLayers = static_cast<std::uint8_t>(pat.nPrecisionLayers);
@@ -178,7 +178,7 @@ CudaGlobalPatternFinder::makePatternState(
   pat.linePos = row.linePos;
   pat.lineDir = row.lineDir;
   pat.leverArm = row.leverArm;
-  pat.meanNormResidual2 = row.meanNormResidual2;
+  pat.sumNormResidual2 = row.sumNormResidual2;
   pat.patPhi = row.patPhi;
   pat.patTheta = row.patTheta;
   pat.patPhiOffset = row.patPhiOffset;
@@ -194,7 +194,6 @@ CudaGlobalPatternFinder::makePatternState(
   pat.nPrecisionLayers = row.nPrecisionLayers;
   pat.nTriggerLayers = row.nTriggerLayers;
   pat.nPhiLayers = row.nPhiLayers;
-  pat.isFinalized = true;
   pat.useBeamspot = (row.flags & CudaPatternFlags::useBeamspot) != 0u;
   pat.needLineUpdate = (row.flags & CudaPatternFlags::needLineUpdate) != 0u;
   return pat;
@@ -223,6 +222,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
 
     // useBeamspot flags whether the line could be drawn from the hits
     pat.useBeamspot = true;
+    pat.needLineUpdate = true;
 
     if (groupHits.size() > 1) {
       const auto [minIt, maxIt]{std::ranges::minmax_element(
@@ -232,6 +232,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
       pat.updateLineParameters(gctx, BeamspotInfo{});
     }
     if (pat.useBeamspot && !groupHits.empty()) {
+      pat.needLineUpdate = true;
       pat.moveLineAnchorHit(groupHits.front());
       pat.lastInsertedHit =
           *std::ranges::max_element(groupHits, {}, [&](const OrderedHit& c) {
@@ -242,6 +243,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
       pat.updateLineParameters(gctx, BeamspotInfo{});
     }
     if (pat.useBeamspot) {
+      pat.needLineUpdate = true;
       const OrderedHit* lowerHit{nullptr};
       const OrderedHit* upperHit{nullptr};
       for (const auto& [group, hits] : Acts::enumerate(pat.hitsPerGroup)) {

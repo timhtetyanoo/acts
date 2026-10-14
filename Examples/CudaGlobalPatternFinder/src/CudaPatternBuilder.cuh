@@ -34,7 +34,7 @@ struct Pattern {
   /// The bending plane: patPhi, patPhiOffset, bendPlaneNorm and bendPlaneCov
   Math::BendPlane plane{};
   double leverArm{0.};
-  double meanNormResidual2{0.};
+  double sumNormResidual2{0.};
   double lastResidual{0.};
   double lastResSigma{0.};
   double patTheta{0.};
@@ -58,8 +58,10 @@ struct Pattern {
   __device__ std::uint32_t nBendingLayers() const {
     return nPrecisionLayers + nTriggerLayers;
   }
-  /// PatternStateAux::getMeanResidual2 of a pattern not finalized yet
-  __device__ double meanResidual2() const { return meanNormResidual2 / nDoF; }
+  /// PatternStateAux::getMeanResidual2
+  __device__ double meanResidual2() const {
+    return sumNormResidual2 / (nDoF > 1u ? static_cast<double>(nDoF) : 1.);
+  }
 };
 
 /// The result of the line test of GlobalPatternFinder
@@ -132,7 +134,7 @@ __device__ bool isBetter(const PatternInfo& a, const PatternInfo& b) {
   return nLayerDiff > 0;
 }
 
-/// The comparison of GlobalPatternFinder::resolveOverlaps: more good groups
+/// The comparison of GlobalPatternFinder::insertIfBest: more good groups
 /// first, then isBetter
 __device__ bool isBetterOverlap(const PatternInfo& a, std::uint32_t goodA,
                                 const PatternInfo& b, std::uint32_t goodB) {
@@ -142,7 +144,7 @@ __device__ bool isBetterOverlap(const PatternInfo& a, std::uint32_t goodA,
   return isBetter(a, b);
 }
 
-/// The overlap test of GlobalPatternFinder::resolveOverlaps. goodA and goodB
+/// GlobalPatternFinder::areOverlapping. goodA and goodB
 /// are the numbers of good groups of the two patterns
 template <typename RowOfA, typename RowOfB>
 __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
@@ -154,7 +156,7 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
   if (!Sector::isNeighbour(a.sector, b.sector)) {
     return false;
   }
-  if (std::abs(a.patTheta - b.patTheta) > 2. * cfg.maxThetaSizeOverlap) {
+  if (std::abs(a.patTheta - b.patTheta) > cfg.maxThetaSizeOverlap) {
     return false;
   }
   // The phi of both patterns at a common radius, where the first one lives
@@ -474,7 +476,7 @@ struct SeedBuilder {
     pat.prevLayerHit = pat.lastInsertedHit;
     pat.lastInsertedHit = test;
 
-    pat.meanNormResidual2 += Math::square(res.residual / res.sigma);
+    pat.sumNormResidual2 += Math::square(res.residual / res.sigma);
     pat.nDoF += res.nDof;
     pat.lastResSigma = res.sigma;
     pat.lastResidual = res.residual;
@@ -508,8 +510,8 @@ struct SeedBuilder {
       ++pat.nPhiLayers;
       updatePhi = true;
     }
-    pat.meanNormResidual2 += Math::square(res.residual / res.sigma) -
-                             Math::square(pat.lastResidual / pat.lastResSigma);
+    pat.sumNormResidual2 += Math::square(res.residual / res.sigma) -
+                            Math::square(pat.lastResidual / pat.lastResSigma);
     pat.nDoF += static_cast<std::uint32_t>(static_cast<int>(res.nDof) -
                                            static_cast<int>(pat.lastNDoF));
     pat.lastResSigma = res.sigma;
@@ -530,40 +532,50 @@ struct SeedBuilder {
     pat.needLineUpdate = true;
   }
 
-  /// The overlap test of GlobalPatternFinder::resolveOverlaps
+  /// GlobalPatternFinder::areOverlapping
   __device__ bool areOverlapping(const Pattern& a, const Pattern& b) {
     return ::areOverlapping(hits, cfg, info(a), rowsOf(a), countGroups(a, true),
                             info(b), rowsOf(b), countGroups(b, true));
   }
 
-  /// GlobalPatternFinder::resolveOverlaps on the first n patterns of a region,
-  /// in place. Returns the number of survivors, which keep their order
-  __device__ std::uint32_t resolveOverlaps(std::uint32_t region,
-                                           std::uint32_t n) {
-    std::uint32_t nOut{0u};
-    for (std::uint32_t i = 0u; i < n; ++i) {
-      Pattern& pi{pattern(region, i)};
-      if (pi.isOverlap) {
+  /// GlobalPatternFinder::insertIfBest into the n patterns of a region: the
+  /// candidate is dropped if an overlapping pattern of the region is better;
+  /// otherwise the patterns it overlaps are removed, the last one of the
+  /// region taking the place of each, and the candidate is appended
+  __device__ void insertIfBest(std::uint32_t region, std::uint32_t& n,
+                               const Pattern& cand) {
+    const PatternInfo candInfo{info(cand)};
+    const std::uint32_t candGood{countGroups(cand, true)};
+    // The positions of the losers, in increasing order, are marked on the
+    // patterns themselves
+    bool anyLoser{false};
+    for (std::uint32_t k = 0u; k < n; ++k) {
+      Pattern& other{pattern(region, k)};
+      other.isOverlap = false;
+      if (!areOverlapping(other, cand)) {
         continue;
       }
-      for (std::uint32_t j = i + 1u; j < n; ++j) {
-        Pattern& pj{pattern(region, j)};
-        if (pj.isOverlap || !areOverlapping(pi, pj)) {
-          continue;
+      if (isBetterOverlap(info(other), countGroups(other, true), candInfo,
+                          candGood)) {
+        for (std::uint32_t l = 0u; l < k; ++l) {
+          pattern(region, l).isOverlap = false;
         }
-        if (isBetterOverlap(info(pi), countGroups(pi, true), info(pj),
-                            countGroups(pj, true))) {
-          pj.isOverlap = true;
-        } else {
-          pi.isOverlap = true;
-          break;
-        }
+        return;
       }
-      if (!pi.isOverlap) {
-        copy(pi, pattern(region, nOut++));
-      }
+      other.isOverlap = true;
+      anyLoser = true;
     }
-    return nOut;
+    for (std::uint32_t k = n; anyLoser && k-- > 0u;) {
+      if (!pattern(region, k).isOverlap) {
+        continue;
+      }
+      if (k + 1u != n) {
+        copy(pattern(region, n - 1u), pattern(region, k));
+      }
+      --n;
+    }
+    copy(cand, pattern(region, n++));
+    pattern(region, n - 1u).isOverlap = false;
   }
 
   /// GlobalPatternFinder::extendPatterns: tests one hit against the n patterns
@@ -669,11 +681,13 @@ struct SeedBuilder {
 
   /// The processHitRange helper of findPatternsInEta: extends the pattern in
   /// region A, slot 0 through the candidates first, first + step, ... up to
-  /// (excluding) last, skipping the seed layer. Returns the region holding the
-  /// resulting patterns, n is set to their number
+  /// (excluding) last, skipping the seed layer. The resulting patterns, with
+  /// the quality cuts if applyCuts, go through insertIfBest into the region
+  /// the extension did not end in. Returns that region, n is set to their
+  /// number
   __device__ std::uint32_t processHitRange(int first, int last, int step,
                                            std::uint16_t seedPos,
-                                           std::uint32_t& n) {
+                                           bool applyCuts, std::uint32_t& n) {
     std::uint32_t current{regionA};
     std::uint32_t next{regionB};
     n = 1u;
@@ -687,10 +701,16 @@ struct SeedBuilder {
       current = next;
       next = swap;
     }
-    if (n > 1u && !overflow) {
-      n = resolveOverlaps(current, n);
+    std::uint32_t nResult{0u};
+    for (std::uint32_t k = 0u; k < n && !overflow; ++k) {
+      const Pattern& pat{pattern(current, k)};
+      if (pat.isOverlap || (applyCuts && !passPatternCuts(pat))) {
+        continue;
+      }
+      insertIfBest(next, nResult, pat);
     }
-    return current;
+    n = nResult;
+    return next;
   }
 
   /// The constructor of PatternStateAux
@@ -720,8 +740,8 @@ struct SeedBuilder {
   __device__ bool passPatternCuts(const Pattern& pat) {
     return pat.nTriggerLayers >= cfg.minStripEtaLayers &&
            pat.nPrecisionLayers >= cfg.minPrecisionLayers &&
-           countGroups(pat, true) >= 2u &&
-           !(pat.meanNormResidual2 > cfg.meanNormRes2Cut);
+           !(pat.meanResidual2() > cfg.meanNormRes2Cut) &&
+           countGroups(pat, true) >= cfg.minGroups;
   }
 
   /// Builds the patterns of a seed into the result region. Returns their
@@ -733,7 +753,7 @@ struct SeedBuilder {
     // First from the seed layer outwards
     std::uint32_t nForward{0u};
     const std::uint32_t forward{processHitRange(
-        seedPos + 1, static_cast<int>(nCands), 1, seedPos, nForward)};
+        seedPos + 1, static_cast<int>(nCands), 1, seedPos, false, nForward)};
     for (std::uint32_t k = 0u; k < nForward; ++k) {
       copy(pattern(forward, k), pattern(regionForward, k));
     }
@@ -745,15 +765,16 @@ struct SeedBuilder {
       copy(pattern(regionForward, f), start);
       moveLineAnchorHit(start, seedPos);
       start.lastInsertedHit = seedPos;
+      start.lastResidual = 0.;
+      start.lastResSigma = 0.;
+      start.lastNDoF = 0u;
       std::uint32_t nBackward{0u};
       const std::uint32_t backward{
-          processHitRange(seedPos - 1, -1, -1, seedPos, nBackward)};
+          processHitRange(seedPos - 1, -1, -1, seedPos, true, nBackward)};
+      // The patterns of the different backward searches against each other
       for (std::uint32_t k = 0u; k < nBackward && !overflow; ++k) {
-        push(pattern(backward, k), regionResult, nResult);
+        insertIfBest(regionResult, nResult, pattern(backward, k));
       }
-    }
-    if (nResult > 1u && !overflow) {
-      nResult = resolveOverlaps(regionResult, nResult);
     }
     return overflow ? 0u : nResult;
   }
@@ -783,7 +804,7 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   out.nDoF[slot] = pat.nDoF;
   out.lastNDoF[slot] = pat.lastNDoF;
   out.anchorRadius[slot] = Math::perp(builder.hit(pat.lineAnchorHit).position);
-  out.meanNormResidual2[slot] = pat.meanNormResidual2;
+  out.sumNormResidual2[slot] = pat.sumNormResidual2;
   out.lastResidual[slot] = pat.lastResidual;
   out.lastResSigma[slot] = pat.lastResSigma;
   out.linePosX[slot] = pat.linePos.x;
@@ -804,7 +825,6 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   out.prevLayerHit[slot] = ownPosition(pat.prevLayerHit);
   out.lineAnchorHit[slot] = ownPosition(pat.lineAnchorHit);
   out.flags[slot] =
-      CudaPatternFlags::isFinalized |
       (pat.useBeamspot ? CudaPatternFlags::useBeamspot : 0u) |
       (pat.needLineUpdate ? CudaPatternFlags::needLineUpdate : 0u);
   out.status[slot] = CudaPatternStatus::ok;
@@ -829,7 +849,7 @@ __device__ void copyRecord(const CudaPatternRecordArrays& from,
   to.nDoF[toSlot] = from.nDoF[fromSlot];
   to.lastNDoF[toSlot] = from.lastNDoF[fromSlot];
   to.anchorRadius[toSlot] = from.anchorRadius[fromSlot];
-  to.meanNormResidual2[toSlot] = from.meanNormResidual2[fromSlot];
+  to.sumNormResidual2[toSlot] = from.sumNormResidual2[fromSlot];
   to.lastResidual[toSlot] = from.lastResidual[fromSlot];
   to.lastResSigma[toSlot] = from.lastResSigma[fromSlot];
   to.linePosX[toSlot] = from.linePosX[fromSlot];
@@ -862,16 +882,19 @@ __device__ void copyRecord(const CudaPatternRecordArrays& from,
 /// A finalized pattern record seen by the comparisons
 __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
                                   std::uint32_t slot) {
-  return PatternInfo{.sector = r.sector[slot],
-                     .patTheta = r.patTheta[slot],
-                     .patPhi = r.patPhi[slot],
-                     .patPhiOffset = r.patPhiOffset[slot],
-                     .anchorRadius = r.anchorRadius[slot],
-                     .nPhiLayers = r.nPhiLayers[slot],
-                     .nPrecisionLayers = r.nPrecisionLayers[slot],
-                     .nTriggerLayers = r.nTriggerLayers[slot],
-                     .meanResidual2 = r.meanNormResidual2[slot],
-                     .nHits = r.nHits[slot]};
+  return PatternInfo{
+      .sector = r.sector[slot],
+      .patTheta = r.patTheta[slot],
+      .patPhi = r.patPhi[slot],
+      .patPhiOffset = r.patPhiOffset[slot],
+      .anchorRadius = r.anchorRadius[slot],
+      .nPhiLayers = r.nPhiLayers[slot],
+      .nPrecisionLayers = r.nPrecisionLayers[slot],
+      .nTriggerLayers = r.nTriggerLayers[slot],
+      .meanResidual2 =
+          r.sumNormResidual2[slot] /
+          (r.nDoF[slot] > 1u ? static_cast<double>(r.nDoF[slot]) : 1.),
+      .nHits = r.nHits[slot]};
 }
 
 }  // namespace

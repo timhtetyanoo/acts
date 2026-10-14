@@ -340,7 +340,7 @@ struct WarpSeed {
     return priorityKey(
         good, parent.nBendingLayers() + 1u,
         parent.nPrecisionLayers + (b.isPrecision(pos) ? 1u : 0u),
-        (parent.meanNormResidual2 + Math::square(res.residual / res.sigma)) /
+        (parent.sumNormResidual2 + Math::square(res.residual / res.sigma)) /
             (parent.nDoF + res.nDof));
   }
 
@@ -746,6 +746,9 @@ struct WarpSeed {
       }
       b.moveLineAnchorHit(start, seedPos);
       start.lastInsertedHit = seedPos;
+      start.lastResidual = 0.;
+      start.lastResSigma = 0.;
+      start.lastNDoF = 0u;
       start.family = static_cast<std::uint16_t>(f);
     }
     __syncwarp();
@@ -763,22 +766,19 @@ struct WarpSeed {
       last = begin;
     }
 
-    // The overlaps inside each family, as at the end of each backward pass of
-    // the CPU, then among all of them
+    // The quality cuts, then the overlaps inside each family, as at the end
+    // of each backward pass of the CPU, then among all of them
+    for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
+      Pattern& pat{pattern(current, k)};
+      pat.isOverlap = pat.isOverlap || !b.passPatternCuts(pat);
+    }
+    __syncwarp();
     if (n > 1u) {
       resolveOverlaps(current, n, true);
       resolveOverlaps(current, n, false);
     }
 
-    // Finalize, keep the patterns that pass the cuts and list them
-    for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
-      Pattern& pat{pattern(current, k)};
-      if (!pat.isOverlap) {
-        pat.meanNormResidual2 /= pat.nDoF;
-        pat.isOverlap = !b.passPatternCuts(pat);
-      }
-    }
-    __syncwarp();
+    // List the kept patterns
     const std::uint32_t nKept{warpExclusiveScan(
         n,
         [&](std::uint32_t k) {
@@ -923,7 +923,7 @@ __device__ void carveRecords(CudaPatternRecordArrays& r, char* base,
   take(r.nDoF, n);
   take(r.lastNDoF, n);
   take(r.anchorRadius, n);
-  take(r.meanNormResidual2, n);
+  take(r.sumNormResidual2, n);
   take(r.lastResidual, n);
   take(r.lastResSigma, n);
   take(r.linePosX, n);
@@ -1092,7 +1092,7 @@ __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
     if (j <= i ||
         !Math::ExpandedSector::isNeighbour(event.sector[i], event.sector[j]) ||
         std::abs(event.patTheta[i] - event.patTheta[j]) >
-            2. * cfg.maxThetaSizeOverlap) {
+            cfg.maxThetaSizeOverlap) {
       continue;
     }
     linkPair(hits, cfg, event, good, links, wordsPerRow, i, j);
