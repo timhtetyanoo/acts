@@ -476,8 +476,6 @@ struct CudaPatternFlags {
   static constexpr std::uint8_t useBeamspot = 1u << 0u;
   /// @brief The line has to be recomputed when a hit is added on a new layer
   static constexpr std::uint8_t needLineUpdate = 1u << 1u;
-  /// @brief The pattern has passed the quality cuts
-  static constexpr std::uint8_t isFinalized = 1u << 2u;
   /// @brief The pattern lost against an overlapping one and is dropped
   static constexpr std::uint8_t isOverlap = 1u << 3u;
 };
@@ -517,10 +515,9 @@ struct CudaPatternRecordRow {
   double bendPlaneCovPhiPhi{0.};
   double bendPlaneCovSS{0.};
   double bendPlaneCovPhiS{0.};
-  /// @brief While the pattern is built, the sum over its eta hits of the
-  ///        squared residual over uncertainty. Divided by the number of
-  ///        degrees of freedom once the pattern is finalized, as on the CPU
-  double meanNormResidual2{0.};
+  /// @brief The sum over the pattern's eta hits of the squared residual over
+  ///        uncertainty, PatternStateAux::sumNormResidual2
+  double sumNormResidual2{0.};
   /// @brief Degrees of freedom of the residuals of the pattern
   std::uint32_t nDoF{0u};
   /// @brief Residual, uncertainty and degrees of freedom of the last inserted
@@ -584,7 +581,7 @@ struct CudaPatternRecordArrays {
   std::uint8_t* lastNDoF = nullptr;
   double* anchorRadius = nullptr;
 
-  double* meanNormResidual2 = nullptr;
+  double* sumNormResidual2 = nullptr;
   double* lastResidual = nullptr;
   double* lastResSigma = nullptr;
 
@@ -653,7 +650,7 @@ struct CudaPatternRecordHostData {
   std::vector<std::uint8_t> lastNDoF;
   std::vector<double> anchorRadius;
 
-  std::vector<double> meanNormResidual2;
+  std::vector<double> sumNormResidual2;
   std::vector<double> lastResidual;
   std::vector<double> lastResSigma;
 

@@ -292,6 +292,9 @@ __host__ __device__ inline LineResidual lineResidual(
   }
   const Vector3 resDir{R / res.residual};
   const double alpha{KdotD / line.leverArm};
+  // Unit vector along the bending plane
+  const double eRX{plane.normal.y};
+  const double eRY{-plane.normal.x};
 
   double phiPlaneDerivativeAcc{0.};
   double phiDisplDerivativeAcc{0.};
@@ -310,7 +313,8 @@ __host__ __device__ inline LineResidual lineResidual(
     const Vector3 trfDir{resDir - projFactor * plane.normal};
 
     residualCovAcc += square(preFactor) * intrinsicVariance(hit, trfDir, true);
-    phiPlaneDerivativeAcc += preFactor * projFactor * perp(pos);
+    phiPlaneDerivativeAcc +=
+        preFactor * projFactor * (pos.x * eRX + pos.y * eRY);
     phiDisplDerivativeAcc += preFactor * projFactor;
   };
 
@@ -682,7 +686,7 @@ struct CudaPatternFinderConfig {
   double phiTolerance{3. * CudaPatternMath::pi / 180.};
   double loosenAcceptanceFactor{2.};
   double minHitDistance4Line{40.};
-  double maxThetaSizeOverlap{0.05};
+  double maxThetaSizeOverlap{5. * CudaPatternMath::pi / 180.};
   double lowConfidenceResSigma{50.};
   double meanNormRes2Cut{0.2};
   std::uint32_t minStripEtaLayers{3u};

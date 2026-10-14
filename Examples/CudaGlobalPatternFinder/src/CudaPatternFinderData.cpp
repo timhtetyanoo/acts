@@ -91,7 +91,7 @@ constexpr auto patternSlotColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.lastNDoF, device.lastNDoF);
   visit(host.anchorRadius, device.anchorRadius);
 
-  visit(host.meanNormResidual2, device.meanNormResidual2);
+  visit(host.sumNormResidual2, device.sumNormResidual2);
   visit(host.lastResidual, device.lastResidual);
   visit(host.lastResSigma, device.lastResSigma);
 
@@ -682,7 +682,7 @@ void CudaPatternRecordContainer::setPattern(size_type patternSlot,
   m_host.lastNDoF[p] = row.lastNDoF;
   m_host.anchorRadius[p] = row.anchorRadius;
 
-  m_host.meanNormResidual2[p] = row.meanNormResidual2;
+  m_host.sumNormResidual2[p] = row.sumNormResidual2;
   m_host.lastResidual[p] = row.lastResidual;
   m_host.lastResSigma[p] = row.lastResSigma;
 
@@ -732,7 +732,7 @@ CudaPatternRecordRow CudaPatternRecordContainer::pattern(
   row.lastNDoF = m_host.lastNDoF[p];
   row.anchorRadius = m_host.anchorRadius[p];
 
-  row.meanNormResidual2 = m_host.meanNormResidual2[p];
+  row.sumNormResidual2 = m_host.sumNormResidual2[p];
   row.lastResidual = m_host.lastResidual[p];
   row.lastResSigma = m_host.lastResSigma[p];
 
