@@ -103,8 +103,6 @@ class ExpandedSector {
   Index_t sector() const;
   /// @brief Returns the phi angle of the expanded sector
   double phi() const;
-  /// @brief Returns the vector pointing radially along the sector plane
-  Acts::Vector3 radialDir() const;
   /// @brief Returns the vector that is normal to the plane spanned
   ///         by the expanded sector
   Acts::Vector3 normalDir() const;
@@ -246,8 +244,8 @@ using SearchTree_t = GlobalPatternFinder_t::SearchTree_t;
 
 /// @brief Structure to hold the search tree data
 struct SearchTreeData {
-  /// @brief Vector of strip hits
-  std::vector<HitPayload> stripPayloads;
+  /// @brief The hit payloads the tree points to
+  std::vector<HitPayload> hitPayloads;
   /// @brief The search tree
   SearchTree_t tree;
 };
