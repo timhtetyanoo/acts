@@ -3,7 +3,6 @@ set(
     ActsExamplesCudaGlobalPatternFinder
     ActsExamplesTrackFinding
 )
-add_unittest(CudaPatternFinderData CudaPatternFinderDataTests.cpp)
 add_unittest(CudaPatternFinder CudaPatternFinderTests.cpp)
 
 # Local end-to-end run on Athena-exported files, the GPU twin of

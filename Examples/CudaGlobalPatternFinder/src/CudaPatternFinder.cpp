@@ -150,13 +150,13 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   auto microseconds = [](Clock::duration d) {
     return std::chrono::duration<double, std::micro>(d).count();
   };
+  const auto hostPreStart = Clock::now();
   const SurfaceTable& surfaces{surfaceTable(gctx)};
   const Acts::TrackingGeometry& geometry{*m_cfg.trackingGeometry};
 
   // The hits the finding uses, and the transform of every bucket into the
   // global frame; positions, the search and the candidate lists are made on
   // the device
-  const auto treeStart = Clock::now();
   // Per row: the bucket and the space point, for the payloads of the kept
   // patterns; per bucket: its rows
   std::vector<std::uint32_t> usedBucket{};
@@ -188,9 +188,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       usedPointer.push_back(&sp);
     }
   }
-  if (timing != nullptr) {
-    timing->treeUs = microseconds(Clock::now() - treeStart);
-  }
   if (usedPointer.empty()) {
     return {};
   }
@@ -200,7 +197,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   // read (row r being space point r, every bucket keeping its number) and
   // the bucket transforms. The positions and the payloads, which the device
   // makes, follow the copied part in the same device block
-  const auto fillStart = Clock::now();
   std::unique_ptr<Workspace> workspace{acquireWorkspace()};
   const WorkspaceReturn giveBack{*this, workspace};
   const cudaStream_t stream{workspace->stream.get()};
@@ -283,10 +279,11 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   stage(block);
   auto* nMissing = reinterpret_cast<std::uint32_t*>(block.host + missingAt);
   if (timing != nullptr) {
-    timing->fillUs = microseconds(Clock::now() - fillStart);
+    timing->hostPreUs = microseconds(Clock::now() - hostPreStart);
   }
 
-  std::array<cudaEvent_t, 2> uploadMarks{};
+  // The copy, then the payload kernel, which counts towards the kernels
+  std::array<cudaEvent_t, 3> uploadMarks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : uploadMarks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
@@ -310,19 +307,17 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   CudaCandidateListContainer lists{};
   findCudaCandidates(deviceSpacePoints, search, selection, lists,
-                     workspace->readback, stream,
-                     timing != nullptr ? &timing->searchUs : nullptr);
+                     workspace->readback, stream);
   if (timing != nullptr) {
-    float ms{0.f};
-    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
-    timing->uploadUs = 1000. * ms;
-    for (cudaEvent_t& mark : uploadMarks) {
-      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
-    }
     timing->nSeeds = lists.nSeeds();
     timing->nCandidates = lists.nCandidates();
   }
   if (lists.empty()) {
+    for (cudaEvent_t& mark : uploadMarks) {
+      if (mark != nullptr) {
+        ACTS_CUDA_CHECK(cudaEventDestroy(mark));
+      }
+    }
     return {};
   }
 
@@ -334,6 +329,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   ACTS_CUDA_CHECK(cudaMemcpyAsync(nMissing, deviceMissing,
                                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
                                   stream));
+  if (timing != nullptr) {
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[2], stream));
+  }
 
   CudaPatternFinderSizes sizes{m_cfg.sizes};
   if (m_arenaBytes > 0u) {
@@ -343,6 +341,16 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   const CudaPatternRecordContainer event{findCudaPatternsInEta(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
       stream, timing, &workspace->readback)};
+  if (timing != nullptr) {
+    float ms{0.f};
+    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
+    timing->uploadUs = 1000. * ms;
+    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[1], uploadMarks[2]));
+    timing->kernelsUs += 1000. * ms;
+    for (cudaEvent_t& mark : uploadMarks) {
+      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
+    }
+  }
   if (*nMissing != 0u) {
     throw std::runtime_error(std::format(
         "CudaGlobalPatternFinder: {} hits have no measurement surface",
@@ -357,7 +365,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
 
   // The payloads of the hits of the kept patterns, on the host, for the
   // phi-only hits and the conversion
-  const auto tailStart = Clock::now();
+  const auto hostPostStart = Clock::now();
   std::vector<std::optional<HitPayload>> payloads(usedPointer.size());
   auto payloadOf = [&](std::uint32_t row) -> const HitPayload& {
     std::optional<HitPayload>& payload{payloads[row]};
@@ -374,7 +382,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   ACTS_DEBUG(__func__ << "() Found " << output.size() << " patterns from "
                       << lists.nSeeds() << " seeds");
   if (timing != nullptr) {
-    timing->tailUs = microseconds(Clock::now() - tailStart);
+    timing->hostPostUs = microseconds(Clock::now() - hostPostStart);
   }
   return output;
 }

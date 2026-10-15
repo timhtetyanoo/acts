@@ -805,16 +805,10 @@ struct Candidate {
   std::uint32_t pad{0u};
 };
 
-/// One seed built by one warp. Every lane holds this object; the lanes share
-/// the patterns and the scratch of the seed, and every loop below runs the
-/// same number of times in all of them.
-///
-/// The patterns live in two regions that the layers swap between. A slot
-/// holds a pattern followed by its hit positions, as many as the seed's
-/// candidate list has layers: a pattern holds at most one hit per layer, so
-/// this cannot overflow. Regions and scratch are taken from the event's
-/// arena as the seed needs them and grow by doubling; what a region held
-/// before it grew is not needed any more when it grows.
+/// One seed built by one warp; every lane holds this object. The patterns
+/// live in two regions that the layers swap between, taken from the event's
+/// arena and grown by doubling. A slot holds a pattern and one hit position
+/// per layer of the seed's list.
 struct WarpSeed {
   SeedBuilder b;
   Arena arena;
@@ -1074,21 +1068,10 @@ struct WarpSeed {
     __syncwarp();
   }
 
-  /// The patterns of a layer, the positions [first, last) of the candidate
-  /// list, tested against the n patterns of region `from`; the continued
-  /// patterns are written to region `to`. Returns their number.
-  ///
-  ///  1. prune: a pattern that missed too many layers in this group, compared
-  ///     to the others of its family, is dropped, and of the patterns of a
-  ///     family that end on the same hit only the first in priority stays;
-  ///  2. test: every hit of the layer against every pattern, against the line
-  ///     the pattern had before the layer, 32 hits at a time;
-  ///  3. room: the patterns of the layer are counted before any is written,
-  ///     and when they do not all fit the best are kept (selectBest);
-  ///  4. rebuild: each compatible hit gives a child, the pattern with the
-  ///     hit. A pattern carries on as it is unless it took a hit of normal
-  ///     confidence.
-  /// A pattern of region `from` marked isOverlap takes no part.
+  /// Extends the n patterns of region `from` by the layer at candidate
+  /// positions [first, last) into region `to`, and returns their number:
+  /// prune, test every (pattern, hit) pair, make room (keeping the best if
+  /// short), then grow a child per accepted hit.
   __device__ __forceinline__ std::uint32_t extendLayer(std::uint32_t from,
                                                        std::uint32_t n,
                                                        std::uint32_t to,
@@ -2508,18 +2491,10 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
                         const CudaSearchArrays& search,
                         const CudaSeedSelection& selection,
                         CudaCandidateListContainer& lists,
-                        CudaPinnedBuffer& readback, cudaStream_t stream,
-                        double* searchUs) {
+                        CudaPinnedBuffer& readback, cudaStream_t stream) {
   lists = CudaCandidateListContainer{};
   if (search.nHits == 0u) {
     return;
-  }
-  std::array<cudaEvent_t, 2> marks{};
-  if (searchUs != nullptr) {
-    for (cudaEvent_t& mark : marks) {
-      ACTS_CUDA_CHECK(cudaEventCreate(&mark));
-    }
-    ACTS_CUDA_CHECK(cudaEventRecord(marks[0], stream));
   }
   // The search's own memory, from the device's pool, released at the end
   std::vector<void*> blocks{};
@@ -2599,18 +2574,7 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
   ACTS_CUDA_CHECK(cudaMemcpyAsync(totals, buf.totals,
                                   2u * sizeof(std::uint32_t),
                                   cudaMemcpyDeviceToHost, stream));
-  if (searchUs != nullptr) {
-    ACTS_CUDA_CHECK(cudaEventRecord(marks[1], stream));
-  }
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
-  if (searchUs != nullptr) {
-    float ms{0.f};
-    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[0], marks[1]));
-    *searchUs = 1000. * ms;
-    for (cudaEvent_t& mark : marks) {
-      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
-    }
-  }
   const std::uint32_t nSeeds{totals[0]};
   const std::uint32_t nCandidates{totals[1]};
   if (nSeeds > 0u) {
@@ -2662,7 +2626,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     ACTS_CUDA_CHECK(cudaMemPoolSetAttribute(
         pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
   }
-  std::array<cudaEvent_t, 5> marks{};
+  std::array<cudaEvent_t, 3> marks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : marks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
@@ -2693,7 +2657,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   mark(0u);
   // The seed checks
   prepareCudaSeeds(hits, lists, cfg, stream);
-  mark(1u);
 
   // Every seed at once, with the memory of the arena; then the totals, which
   // size the event's patterns
@@ -2716,7 +2679,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     cfg, arena, results, counts);
     ACTS_CUDA_CHECK(cudaGetLastError());
   }
-  mark(2u);
   // The event's buffers, sized on the device by what the seeds produced,
   // then the patterns of every seed, the links of every pair and the rounds
   EventBuffers* eventBuffers{nullptr};
@@ -2740,7 +2702,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   // read, then their slots copied
   compactEventPatternsKernel<<<1, 256, 0, stream>>>(eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  mark(3u);
+  mark(1u);
   // The counts, then the block of the kept patterns, into page-locked memory
   CudaPinnedBuffer ownReadback{};
   CudaPinnedBuffer& pinned{readback != nullptr ? *readback : ownReadback};
@@ -2762,7 +2724,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     ready.compactedBase, ready.compactedBytes,
                                     cudaMemcpyDeviceToHost, stream));
   }
-  mark(4u);
+  mark(2u);
   release();
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
   if (ready.nKept > 0u) {
@@ -2779,11 +2741,8 @@ CudaPatternRecordContainer findCudaPatternsInEta(
       ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[from], marks[to]));
       return 1000. * ms;
     };
-    timing->seedsUs = elapsedUs(0u, 1u);
-    timing->buildUs = elapsedUs(1u, 2u);
-    timing->overlapsUs = elapsedUs(2u, 3u);
-    timing->kernelsUs = elapsedUs(0u, 3u);
-    timing->downloadUs = elapsedUs(3u, 4u);
+    timing->kernelsUs = elapsedUs(0u, 1u);
+    timing->downloadUs = elapsedUs(1u, 2u);
     timing->largestBeam = totals.largestBeam;
     timing->overflow = overflow;
     timing->nPatternsInEta = nKept[0];

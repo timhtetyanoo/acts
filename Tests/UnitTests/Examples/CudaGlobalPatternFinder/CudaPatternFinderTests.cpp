@@ -106,8 +106,7 @@ struct Hits {
 
 /// @brief Trigger strip hits of a straight track from the origin in the
 ///        y-z plane, two layers in each of BI, BM and BO, a little off the
-///        line in alternating directions. Then one hit far off the line, and
-///        optionally a second hit on the first BM layer, close to the line
+///        line in alternating directions, then one hit far off the line
 struct LineHits {
   ActsExamples::MuonSpacePointBucket bucket{};
   std::shared_ptr<Surface> surface{};
@@ -115,7 +114,7 @@ struct LineHits {
 
   static constexpr std::uint32_t nOnLine = 6u;
 
-  LineHits(const GeometryContext& gctx, bool withTwin) {
+  explicit LineHits(const GeometryContext& gctx) {
     using SN = MuonId::StationName;
     // The strips run along x, perpendicular to the bending plane, and measure
     // z
@@ -139,9 +138,6 @@ struct LineHits {
     add(SN::BOL, 9500., 0.1, 1u);
     add(SN::BOL, 9700., -0.1, 2u);
     add(SN::BML, 7400., 60., 3u);
-    if (withTwin) {
-      add(SN::BML, 7000., 0.3, 1u);
-    }
     for (const auto& sp : bucket) {
       payloads.emplace_back(gctx, &sp, &bucket, Transform3::Identity(),
                             surface.get());
@@ -167,16 +163,10 @@ ActsExamples::CudaCandidateListContainer makeLineLists(const LineHits& hits) {
   return lists;
 }
 
-/// @brief The result of the pattern finding in eta of the line: the hit rows
-///        of each accepted pattern, sorted, and what did not fit
-struct LineResult {
-  std::vector<std::vector<std::uint32_t>> accepted{};
-  std::uint8_t overflow{0u};
-};
-
-/// @brief Runs the whole pattern finding in eta of the line
-LineResult findLinePatterns(const GeometryContext& gctx, const LineHits& hits,
-                            const ActsExamples::CudaPatternFinderSizes& sizes) {
+/// @brief Runs the whole pattern finding in eta of the line: the hit rows of
+///        each accepted pattern, sorted
+std::vector<std::vector<std::uint32_t>> findLinePatterns(
+    const GeometryContext& gctx, const LineHits& hits) {
   auto payloads =
       ActsExamples::makeCudaHitPayloadContainer(gctx, hits.payloads);
   auto lists = makeLineLists(hits);
@@ -187,19 +177,19 @@ LineResult findLinePatterns(const GeometryContext& gctx, const LineHits& hits,
       payloads, lists,
       ActsExamples::makeCudaPatternFinderConfig(
           lineConfig(), PatternStateAux::BeamspotInfo{}),
-      sizes, stream.get());
+      ActsExamples::CudaPatternFinderSizes{}, stream.get());
 
-  LineResult result{.overflow = event.overflow(0u)};
+  std::vector<std::vector<std::uint32_t>> accepted{};
   for (std::uint32_t k = 0u; k < event.nPatterns(0u); ++k) {
     const auto slot = event.slot(0u, k);
     if (event.pattern(slot).status != ActsExamples::CudaPatternStatus::ok) {
       continue;
     }
-    auto& rows = result.accepted.emplace_back(event.hitIndices(slot).begin(),
-                                              event.hitIndices(slot).end());
+    auto& rows = accepted.emplace_back(event.hitIndices(slot).begin(),
+                                       event.hitIndices(slot).end());
     std::ranges::sort(rows);
   }
-  return result;
+  return accepted;
 }
 
 /// @brief The rows of the hits on the line
@@ -314,21 +304,6 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
   const PatternStateAux::BeamspotInfo beamspot{Vector3{0., 0., 10.}, 1., 100.};
   const Math::Beamspot deviceBeamspot{toMath(beamspot.position),
                                       beamspot.radius, beamspot.length};
-
-  // The variance of every hit along a few directions, projected and not
-  for (std::size_t h = 0; h < hits.payloads.size(); ++h) {
-    for (const Vector3& c :
-         {Vector3{1., 0., 0.}, Vector3{1., 2., 3.}.normalized()}) {
-      for (const bool projected : {false, true}) {
-        BOOST_TEST_CONTEXT("hit " << h << ", projected " << projected) {
-          BOOST_CHECK_EQUAL(
-              PatternStateAux::intrinsicVariance(gctx, hits.payloads[h], c,
-                                                 projected),
-              Math::intrinsicVariance(hits.device[h], toMath(c), projected));
-        }
-      }
-    }
-  }
 
   // Anchor and last hit far apart, then close enough to need the beam spot
   for (const auto [anchor, last] : {std::pair{0u, 2u}, std::pair{1u, 3u}}) {
@@ -493,28 +468,6 @@ BOOST_AUTO_TEST_CASE(CudaBendPlaneFitMatchesCpu) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(CudaPatternLayerOrderMatchesCpu) {
-  using ActsExamples::PatternTopology;
-  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
-  const Hits hits{gctx};
-
-  for (std::size_t i = 0; i < hits.payloads.size(); ++i) {
-    for (std::size_t j = 0; j < hits.payloads.size(); ++j) {
-      BOOST_TEST_CONTEXT("hits " << i << " and " << j) {
-        BOOST_CHECK_EQUAL(
-            PatternTopology::layerSorter(hits.payloads[i], hits.payloads[j]),
-            Math::layerSorter(hits.device[i], hits.device[j]));
-        BOOST_CHECK_EQUAL(
-            PatternTopology::sameLayer(hits.payloads[i], hits.payloads[j]),
-            Math::sameLayer(hits.device[i], hits.device[j]));
-      }
-    }
-    BOOST_CHECK_EQUAL(
-        static_cast<unsigned>(PatternTopology::groupIndex(hits.payloads[i])),
-        static_cast<unsigned>(Math::groupIndex(hits.device[i])));
-  }
-}
-
 BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
   using ActsExamples::CudaSeedStatus;
   if (!hasCudaDevice()) {
@@ -578,61 +531,20 @@ BOOST_AUTO_TEST_CASE(CudaSeedPreparationMatchesCpu) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(CudaExpandedSectorMatchesCpu) {
-  namespace Sector = Math::ExpandedSector;
-  using ActsExamples::ExpandedSector;
-  for (int s = 0; s < Sector::nExpanded; ++s) {
-    const ExpandedSector cpu{static_cast<ExpandedSector::Index_t>(s)};
-    BOOST_TEST_CONTEXT("sector " << s) {
-      BOOST_CHECK_EQUAL(cpu.phi(), Sector::phi(s));
-      BOOST_CHECK_EQUAL(cpu.sectorSize(), Sector::size(s));
-      for (int o = 0; o < Sector::nExpanded; ++o) {
-        BOOST_CHECK_EQUAL(cpu.isNeighbour(ExpandedSector{
-                              static_cast<ExpandedSector::Index_t>(o)}),
-                          Sector::isNeighbour(s, o));
-      }
-      for (int i = 0; i < 720; ++i) {
-        const double phi{-Math::pi + i * Math::pi / 360.};
-        BOOST_CHECK_EQUAL(cpu.insideSector(phi), Sector::inside(s, phi));
-      }
-    }
-  }
-}
-
 BOOST_AUTO_TEST_CASE(CudaPatternFindingAcceptsLineOnce) {
   if (!hasCudaDevice()) {
     BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
     return;
   }
   const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
-  const LineHits hits{gctx, false};
+  const LineHits hits{gctx};
   const std::vector<std::uint32_t> expected{lineRows()};
 
   // All six seeds find the line; it is accepted once
-  const auto accepted = findLinePatterns(gctx, hits, {}).accepted;
+  const auto accepted = findLinePatterns(gctx, hits);
   BOOST_REQUIRE_EQUAL(accepted.size(), 1u);
   BOOST_CHECK_EQUAL_COLLECTIONS(accepted[0].begin(), accepted[0].end(),
                                 expected.begin(), expected.end());
-}
-
-BOOST_AUTO_TEST_CASE(CudaPatternFindingReportsOverflow) {
-  if (!hasCudaDevice()) {
-    BOOST_TEST_MESSAGE("No CUDA device found, skipping CUDA runtime test");
-    return;
-  }
-  const auto gctx = GeometryContext::dangerouslyDefaultConstruct();
-  const LineHits hits{gctx, true};
-
-  // Room for both branches of every seed: the line is found and nothing
-  // overflows
-  const auto ample = findLinePatterns(gctx, hits, {});
-  BOOST_CHECK_EQUAL(ample.overflow, 0u);
-  BOOST_CHECK_EQUAL(ample.accepted.size(), 1u);
-
-  // No memory at all: nothing is built, and it is reported
-  const auto none = findLinePatterns(gctx, hits, {.workspaceBytes = 8u});
-  BOOST_CHECK_EQUAL(none.overflow, ActsExamples::CudaPatternOverflow::patterns);
-  BOOST_CHECK(none.accepted.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

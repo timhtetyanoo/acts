@@ -109,20 +109,8 @@ struct CudaHitFlags {
   static constexpr std::uint8_t precision = 1u << 3u;
 };
 
-/// @brief One hit payload as plain numbers, the way the host container takes and
-///        returns it.
-///
-/// The values are what the pattern finder reads from a hit through the
-/// GlobPatFinderHit interface, evaluated once on the host. A kernel cannot call
-/// the surface or the space point, so everything that depends on them is here:
-///
-///  - the position and the sensor direction;
-///  - what PatternStateAux::intrinsicVariance reads to contract the hit
-///    covariance along a direction: the space point covariance, the drift
-///    variance of a straw and the measured directions of a strip
-///    (stripMeasurementDirections);
-///  - the identifier of its measurement surface for the overlap test and the
-///    station and layer numbers that the layer ordering is made of.
+/// @brief One hit payload as plain numbers: what the pattern finder reads from
+///        a hit, without the surface or the space point.
 struct CudaHitPayloadRow {
   /// @brief Global position of the hit
   Acts::Vector3 position{Acts::Vector3::Zero()};
@@ -263,45 +251,10 @@ class CudaHitPayloadContainer {
   /// @brief Checks whether the container is empty.
   bool empty() const noexcept { return size() == 0; }
 
-  /// @brief Sets the quantities of one hit payload.
-  /// @param index The hit payload index.
-  /// @param position The global position of the hit.
-  /// @param localPositionY The local y coordinate of the space point.
-  /// @param stationKey The station key as returned by stationKey().
-  /// @param station The station index of the hit.
-  /// @param locLayer The layer number in the sector frame.
-  void setHit(size_type index, const Acts::Vector3& position,
-              double localPositionY, std::uint32_t stationKey,
-              std::uint8_t station, std::uint8_t locLayer);
-
   /// @brief Sets every quantity of one hit payload.
   /// @param index The hit payload index.
   /// @param row The quantities of the hit.
   void setHit(size_type index, const CudaHitPayloadRow& row);
-
-  /// @brief Returns every quantity of one hit payload.
-  /// @param index The hit payload index.
-  CudaHitPayloadRow hit(size_type index) const;
-
-  /// @brief Returns the global position of a hit payload.
-  /// @param index The hit payload index.
-  Acts::Vector3 position(size_type index) const;
-
-  /// @brief Returns the local y coordinate of a hit payload.
-  /// @param index The hit payload index.
-  double localPositionY(size_type index) const;
-
-  /// @brief Returns the station key of a hit payload.
-  /// @param index The hit payload index.
-  std::uint32_t stationKey(size_type index) const;
-
-  /// @brief Returns the station index of a hit payload.
-  /// @param index The hit payload index.
-  std::uint8_t station(size_type index) const;
-
-  /// @brief Returns the layer number in the sector frame of a hit payload.
-  /// @param index The hit payload index.
-  std::uint8_t locLayer(size_type index) const;
 
   /// @brief Copies all host columns on a CUDA stream.
   /// The method waits only for the supplied stream.
@@ -315,10 +268,6 @@ class CudaHitPayloadContainer {
   /// @param size The number of hit payloads
   /// @param block The block the columns are placed in
   void placeOnDevice(size_type size, CudaStagedBlock& block);
-
-  /// @brief Copies all device columns on a CUDA stream.
-  /// The method waits only for the supplied stream.
-  void moveToHost(cudaStream_t stream);
 
   /// @brief Releases all device memory.
   void clearDevice() noexcept;
@@ -341,15 +290,9 @@ class CudaHitPayloadContainer {
 };
 
 /// @brief Device-side raw structure-of-arrays view of the per-seed candidate
-///        lists. The structure holds raw device pointers and owns no memory.
-///        CUDA kernels receive it by value.
-///
-/// Seed s owns the candidate hit rows
-/// `[candidateOffsets[s], candidateOffsets[s + 1])` of candidateIndices.
-/// Those rows are indices into CudaHitPayloadContainer. The lists are the
-/// output of the host tree range search; the skip rule is not applied. The
-/// seed preparation kernel sorts each list in place and fills the output
-/// columns.
+///        lists. It owns no memory; kernels receive it by value. Seed s owns
+///        the payload rows [candidateOffsets[s], candidateOffsets[s + 1]) of
+///        candidateIndices, which the seed checks sort in place.
 struct CudaCandidateArrays {
   std::uint32_t* seedHitIndex = nullptr;
   double* seedSector = nullptr;
@@ -474,31 +417,11 @@ class CudaCandidateListContainer {
         std::span<const std::uint32_t>{hitIndices.begin(), hitIndices.size()});
   }
 
-  /// @brief Overwrites the header of an existing seed. The candidate range
-  ///        is left as it is
-  void setSeed(size_type seed, std::uint32_t seedHitIndex, double sector,
-               double theta);
-
-  /// @brief Overwrites one flat candidate entry
-  void setCandidate(size_type index, std::uint32_t hitIndex);
-
-  /// @brief Payload row of the seed hit
-  std::uint32_t seedHitIndex(size_type seed) const;
-
-  /// @brief Tree sector coordinate of the seed
-  double seedSector(size_type seed) const;
-
-  /// @brief Tree theta coordinate of the seed
-  double seedTheta(size_type seed) const;
-
   /// @brief First candidate of a seed, as an index into the flat list
   size_type candidateBegin(size_type seed) const;
 
   /// @brief One-past-last candidate of a seed, as an index into the flat list
   size_type candidateEnd(size_type seed) const;
-
-  /// @brief Payload row of one candidate of a seed
-  std::uint32_t candidateHitIndex(size_type seed, size_type local) const;
 
   /// @brief Payload rows of every candidate of a seed
   std::span<const std::uint32_t> candidateHitIndices(size_type seed) const;
@@ -548,7 +471,6 @@ class CudaCandidateListContainer {
   bool m_deviceOnly = false;
 
   void checkSeed(size_type seed) const;
-  void checkCandidate(size_type index) const;
 };
 
 /// @brief Position in a pattern's own hit list that marks an unset hit
@@ -639,20 +561,11 @@ struct CudaPatternRecordRow {
   std::uint8_t status{CudaPatternStatus::empty};
 };
 
-/// @brief Device-side raw structure-of-arrays view of the pattern records.
-///        The structure holds raw device pointers and owns no memory. CUDA
-///        kernels receive it by value.
-///
-/// Every seed owns capacityPerSeed pattern slots, in order:
-///
-///   seed 0: slot 0, slot 1, ..., slot capacityPerSeed - 1
-///   seed 1: slot 0, ...
-///
-/// so a seed writes only its own slots and the output order does not depend on
-/// the order the threads run in. nPatterns[seed] is how many of them the seed
-/// filled, and overflow[seed] holds the CudaPatternOverflow bits of what did
-/// not fit; such a seed is built again with more room. Each pattern slot owns
-/// maxHitsPerPattern hit slots.
+/// @brief Device-side raw structure-of-arrays view of the pattern records. It
+///        owns no memory; kernels receive it by value. Entry e holds
+///        capacityPerSeed pattern slots, nPatterns[e] of them filled, and
+///        overflow[e] holds the CudaPatternOverflow bits. Each pattern slot
+///        owns maxHitsPerPattern hit slots.
 struct CudaPatternRecordArrays {
   std::int8_t* sector = nullptr;
 
@@ -831,22 +744,8 @@ class CudaPatternRecordContainer {
   std::uint8_t overflow(size_type seed) const;
   void setOverflow(size_type seed, std::uint8_t overflow);
 
-  /// @brief Sets every quantity of one pattern slot except the hit list
-  void setPattern(size_type patternSlot, const CudaPatternRecordRow& row);
-
   /// @brief Returns every quantity of one pattern slot except the hit list
   CudaPatternRecordRow pattern(size_type patternSlot) const;
-
-  /// @brief Sets one hit of a pattern slot
-  /// @param patternSlot The pattern slot
-  /// @param local The hit slot inside the pattern
-  /// @param hitIndex The payload row of the hit
-  /// @param globLayer The global layer number of the hit
-  void setHit(size_type patternSlot, size_type local, std::uint32_t hitIndex,
-              std::uint16_t globLayer = 0u);
-
-  /// @brief Sets how many hit slots of a pattern slot are in use
-  void setNHits(size_type patternSlot, std::uint32_t nHits);
 
   /// @brief Returns how many hit slots of a pattern slot are in use
   std::uint32_t nHits(size_type patternSlot) const;
@@ -859,14 +758,6 @@ class CudaPatternRecordContainer {
 
   /// @brief Payload rows of the used hits of a pattern slot
   std::span<const std::uint32_t> hitIndices(size_type patternSlot) const;
-
-  /// @brief Allocates the device buffers and zeroes the counts, the overflow
-  ///        flags and the slot status. Nothing is uploaded.
-  void moveToDevice(cudaStream_t stream);
-
-  /// @brief Copies the counts, the overflow flags and every slot to the host.
-  /// The method waits only for the supplied stream.
-  void moveToHost(cudaStream_t stream);
 
   /// @brief Releases all device memory.
   void clearDevice() noexcept;
@@ -902,14 +793,9 @@ constexpr std::size_t cudaHitEtaCovarianceIndex = 1u;
 ///        MuonSpacePoint::covariance()
 constexpr std::size_t cudaHitPhiCovarianceIndex = 0u;
 
-/// @brief Evaluates, on the host, everything the pattern finder reads from a
-///        hit, so that a kernel needs neither the surface nor the space point.
-///
-/// The function takes the hit type as a template parameter and reads the public
-/// members of ActsExamples::HitPayload, so that the CUDA library has no
-/// dependency on the track finding library. Each quantity is computed with the
-/// formula of the CPU hit, in the same order of operations, because the device
-/// has to reproduce the CPU residuals.
+/// @brief Evaluates on the host what the pattern finder reads from a hit, with
+///        the formulas of the CPU hit. Templated so that the CUDA library does
+///        not depend on the track finding library.
 ///
 /// @tparam Payload The hit payload type, ActsExamples::HitPayload
 /// @param gctx The geometry context
@@ -983,58 +869,6 @@ CudaHitPayloadContainer makeCudaHitPayloadContainer(
     container.setHit(row, makeCudaHitPayloadRow(gctx, hits[row]));
   }
   return container;
-}
-
-/// @brief Builds the per-seed candidate lists of an event from the host tree,
-///        as the CPU seed loop does.
-///
-/// Every tree entry is a seed candidate, in the order of the tree. An entry
-/// that is not good for seeding is left out; every other gets the hits of the
-/// same range search the CPU makes, in the order the search returns them. A
-/// hit enters the tree once per sector it is projected into, so the same hit
-/// can be several seeds. The skip rule is not applied: it depends on the
-/// patterns found before a seed and is replayed by the driver.
-///
-/// @tparam Finder The pattern finder, for its tree and coordinate types
-///         (ActsExamples::GlobalPatternFinder_t)
-/// @param tree The search tree. Its entries point into payloads
-/// @param payloads The hit payloads, in the order of the payload container rows
-/// @param seedSelector The seed selector of the pattern finder
-/// @return The candidate lists, on the host
-template <typename Finder, typename Payload, typename Selector>
-CudaCandidateListContainer makeCudaCandidateLists(
-    const typename Finder::SearchTree_t& tree,
-    const std::vector<Payload>& payloads, const Selector& seedSelector) {
-  using HitCoords = typename Finder::HitCoords;
-  constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
-  constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);
-  auto row = [&payloads](const Payload* hit) {
-    return static_cast<std::uint32_t>(hit - payloads.data());
-  };
-
-  CudaCandidateListContainer lists{};
-  std::vector<std::uint32_t> candidates{};
-  for (const auto& [seedCoords, seedPtr] : tree) {
-    if (!seedSelector.goodForSeeding(*seedPtr)) {
-      continue;
-    }
-    // The window of GlobalPatternFinder::findPatternsInEta
-    typename Finder::SearchTree_t::range_t selectRange{};
-    selectRange[sectorIdx].shrink(seedCoords[sectorIdx] - 0.1,
-                                  seedCoords[sectorIdx] + 0.1);
-    const double thetaHalfWindow{seedSelector.thetaSearchWindow(*seedPtr) / 2.};
-    selectRange[thetaIdx].shrink(seedCoords[thetaIdx] - thetaHalfWindow,
-                                 seedCoords[thetaIdx] + thetaHalfWindow);
-
-    candidates.clear();
-    tree.rangeSearchMapDiscard(selectRange,
-                               [&](const auto& /*coords*/, const Payload* hit) {
-                                 candidates.push_back(row(hit));
-                               });
-    lists.addSeed(row(seedPtr), seedCoords[sectorIdx], seedCoords[thetaIdx],
-                  candidates);
-  }
-  return lists;
 }
 
 }  // namespace ActsExamples

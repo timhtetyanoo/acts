@@ -267,21 +267,6 @@ CudaHitPayloadContainer::~CudaHitPayloadContainer() noexcept {
   clearDevice();
 }
 
-void CudaHitPayloadContainer::setHit(
-    size_type index, const Acts::Vector3& position, double localPositionY,
-    std::uint32_t stationKey, std::uint8_t station, std::uint8_t locLayer) {
-  // The quantities that are not given are reset, so that a row never keeps
-  // values of the hit that was there before
-  CudaHitPayloadRow row{};
-  row.position = position;
-  row.localPositionY = localPositionY;
-  row.stationKey = stationKey;
-  row.station = station;
-  row.locLayer = locLayer;
-
-  setHit(index, row);
-}
-
 void CudaHitPayloadContainer::setHit(size_type index,
                                      const CudaHitPayloadRow& row) {
   checkIndex(index);
@@ -316,67 +301,6 @@ void CudaHitPayloadContainer::setHit(size_type index,
   m_host.flags[index] = row.flags;
 }
 
-CudaHitPayloadRow CudaHitPayloadContainer::hit(size_type index) const {
-  checkIndex(index);
-
-  CudaHitPayloadRow row{};
-  row.position = {m_host.positionX[index], m_host.positionY[index],
-                  m_host.positionZ[index]};
-  row.sensorDirection = {m_host.sensorDirectionX[index],
-                         m_host.sensorDirectionY[index],
-                         m_host.sensorDirectionZ[index]};
-  row.etaMeasurementDirection = {m_host.etaMeasurementDirectionX[index],
-                                 m_host.etaMeasurementDirectionY[index],
-                                 m_host.etaMeasurementDirectionZ[index]};
-  row.phiMeasurementDirection = {m_host.phiMeasurementDirectionX[index],
-                                 m_host.phiMeasurementDirectionY[index],
-                                 m_host.phiMeasurementDirectionZ[index]};
-
-  row.localPositionY = m_host.localPositionY[index];
-  row.etaCovariance = m_host.etaCovariance[index];
-  row.phiCovariance = m_host.phiCovariance[index];
-  row.driftCovariance = m_host.driftCovariance[index];
-
-  row.geometryId = m_host.geometryId[index];
-  row.stationKey = m_host.stationKey[index];
-  row.station = m_host.station[index];
-  row.locLayer = m_host.locLayer[index];
-  row.flags = m_host.flags[index];
-
-  return row;
-}
-
-Acts::Vector3 CudaHitPayloadContainer::position(size_type index) const {
-  checkIndex(index);
-
-  return Acts::Vector3{m_host.positionX[index], m_host.positionY[index],
-                       m_host.positionZ[index]};
-}
-
-double CudaHitPayloadContainer::localPositionY(size_type index) const {
-  checkIndex(index);
-
-  return m_host.localPositionY[index];
-}
-
-std::uint32_t CudaHitPayloadContainer::stationKey(size_type index) const {
-  checkIndex(index);
-
-  return m_host.stationKey[index];
-}
-
-std::uint8_t CudaHitPayloadContainer::station(size_type index) const {
-  checkIndex(index);
-
-  return m_host.station[index];
-}
-
-std::uint8_t CudaHitPayloadContainer::locLayer(size_type index) const {
-  checkIndex(index);
-
-  return m_host.locLayer[index];
-}
-
 void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   clearDevice();
 
@@ -384,14 +308,6 @@ void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   copyColumnsToDevice(hitPayloadColumns, m_host, m_device, stream);
 
   m_onDevice = true;
-}
-
-void CudaHitPayloadContainer::moveToHost(cudaStream_t stream) {
-  if (!m_onDevice) {
-    return;
-  }
-
-  copyColumnsToHost(hitPayloadColumns, m_host, m_device, stream);
 }
 
 void CudaHitPayloadContainer::clearDevice() noexcept {
@@ -463,41 +379,6 @@ void CudaCandidateListContainer::addSeed(
   m_host.candidateInfo.resize(m_host.candidateIndices.size(), 0u);
 }
 
-void CudaCandidateListContainer::setSeed(size_type seed,
-                                         std::uint32_t seedHitIndex,
-                                         double sector, double theta) {
-  checkSeed(seed);
-
-  m_host.seedHitIndex[seed] = seedHitIndex;
-  m_host.seedSector[seed] = sector;
-  m_host.seedTheta[seed] = theta;
-}
-
-void CudaCandidateListContainer::setCandidate(size_type index,
-                                              std::uint32_t hitIndex) {
-  checkCandidate(index);
-
-  m_host.candidateIndices[index] = hitIndex;
-}
-
-std::uint32_t CudaCandidateListContainer::seedHitIndex(size_type seed) const {
-  checkSeed(seed);
-
-  return m_host.seedHitIndex[seed];
-}
-
-double CudaCandidateListContainer::seedSector(size_type seed) const {
-  checkSeed(seed);
-
-  return m_host.seedSector[seed];
-}
-
-double CudaCandidateListContainer::seedTheta(size_type seed) const {
-  checkSeed(seed);
-
-  return m_host.seedTheta[seed];
-}
-
 CudaCandidateListContainer::size_type
 CudaCandidateListContainer::candidateBegin(size_type seed) const {
   checkSeed(seed);
@@ -510,21 +391,6 @@ CudaCandidateListContainer::size_type CudaCandidateListContainer::candidateEnd(
   checkSeed(seed);
 
   return m_host.candidateOffsets[seed + 1u];
-}
-
-std::uint32_t CudaCandidateListContainer::candidateHitIndex(
-    size_type seed, size_type local) const {
-  const size_type begin{candidateBegin(seed)};
-  const size_type index{begin + local};
-  if (index >= candidateEnd(seed)) {
-    std::stringstream ss;
-    ss << "CudaCandidateListContainer: local candidate " << local
-       << " is out of range for seed " << seed << " with " << nCandidates(seed)
-       << " candidates";
-    throw std::out_of_range(ss.str());
-  }
-
-  return m_host.candidateIndices[index];
 }
 
 std::span<const std::uint32_t> CudaCandidateListContainer::candidateHitIndices(
@@ -628,15 +494,6 @@ void CudaCandidateListContainer::checkSeed(size_type seed) const {
     std::stringstream ss;
     ss << "CudaCandidateListContainer: seed " << seed << " is out of range for "
        << nSeeds() << " seeds";
-    throw std::out_of_range(ss.str());
-  }
-}
-
-void CudaCandidateListContainer::checkCandidate(size_type index) const {
-  if (index >= nCandidates()) {
-    std::stringstream ss;
-    ss << "CudaCandidateListContainer: candidate " << index
-       << " is out of range for " << nCandidates() << " candidates";
     throw std::out_of_range(ss.str());
   }
 }
@@ -748,61 +605,6 @@ void CudaPatternRecordContainer::setOverflow(size_type seed,
   m_host.overflow[seed] = overflow;
 }
 
-void CudaPatternRecordContainer::setPattern(size_type patternSlot,
-                                            const CudaPatternRecordRow& row) {
-  checkSlot(patternSlot);
-  if (row.nHits > m_maxHitsPerPattern) {
-    std::stringstream ss;
-    ss << "CudaPatternRecordContainer: nHits " << row.nHits
-       << " exceeds maxHitsPerPattern " << m_maxHitsPerPattern;
-    throw std::out_of_range(ss.str());
-  }
-  const size_type p{patternSlot};
-
-  m_host.sector[p] = row.sector;
-
-  m_host.patPhi[p] = row.patPhi;
-  m_host.patTheta[p] = row.patTheta;
-  m_host.patPhiOffset[p] = row.patPhiOffset;
-  m_host.bendPlaneCovPhiPhi[p] = row.bendPlaneCovPhiPhi;
-  m_host.bendPlaneCovSS[p] = row.bendPlaneCovSS;
-  m_host.bendPlaneCovPhiS[p] = row.bendPlaneCovPhiS;
-  m_host.nDoF[p] = row.nDoF;
-  m_host.lastNDoF[p] = row.lastNDoF;
-  m_host.anchorRadius[p] = row.anchorRadius;
-
-  m_host.sumNormResidual2[p] = row.sumNormResidual2;
-  m_host.lastResidual[p] = row.lastResidual;
-  m_host.lastResSigma[p] = row.lastResSigma;
-
-  m_host.linePosX[p] = row.linePos.x();
-  m_host.linePosY[p] = row.linePos.y();
-  m_host.linePosZ[p] = row.linePos.z();
-
-  m_host.lineDirX[p] = row.lineDir.x();
-  m_host.lineDirY[p] = row.lineDir.y();
-  m_host.lineDirZ[p] = row.lineDir.z();
-
-  m_host.leverArm[p] = row.leverArm;
-
-  m_host.bendPlaneNormX[p] = row.bendPlaneNorm.x();
-  m_host.bendPlaneNormY[p] = row.bendPlaneNorm.y();
-  m_host.bendPlaneNormZ[p] = row.bendPlaneNorm.z();
-
-  m_host.nPrecisionLayers[p] = row.nPrecisionLayers;
-  m_host.nTriggerLayers[p] = row.nTriggerLayers;
-  m_host.nPhiLayers[p] = row.nPhiLayers;
-
-  m_host.nHits[p] = row.nHits;
-
-  m_host.lastInsertedHit[p] = row.lastInsertedHit;
-  m_host.prevLayerHit[p] = row.prevLayerHit;
-  m_host.lineAnchorHit[p] = row.lineAnchorHit;
-
-  m_host.flags[p] = row.flags;
-  m_host.status[p] = row.status;
-}
-
 CudaPatternRecordRow CudaPatternRecordContainer::pattern(
     size_type patternSlot) const {
   checkSlot(patternSlot);
@@ -847,28 +649,6 @@ CudaPatternRecordRow CudaPatternRecordContainer::pattern(
   return row;
 }
 
-void CudaPatternRecordContainer::setHit(size_type patternSlot, size_type local,
-                                        std::uint32_t hitIndex,
-                                        std::uint16_t globLayer) {
-  const size_type slot{hitSlot(patternSlot, local)};
-
-  m_host.hitIndex[slot] = hitIndex;
-  m_host.globLayer[slot] = globLayer;
-}
-
-void CudaPatternRecordContainer::setNHits(size_type patternSlot,
-                                          std::uint32_t nHits) {
-  checkSlot(patternSlot);
-  if (nHits > m_maxHitsPerPattern) {
-    std::stringstream ss;
-    ss << "CudaPatternRecordContainer: nHits " << nHits
-       << " exceeds maxHitsPerPattern " << m_maxHitsPerPattern;
-    throw std::out_of_range(ss.str());
-  }
-
-  m_host.nHits[patternSlot] = nHits;
-}
-
 std::uint32_t CudaPatternRecordContainer::nHits(size_type patternSlot) const {
   checkSlot(patternSlot);
 
@@ -894,30 +674,6 @@ std::span<const std::uint32_t> CudaPatternRecordContainer::hitIndices(
 
   return std::span<const std::uint32_t>{
       m_host.hitIndex.data() + hitSlot(patternSlot, 0), used};
-}
-
-void CudaPatternRecordContainer::moveToDevice(cudaStream_t stream) {
-  clearDevice();
-
-  m_block = allocateColumns(patternColumns, m_host, m_device, stream);
-  // A kernel reads these before it writes them; everything else of a slot is
-  // valid only once the slot is counted in nPatterns
-  zeroDeviceColumn(m_device.nPatterns, m_nSeeds, stream);
-  zeroDeviceColumn(m_device.overflow, m_nSeeds, stream);
-  zeroDeviceColumn(m_device.status, nSlots(), stream);
-
-  m_device.nSeeds = static_cast<std::uint32_t>(m_nSeeds);
-  m_device.capacityPerSeed = static_cast<std::uint32_t>(m_capacityPerSeed);
-  m_device.maxHitsPerPattern = static_cast<std::uint32_t>(m_maxHitsPerPattern);
-  m_onDevice = true;
-}
-
-void CudaPatternRecordContainer::moveToHost(cudaStream_t stream) {
-  if (!m_onDevice) {
-    return;
-  }
-
-  copyColumnsToHost(patternColumns, m_host, m_device, stream);
 }
 
 void CudaPatternRecordContainer::clearDevice() noexcept {
