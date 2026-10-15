@@ -169,13 +169,13 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   auto microseconds = [](Clock::duration d) {
     return std::chrono::duration<double, std::micro>(d).count();
   };
+  const auto hostPreStart = Clock::now();
   using enum ExpandedSector::SectorProjector;
   const SurfaceTable& surfaces{surfaceTable(gctx)};
   const Acts::TrackingGeometry& geometry{*m_cfg.trackingGeometry};
 
   // The global positions of the hits the finding uses and the search tree
   // over them, as GlobalPatternFinderAlgorithm::constructTree
-  const auto treeStart = Clock::now();
   // Per row: the bucket and the space point, for the payloads of the kept
   // patterns; per bucket: its rows
   std::vector<std::uint32_t> usedBucket{};
@@ -243,12 +243,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     bucketEnd[k] = static_cast<std::uint32_t>(usedPointer.size());
   }
   const RowTree tree{std::move(treeEntries)};
-  if (timing != nullptr) {
-    timing->treeUs = microseconds(Clock::now() - treeStart);
-  }
 
   // The candidate lists, as makeCudaCandidateLists, and the flat space points
-  const auto fillStart = Clock::now();
   using HitCoords = GlobalPatternFinder_t::HitCoords;
   constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
   constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);
@@ -357,10 +353,11 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   stage(block);
   auto* nMissing = reinterpret_cast<std::uint32_t*>(block.host + missingAt);
   if (timing != nullptr) {
-    timing->fillUs = microseconds(Clock::now() - fillStart);
+    timing->hostPreUs = microseconds(Clock::now() - hostPreStart);
   }
 
-  std::array<cudaEvent_t, 2> uploadMarks{};
+  // The copy, then the payload kernel, which counts towards the kernels
+  std::array<cudaEvent_t, 3> uploadMarks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : uploadMarks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
@@ -369,6 +366,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   ACTS_CUDA_CHECK(cudaMemcpyAsync(block.device, block.host, uploadBytes,
                                   cudaMemcpyHostToDevice, stream));
+  if (timing != nullptr) {
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream));
+  }
   buildCudaHitPayloads(deviceSpacePoints, used,
                        CudaSurfaceTableArrays{.geometryId = surfaces.geometryId,
                                               .rotation = surfaces.rotation,
@@ -378,7 +378,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
                                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
                                   stream));
   if (timing != nullptr) {
-    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream));
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[2], stream));
   }
 
   CudaPatternFinderSizes sizes{m_cfg.sizes};
@@ -393,6 +393,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     float ms{0.f};
     ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
     timing->uploadUs = 1000. * ms;
+    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[1], uploadMarks[2]));
+    timing->kernelsUs += 1000. * ms;
     for (cudaEvent_t& mark : uploadMarks) {
       ACTS_CUDA_CHECK(cudaEventDestroy(mark));
     }
@@ -411,7 +413,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
 
   // The payloads of the hits of the kept patterns, on the host, for the
   // phi-only hits and the conversion
-  const auto tailStart = Clock::now();
+  const auto hostPostStart = Clock::now();
   std::vector<std::optional<HitPayload>> payloads(usedPointer.size());
   auto payloadOf = [&](std::uint32_t row) -> const HitPayload& {
     std::optional<HitPayload>& payload{payloads[row]};
@@ -428,7 +430,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   ACTS_DEBUG(__func__ << "() Found " << output.size() << " patterns from "
                       << lists.nSeeds() << " seeds");
   if (timing != nullptr) {
-    timing->tailUs = microseconds(Clock::now() - tailStart);
+    timing->hostPostUs = microseconds(Clock::now() - hostPostStart);
   }
   return output;
 }

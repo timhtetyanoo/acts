@@ -149,10 +149,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
       !timingPath.empty()) {
     timingFile.open(timingPath);
     timingFile << "event,nSpacePoints,nBuckets,nPatterns,totalTime_us,"
-                  "treeTime_us,fillTime_us,uploadTime_us,kernelTime_us,"
-                  "downloadTime_us,tailTime_us,nSeeds,nCandidates,"
-                  "nPatternsInEta,largestBeam,overflow,seedTime_us,"
-                  "buildTime_us,overlapTime_us\n";
+                  "hostPreTime_us,uploadTime_us,kernelTime_us,"
+                  "downloadTime_us,hostPostTime_us,nSeeds,nCandidates,"
+                  "nPatternsInEta,largestBeam,overflow\n";
   }
 
   /// The patterns are written out for the offline validation, if asked for
@@ -216,13 +215,12 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
                  << std::chrono::duration_cast<std::chrono::microseconds>(
                         elapsed)
                         .count()
-                 << ',' << stages.treeUs << ',' << stages.fillUs << ','
-                 << stages.uploadUs << ',' << stages.kernelsUs << ','
-                 << stages.downloadUs << ',' << stages.tailUs << ','
-                 << stages.nSeeds << ',' << stages.nCandidates << ','
-                 << stages.nPatternsInEta << ',' << stages.largestBeam << ','
-                 << static_cast<int>(stages.overflow) << ',' << stages.seedsUs
-                 << ',' << stages.buildUs << ',' << stages.overlapsUs << '\n';
+                 << ',' << stages.hostPreUs << ',' << stages.uploadUs << ','
+                 << stages.kernelsUs << ',' << stages.downloadUs << ','
+                 << stages.hostPostUs << ',' << stages.nSeeds << ','
+                 << stages.nCandidates << ',' << stages.nPatternsInEta << ','
+                 << stages.largestBeam << ',' << static_cast<int>(stages.overflow)
+                 << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);

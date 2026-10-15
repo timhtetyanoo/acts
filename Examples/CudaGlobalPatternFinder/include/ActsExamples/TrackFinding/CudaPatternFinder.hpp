@@ -789,28 +789,20 @@ struct CudaPatternFinderSizes {
 };
 
 /// @brief Where the time of one event went, in microseconds, and what the
-///        event held. Host stages are wall time, device stages are measured
+///        event held. The host stages are wall time, the others are measured
 ///        with CUDA events on the stream.
 struct CudaPatternFinderTiming {
-  /// @brief Host: the search tree
-  double treeUs{0.};
-  /// @brief Host: the hit columns and the candidate lists
-  double fillUs{0.};
-  /// @brief Device: copy of the hits and the lists to the device
+  /// @brief Host, before the copy: everything the device input needs
+  double hostPreUs{0.};
+  /// @brief Copy of the input to the device
   double uploadUs{0.};
-  /// @brief Device: seed preparation, builds and accepts
+  /// @brief Every kernel of the event, from the first to the last
   double kernelsUs{0.};
-  /// @brief Device, part of kernelsUs: the seed checks
-  double seedsUs{0.};
-  /// @brief Device, part of kernelsUs: the building of every seed
-  double buildUs{0.};
-  /// @brief Device, part of kernelsUs: the event's patterns gathered, their
-  ///        overlaps resolved and the kept ones compacted
-  double overlapsUs{0.};
-  /// @brief Device: copy of the event's patterns to the host
+  /// @brief Copy of the event's patterns to the host
   double downloadUs{0.};
-  /// @brief Host: phi-only hits and the conversion of the patterns
-  double tailUs{0.};
+  /// @brief Host, after the copy: phi-only hits and the conversion of the
+  ///        patterns
+  double hostPostUs{0.};
   std::size_t nSeeds{0u};
   std::size_t nCandidates{0u};
   /// @brief Patterns in eta accepted on the device

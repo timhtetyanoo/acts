@@ -2295,7 +2295,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     ACTS_CUDA_CHECK(cudaMemPoolSetAttribute(
         pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
   }
-  std::array<cudaEvent_t, 5> marks{};
+  std::array<cudaEvent_t, 3> marks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : marks) {
       ACTS_CUDA_CHECK(cudaEventCreate(&mark));
@@ -2326,7 +2326,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   mark(0u);
   // The seed checks
   prepareCudaSeeds(hits, lists, cfg, stream);
-  mark(1u);
 
   // Every seed at once, with the memory of the arena; then the totals, which
   // size the event's patterns
@@ -2349,7 +2348,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     cfg, arena, results, counts);
     ACTS_CUDA_CHECK(cudaGetLastError());
   }
-  mark(2u);
   // The event's buffers, sized on the device by what the seeds produced,
   // then the patterns of every seed, the links of every pair and the rounds
   EventBuffers* eventBuffers{nullptr};
@@ -2373,7 +2371,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   // read, then their slots copied
   compactEventPatternsKernel<<<1, 256, 0, stream>>>(eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  mark(3u);
+  mark(1u);
   // The counts, then the block of the kept patterns, into page-locked memory
   CudaPinnedBuffer ownReadback{};
   CudaPinnedBuffer& pinned{readback != nullptr ? *readback : ownReadback};
@@ -2395,7 +2393,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     ready.compactedBase, ready.compactedBytes,
                                     cudaMemcpyDeviceToHost, stream));
   }
-  mark(4u);
+  mark(2u);
   release();
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
   if (ready.nKept > 0u) {
@@ -2412,11 +2410,8 @@ CudaPatternRecordContainer findCudaPatternsInEta(
       ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[from], marks[to]));
       return 1000. * ms;
     };
-    timing->seedsUs = elapsedUs(0u, 1u);
-    timing->buildUs = elapsedUs(1u, 2u);
-    timing->overlapsUs = elapsedUs(2u, 3u);
-    timing->kernelsUs = elapsedUs(0u, 3u);
-    timing->downloadUs = elapsedUs(3u, 4u);
+    timing->kernelsUs = elapsedUs(0u, 1u);
+    timing->downloadUs = elapsedUs(1u, 2u);
     timing->largestBeam = totals.largestBeam;
     timing->overflow = overflow;
     timing->nPatternsInEta = nKept[0];
