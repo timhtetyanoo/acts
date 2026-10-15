@@ -838,6 +838,10 @@ struct WarpSeed {
   std::uint8_t* flags{nullptr};
   std::uint8_t* state{nullptr};
   std::uint8_t* nextState{nullptr};
+  /// The line test of every pattern and hit the pattern accepts, [pattern]
+  /// [chunk][hit], so that the child that takes the hit does not compute it
+  /// again
+  LineTest* tests{nullptr};
   /// The most patterns the seed held at once
   std::uint32_t largestBeam{0u};
 
@@ -884,11 +888,16 @@ struct WarpSeed {
     target = target > lanesPerWarp ? target : lanesPerWarp;
     if (scratchCap < target) {
       const unsigned long long maskBytes{4ull * target * maxChunks};
-      const unsigned long long bytes{2ull * maskBytes + 4ull * target +
-                                     3ull * target};
+      const unsigned long long testBytes{sizeof(LineTest) * target *
+                                         maxChunks * lanesPerWarp};
+      // The tests first, at the alignment of the block
+      const unsigned long long bytes{testBytes + 2ull * maskBytes +
+                                     4ull * target + 3ull * target};
       unsigned long long got{0u};
       char* block{take(bytes, arena.patternLimit, false, got)};
       if (block != nullptr) {
+        auto* newTests = reinterpret_cast<LineTest*>(block);
+        block += testBytes;
         auto* newAccept = reinterpret_cast<std::uint32_t*>(block);
         auto* newLow = reinterpret_cast<std::uint32_t*>(block + maskBytes);
         auto* newOffsets =
@@ -899,10 +908,15 @@ struct WarpSeed {
           newAccept[k] = acceptMask[k];
           newLow[k] = lowMask[k];
         }
+        for (std::uint32_t k = lane; k < nLive * maxChunks * lanesPerWarp;
+             k += lanesPerWarp) {
+          newTests[k] = tests[k];
+        }
         for (std::uint32_t k = lane; k < nLive; k += lanesPerWarp) {
           newFlags[k] = flags[k];
         }
         __syncwarp();
+        tests = newTests;
         acceptMask = newAccept;
         lowMask = newLow;
         offsets = newOffsets;
@@ -1164,6 +1178,7 @@ struct WarpSeed {
         if (res.decision != Decision::addHit) {
           continue;
         }
+        tests[(i * maxChunks + c) * lanesPerWarp + h] = res;
         atomicOr(&acceptMask[i * maxChunks + c], 1u << h);
         if (res.sigma > static_cast<Real>(b.cfg.lowConfidenceResSigma) &&
             res.residual / res.sigma > Real{2}) {
@@ -1207,7 +1222,6 @@ struct WarpSeed {
     // 4. Rebuild, chunk after chunk, then the patterns that carry on
     std::uint32_t nOut{0u};
     for (std::uint32_t c = 0u; c < nChunks; ++c) {
-      loadChunk(c);
       const std::uint32_t chunk{first + c * lanesPerWarp};
       const std::uint32_t nChildren{warpExclusiveScan(
           n,
@@ -1232,7 +1246,9 @@ struct WarpSeed {
         const auto test = static_cast<std::uint16_t>(chunk + h);
         Pattern& child{pattern(to, nOut + t)};
         b.copy(pattern(from, lo), child);
-        b.addHit(child, test, b.checkLine(child, test, chunkHits[h]));
+        // The child is its parent with the same line, so the test of the
+        // parent is the child's
+        b.addHit(child, test, tests[(lo * maxChunks + c) * lanesPerWarp + h]);
       }
       nOut += nChildren;
       __syncwarp();
