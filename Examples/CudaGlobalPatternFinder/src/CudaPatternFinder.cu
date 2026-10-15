@@ -15,6 +15,8 @@
 #include "ActsExamples/TrackFinding/CudaPatternFinder.hpp"
 #include "ActsExamples/Utilities/CudaUtilities.hpp"
 
+#include <cub/cub.cuh>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -2187,6 +2189,294 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
   out.phiMeasurementDirectionZ[r] = phiDir.z;
 }
 
+/// The search of GlobalPatternFinderAlgorithm::constructTree and the range
+/// searches of the seed loop, on a sorted array instead of a tree. Every
+/// used hit enters the search once per expanded sector it is projected into,
+/// with the coordinates (sector, theta) the host computes; the entries are
+/// sorted by sector, then theta, and the window of a seed is the slice of its
+/// sector between two binary searches. The tree's ranges are [min, max), and
+/// so are the slices.
+namespace Search {
+
+constexpr std::uint32_t projections = 3u;
+constexpr std::uint8_t noSector = 0xFFu;
+/// Acts::UnitConstants::degree
+constexpr double degree = Math::pi / 180.;
+
+/// sectorMap::getSector: the muon sector of an angle
+__device__ int msSectorOfPhi(double phi) {
+  double val = (phi + Math::ExpandedSector::msSize(1)) * (8. / Math::pi);
+  if (val < 0) {
+    val += 16;
+  }
+  const int sliceIndex{static_cast<int>(val / 2)};
+  const double valueInSlice{val - 2 * sliceIndex};
+  int sector{2 * sliceIndex + 1};
+  if (valueInSlice > 1.2) {
+    ++sector;
+  }
+  return sector;
+}
+
+/// ExpandedSector(phi): the first two muon sectors the angle is inside, in
+/// the order sectorMap::getSectors lists them, as the host combines them
+__device__ unsigned expandedSectorOfPhi(double phi) {
+  namespace Sector = Math::ExpandedSector;
+  const int sector{msSectorOfPhi(phi)};
+  const int next{sector != 16 ? sector + 1 : 1};
+  const int before{sector != 1 ? sector - 1 : 16};
+  int found[3]{};
+  int n{0};
+  for (const int s : {before, sector, next}) {
+    if (Sector::insideMsSector(s, phi)) {
+      found[n++] = s;
+    }
+  }
+  if (n == 1) {
+    return (2u * static_cast<unsigned>(found[0])) % 32u;
+  }
+  // As the host: the projector is the difference of the two, modulo 16 the
+  // C++ way, added in unsigned arithmetic
+  // numberOfSectors() is unsigned there, so the difference is taken modulo
+  // 16 in unsigned arithmetic
+  const auto dS = static_cast<int>(
+      static_cast<unsigned>(found[1] - found[0]) % 16u);
+  return (2u * static_cast<unsigned>(found[0]) +
+          static_cast<unsigned>(static_cast<std::int8_t>(dS))) %
+         32u;
+}
+
+/// ExpandedSector::normalDir: makeDirectionFromPhiTheta(phi + 90 deg, 90 deg)
+__device__ Math::Vector3 normalDir(int sector) {
+  const double phi{Math::ExpandedSector::phi(sector) + 90. * degree};
+  const double theta{90. * degree};
+  const double sinTheta{std::sin(theta)};
+  return {std::cos(phi) * sinTheta, std::sin(phi) * sinTheta,
+          std::cos(theta)};
+}
+
+/// The bucket of a row: the last one that starts at or before it
+__device__ std::uint32_t bucketOf(const CudaMuonSpacePointArrays& sp,
+                                  std::uint32_t nBuckets, std::uint32_t r) {
+  std::uint32_t bucket{0u};
+  std::uint32_t pastBucket{nBuckets};
+  while (pastBucket - bucket > 1u) {
+    const std::uint32_t mid{(bucket + pastBucket) / 2u};
+    if (sp.bucketStart[mid] <= r) {
+      bucket = mid;
+    } else {
+      pastBucket = mid;
+    }
+  }
+  return bucket;
+}
+
+/// SeedSelector::goodForSeeding and thetaSearchWindow of a hit: the window,
+/// or a negative number if the hit does not seed
+__device__ double seedWindow(std::uint32_t raw, const CudaSeedSelection& sel) {
+  const std::uint8_t layer{Math::layerOf(
+      MuonIdBits::station(MuonIdBits::stationName(raw)))};
+  const bool straw{MuonIdBits::technology(raw) == MuonIdBits::mdt};
+  if (((sel.seedingLayers >> layer) & 1u) == 0u ||
+      (straw && !sel.seedFromMdt)) {
+    return -1.;
+  }
+  return (layer == Math::Layer::Inner || layer == Math::Layer::Outer)
+             ? sel.thetaSearchWindow
+             : 0.5 * sel.thetaSearchWindow;
+}
+
+/// The device arrays of one search
+struct Buffers {
+  // Per entry, row * 3 + projection
+  std::uint64_t* thetaKey;
+  std::uint8_t* sector;
+  double* theta;
+  std::uint32_t* entry;
+  // Sorted
+  std::uint64_t* thetaKeySorted;
+  std::uint32_t* entrySorted;
+  std::uint8_t* sectorSorted;
+  std::uint8_t* sectorSorted2;
+  std::uint32_t* entrySorted2;
+  // Per sorted position
+  std::uint32_t* isSeed;
+  std::uint32_t* seedSlot;
+  std::uint32_t* count;
+  std::uint32_t* offset;
+  std::uint32_t* low;
+  // Per sector, [first, last) of its entries
+  std::uint32_t* segment;
+  // nSeeds, nCandidates
+  std::uint32_t* totals;
+  std::uint32_t nEntries;
+};
+
+/// The global position of every used hit and its entries
+__global__ void entriesKernel(CudaMuonSpacePointArrays sp,
+                              CudaSearchArrays in, Buffers buf) {
+  const std::uint32_t r{blockIdx.x * blockDim.x + threadIdx.x};
+  if (r >= in.nHits) {
+    return;
+  }
+  const std::uint32_t b{bucketOf(sp, in.nBuckets, r)};
+  const double* rot{in.bucketRotation + 9u * b};
+  const double* t{in.bucketTranslation + 3u * b};
+  const double lx{sp.localPositionX[r]};
+  const double ly{sp.localPositionY[r]};
+  const double lz{sp.localPositionZ[r]};
+  // Transform3 * Vector3, the products and sums rounded one by one as on
+  // the host
+  auto row = [&](int i) {
+    return __dadd_rn(__dadd_rn(__dadd_rn(__dmul_rn(rot[i], lx),
+                                         __dmul_rn(rot[3 + i], ly)),
+                               __dmul_rn(rot[6 + i], lz)),
+                     t[i]);
+  };
+  const Math::Vector3 pos{row(0), row(1), row(2)};
+  in.positionX[r] = pos.x;
+  in.positionY[r] = pos.y;
+  in.positionZ[r] = pos.z;
+
+  const std::uint32_t raw{sp.muonId[r]};
+  const bool measPhi{MuonIdBits::measuresPhi(raw)};
+  // The muon sector of the bucket, from its first used hit
+  const auto msSector =
+      static_cast<unsigned>(MuonIdBits::sector(sp.muonId[sp.bucketStart[b]]));
+  const unsigned hitSector{
+      measPhi ? expandedSectorOfPhi(std::atan2(pos.y, pos.x)) : 32u};
+  for (int proj = -1; proj <= 1; ++proj) {
+    const std::uint32_t e{projections * r + static_cast<std::uint32_t>(proj + 1)};
+    const unsigned sector{(2u * msSector + static_cast<unsigned>(proj)) % 32u};
+    buf.entry[e] = e;
+    if (proj != 0 && measPhi && sector != hitSector) {
+      buf.thetaKey[e] = ~0ull;
+      buf.sector[e] = noSector;
+      buf.theta[e] = 0.;
+      continue;
+    }
+    double projR{0.};
+    if (measPhi) {
+      projR = std::sqrt(__dadd_rn(__dmul_rn(pos.x, pos.x),
+                                  __dmul_rn(pos.y, pos.y)));
+    } else {
+      const Math::Vector3 n{normalDir(static_cast<int>(sector))};
+      const double d{__dadd_rn(__dadd_rn(__dmul_rn(pos.x, n.x),
+                                         __dmul_rn(pos.y, n.y)),
+                               __dmul_rn(pos.z, n.z))};
+      const double px{__dadd_rn(pos.x, -__dmul_rn(d, n.x))};
+      const double py{__dadd_rn(pos.y, -__dmul_rn(d, n.y))};
+      projR = std::sqrt(__dadd_rn(__dmul_rn(px, px), __dmul_rn(py, py)));
+    }
+    const double theta{std::atan2(projR, pos.z)};
+    buf.theta[e] = theta;
+    // theta is not negative, so its bits order as the values do
+    buf.thetaKey[e] = static_cast<std::uint64_t>(__double_as_longlong(theta));
+    buf.sector[e] = static_cast<std::uint8_t>(sector);
+  }
+}
+
+/// The sector of every entry in the order of the theta sort
+__global__ void gatherSectorsKernel(Buffers buf) {
+  const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
+  if (i < buf.nEntries) {
+    buf.sectorSorted[i] = buf.sector[buf.entrySorted[i]];
+  }
+}
+
+/// The first and last entry of every sector, from the sorted sectors
+__global__ void segmentsKernel(Buffers buf) {
+  const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
+  if (i >= buf.nEntries) {
+    return;
+  }
+  const std::uint8_t s{buf.sectorSorted2[i]};
+  if (s == noSector) {
+    return;
+  }
+  if (i == 0u || buf.sectorSorted2[i - 1u] != s) {
+    buf.segment[2u * s] = i;
+  }
+  if (i + 1u == buf.nEntries || buf.sectorSorted2[i + 1u] != s) {
+    buf.segment[2u * s + 1u] = i + 1u;
+  }
+}
+
+/// The window of every entry that seeds: two binary searches in its sector
+__global__ void windowsKernel(CudaMuonSpacePointArrays sp,
+                              CudaSeedSelection sel, Buffers buf) {
+  const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
+  if (i >= buf.nEntries) {
+    return;
+  }
+  buf.isSeed[i] = 0u;
+  buf.count[i] = 0u;
+  const std::uint8_t s{buf.sectorSorted2[i]};
+  if (s == noSector) {
+    return;
+  }
+  const std::uint32_t e{buf.entrySorted2[i]};
+  const double window{seedWindow(sp.muonId[e / projections], sel)};
+  if (window < 0.) {
+    return;
+  }
+  const double t{buf.theta[e]};
+  const double lowEdge{t - window / 2.};
+  const double highEdge{t + window / 2.};
+  auto lowerBound = [&](double value) {
+    std::uint32_t lo{buf.segment[2u * s]};
+    std::uint32_t hi{buf.segment[2u * s + 1u]};
+    while (lo < hi) {
+      const std::uint32_t mid{(lo + hi) / 2u};
+      if (buf.theta[buf.entrySorted2[mid]] < value) {
+        lo = mid + 1u;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  };
+  const std::uint32_t lo{lowerBound(lowEdge)};
+  const std::uint32_t hi{lowerBound(highEdge)};
+  buf.isSeed[i] = 1u;
+  buf.low[i] = lo;
+  buf.count[i] = hi - lo;
+}
+
+/// The number of seeds and candidates, from the exclusive scans
+__global__ void totalsKernel(Buffers buf) {
+  if (threadIdx.x == 0u && blockIdx.x == 0u) {
+    const std::uint32_t last{buf.nEntries - 1u};
+    buf.totals[0] = buf.seedSlot[last] + buf.isSeed[last];
+    buf.totals[1] = buf.offset[last] + buf.count[last];
+  }
+}
+
+/// The candidate lists: per seed its hit, sector, theta and the rows of its
+/// window
+__global__ void fillListsKernel(Buffers buf, CudaCandidateArrays lists) {
+  const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
+  if (i >= buf.nEntries || buf.isSeed[i] == 0u) {
+    return;
+  }
+  const std::uint32_t seed{buf.seedSlot[i]};
+  const std::uint32_t e{buf.entrySorted2[i]};
+  lists.seedHitIndex[seed] = e / projections;
+  lists.seedSector[seed] = static_cast<double>(buf.sectorSorted2[i]);
+  lists.seedTheta[seed] = buf.theta[e];
+  const std::uint32_t first{buf.offset[i]};
+  lists.candidateOffsets[seed] = first;
+  if (seed + 1u == lists.nSeeds) {
+    lists.candidateOffsets[seed + 1u] = first + buf.count[i];
+  }
+  for (std::uint32_t k = 0u; k < buf.count[i]; ++k) {
+    lists.candidateIndices[first + k] =
+        buf.entrySorted2[buf.low[i] + k] / projections;
+  }
+}
+
+}  // namespace Search
+
 /// Copies the patterns of status ok of the event pool to the start of the
 /// output records, in order, and their number and the overflow bits. Runs in
 /// one block
@@ -2254,6 +2544,127 @@ void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
                            0, stream>>>(spacePoints, used, surfaces, payloads,
                                         nMissingSurfaces);
   ACTS_CUDA_CHECK(cudaGetLastError());
+}
+
+void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
+                        const CudaSearchArrays& search,
+                        const CudaSeedSelection& selection,
+                        CudaCandidateListContainer& lists,
+                        CudaPinnedBuffer& readback, cudaStream_t stream,
+                        double* searchUs) {
+  lists = CudaCandidateListContainer{};
+  if (search.nHits == 0u) {
+    return;
+  }
+  std::array<cudaEvent_t, 2> marks{};
+  if (searchUs != nullptr) {
+    for (cudaEvent_t& mark : marks) {
+      ACTS_CUDA_CHECK(cudaEventCreate(&mark));
+    }
+    ACTS_CUDA_CHECK(cudaEventRecord(marks[0], stream));
+  }
+  // The search's own memory, from the device's pool, released at the end
+  std::vector<void*> blocks{};
+  auto allocate = [&](auto*& ptr, std::size_t count) {
+    ACTS_CUDA_CHECK(cudaMallocAsync(
+        reinterpret_cast<void**>(&ptr),
+        std::max<std::size_t>(count, 1u) * sizeof(*ptr), stream));
+    blocks.push_back(ptr);
+  };
+  Search::Buffers buf{};
+  const std::uint32_t n{search.nHits * Search::projections};
+  buf.nEntries = n;
+  allocate(buf.thetaKey, n);
+  allocate(buf.sector, n);
+  allocate(buf.theta, n);
+  allocate(buf.entry, n);
+  allocate(buf.thetaKeySorted, n);
+  allocate(buf.entrySorted, n);
+  allocate(buf.sectorSorted, n);
+  allocate(buf.sectorSorted2, n);
+  allocate(buf.entrySorted2, n);
+  allocate(buf.isSeed, n);
+  allocate(buf.seedSlot, n);
+  allocate(buf.count, n);
+  allocate(buf.offset, n);
+  allocate(buf.low, n);
+  allocate(buf.segment, 2u * 32u);
+  allocate(buf.totals, 2u);
+  std::size_t sortThetaBytes{0u};
+  std::size_t sortSectorBytes{0u};
+  std::size_t scanBytes{0u};
+  ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      nullptr, sortThetaBytes, buf.thetaKey, buf.thetaKeySorted, buf.entry,
+      buf.entrySorted, n, 0, 64, stream));
+  ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      nullptr, sortSectorBytes, buf.sectorSorted, buf.sectorSorted2,
+      buf.entrySorted, buf.entrySorted2, n, 0, 8, stream));
+  ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, buf.isSeed,
+                                                buf.seedSlot, n, stream));
+  std::size_t tempBytes{
+      std::max({sortThetaBytes, sortSectorBytes, scanBytes})};
+  char* temp{nullptr};
+  allocate(temp, tempBytes);
+  ACTS_CUDA_CHECK(
+      cudaMemsetAsync(buf.segment, 0, 2u * 32u * sizeof(std::uint32_t), stream));
+
+  constexpr unsigned blockSize{256u};
+  const unsigned hitBlocks{(search.nHits + blockSize - 1u) / blockSize};
+  const unsigned entryBlocks{(n + blockSize - 1u) / blockSize};
+  Search::entriesKernel<<<hitBlocks, blockSize, 0, stream>>>(spacePoints,
+                                                             search, buf);
+  ACTS_CUDA_CHECK(cudaGetLastError());
+  // By theta, then by sector; the radix sort is stable, so the second keeps
+  // the theta order within a sector
+  ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      temp, tempBytes, buf.thetaKey, buf.thetaKeySorted, buf.entry,
+      buf.entrySorted, n, 0, 64, stream));
+  Search::gatherSectorsKernel<<<entryBlocks, blockSize, 0, stream>>>(buf);
+  ACTS_CUDA_CHECK(cudaGetLastError());
+  ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+      temp, tempBytes, buf.sectorSorted, buf.sectorSorted2, buf.entrySorted,
+      buf.entrySorted2, n, 0, 8, stream));
+  Search::segmentsKernel<<<entryBlocks, blockSize, 0, stream>>>(buf);
+  ACTS_CUDA_CHECK(cudaGetLastError());
+  Search::windowsKernel<<<entryBlocks, blockSize, 0, stream>>>(spacePoints,
+                                                               selection, buf);
+  ACTS_CUDA_CHECK(cudaGetLastError());
+  ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp, tempBytes, buf.isSeed,
+                                                buf.seedSlot, n, stream));
+  ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp, tempBytes, buf.count,
+                                                buf.offset, n, stream));
+  Search::totalsKernel<<<1, 1, 0, stream>>>(buf);
+  ACTS_CUDA_CHECK(cudaGetLastError());
+
+  // The counts size the lists
+  auto* totals = reinterpret_cast<std::uint32_t*>(
+      readback.reserve(2u * sizeof(std::uint32_t)));
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(totals, buf.totals,
+                                  2u * sizeof(std::uint32_t),
+                                  cudaMemcpyDeviceToHost, stream));
+  if (searchUs != nullptr) {
+    ACTS_CUDA_CHECK(cudaEventRecord(marks[1], stream));
+  }
+  ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (searchUs != nullptr) {
+    float ms{0.f};
+    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, marks[0], marks[1]));
+    *searchUs = 1000. * ms;
+    for (cudaEvent_t& mark : marks) {
+      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
+    }
+  }
+  const std::uint32_t nSeeds{totals[0]};
+  const std::uint32_t nCandidates{totals[1]};
+  if (nSeeds > 0u) {
+    lists.allocateDevice(nSeeds, nCandidates, stream);
+    Search::fillListsKernel<<<entryBlocks, blockSize, 0, stream>>>(
+        buf, lists.deviceArrays());
+    ACTS_CUDA_CHECK(cudaGetLastError());
+  }
+  for (void* ptr : blocks) {
+    ACTS_CUDA_CHECK(cudaFreeAsync(ptr, stream));
+  }
 }
 
 void prepareCudaSeeds(const CudaHitPayloadContainer& hits,

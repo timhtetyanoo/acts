@@ -601,6 +601,43 @@ void CudaCandidateListContainer::clearDevice() noexcept {
 
   m_device = {};
   m_onDevice = false;
+  m_deviceOnly = false;
+}
+
+void CudaCandidateListContainer::allocateDevice(size_type nSeeds,
+                                                size_type nCandidates,
+                                                cudaStream_t stream) {
+  clearDevice();
+  m_host = {};
+  auto count = [&](const auto& hostColumn) -> std::size_t {
+    const void* column{&hostColumn};
+    if (column == &m_host.candidateOffsets) {
+      return nSeeds + 1u;
+    }
+    if (column == &m_host.candidateIndices ||
+        column == &m_host.candidateGlobLayer ||
+        column == &m_host.candidateInfo) {
+      return nCandidates;
+    }
+    return nSeeds;
+  };
+  std::size_t bytes{0u};
+  carveColumns(candidateColumns, m_host, m_device, nullptr, bytes, count);
+  char* block{nullptr};
+  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&block),
+                                  std::max<std::size_t>(bytes, 1u), stream));
+  std::size_t cursor{0u};
+  carveColumns(candidateColumns, m_host, m_device, block, cursor, count);
+  m_block = block;
+  // Zeroed, so that a seed the kernel has not reached reads as pending
+  candidateOutputColumns(
+      m_host, m_device, [&](const auto& hostColumn, auto& deviceColumn) {
+        zeroDeviceColumn(deviceColumn, count(hostColumn), stream);
+      });
+  m_device.nSeeds = static_cast<std::uint32_t>(nSeeds);
+  m_device.nCandidates = static_cast<std::uint32_t>(nCandidates);
+  m_onDevice = true;
+  m_deviceOnly = true;
 }
 
 void CudaCandidateListContainer::checkSeed(size_type seed) const {

@@ -446,11 +446,14 @@ class CudaCandidateListContainer {
   ~CudaCandidateListContainer() noexcept;
 
   /// @brief Returns the number of seeds
-  size_type nSeeds() const noexcept { return m_host.seedHitIndex.size(); }
+  size_type nSeeds() const noexcept {
+    return m_deviceOnly ? m_device.nSeeds : m_host.seedHitIndex.size();
+  }
 
   /// @brief Returns the total number of candidate entries
   size_type nCandidates() const noexcept {
-    return m_host.candidateIndices.size();
+    return m_deviceOnly ? m_device.nCandidates
+                        : m_host.candidateIndices.size();
   }
 
   /// @brief Returns the number of candidate hits of one seed
@@ -527,6 +530,13 @@ class CudaCandidateListContainer {
   ///        counted.
   void stageForDevice(CudaStagedBlock& block);
 
+  /// @brief Allocates the device columns of lists that a kernel fills,
+  ///        without host columns: nSeeds seeds and nCandidates candidates in
+  ///        all, the output columns zeroed. The host accessors other than
+  ///        the counts are not usable afterwards.
+  void allocateDevice(size_type nSeeds, size_type nCandidates,
+                      cudaStream_t stream);
+
   /// @brief Copies all device columns on a CUDA stream.
   /// The method waits only for the supplied stream.
   void moveToHost(cudaStream_t stream);
@@ -546,6 +556,8 @@ class CudaCandidateListContainer {
   /// @brief The one device allocation all columns live in
   void* m_block = nullptr;
   bool m_onDevice = false;
+  /// @brief The lists exist on the device only, with the counts of m_device
+  bool m_deviceOnly = false;
 
   void checkSeed(size_type seed) const;
   void checkCandidate(size_type index) const;

@@ -802,12 +802,15 @@ struct CudaPatternFinderSizes {
 ///        event held. Host stages are wall time, device stages are measured
 ///        with CUDA events on the stream.
 struct CudaPatternFinderTiming {
-  /// @brief Host: the search tree
+  /// @brief Host: the used hits and the transform of every bucket
   double treeUs{0.};
-  /// @brief Host: the hit columns and the candidate lists
+  /// @brief Host: the hit columns written for the copy
   double fillUs{0.};
-  /// @brief Device: copy of the hits and the lists to the device
+  /// @brief Device: copy of the hits to the device
   double uploadUs{0.};
+  /// @brief Device: positions, the sorted search array and the candidate
+  ///        lists, with the wait for their counts
+  double searchUs{0.};
   /// @brief Device: seed preparation, builds and accepts
   double kernelsUs{0.};
   /// @brief Device, part of kernelsUs: the seed checks
@@ -912,6 +915,53 @@ void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
                           const CudaSurfaceTableArrays& surfaces,
                           const CudaHitPayloadArrays& payloads,
                           std::uint32_t* nMissingSurfaces, cudaStream_t stream);
+
+/// @brief SeedSelector, for the search on the device: which hits seed and
+///        the theta window of their search
+struct CudaSeedSelection {
+  /// @brief Bit l set: hits of LayerIndex l seed
+  std::uint32_t seedingLayers{0u};
+  bool seedFromMdt{false};
+  double thetaSearchWindow{0.};
+};
+
+/// @brief What the search needs beyond the space points: the transform of
+///        each bucket into the global frame, rotation[9 * b, 9 * b + 9)
+///        column major and translation[3 * b, 3 * b + 3), and where the
+///        global positions of the hits go. The arrays are not owned.
+struct CudaSearchArrays {
+  const double* bucketRotation{nullptr};
+  const double* bucketTranslation{nullptr};
+  double* positionX{nullptr};
+  double* positionY{nullptr};
+  double* positionZ{nullptr};
+  std::uint32_t nHits{0u};
+  std::uint32_t nBuckets{0u};
+};
+
+/// @brief GlobalPatternFinderAlgorithm::constructTree and the range searches
+///        of the seed loop, on the device: the global position of every hit,
+///        its entries (sector, theta) as the host computes them, the entries
+///        sorted by sector and theta, and for every entry that seeds the
+///        slice of its sector within its theta window, by two binary
+///        searches. The candidates of a seed are the same hits as the tree's;
+///        the seeds come in the order of the sorted entries.
+/// @param spacePoints Device arrays of the used hits, with their local
+///        positions, ids and bucket starts
+/// @param search The bucket transforms and the position outputs
+/// @param selection The seed selection
+/// @param lists Filled with the candidate lists, on the device only
+/// @param readback Page-locked memory for the two counts, which the call
+///        waits for
+/// @param stream The stream
+/// @param searchUs If given, the device time of the search up to the counts,
+///        in microseconds
+void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
+                        const CudaSearchArrays& search,
+                        const CudaSeedSelection& selection,
+                        CudaCandidateListContainer& lists,
+                        CudaPinnedBuffer& readback, cudaStream_t stream,
+                        double* searchUs = nullptr);
 
 /// @brief Finds the patterns in eta of an event on the device, in one pass.
 ///

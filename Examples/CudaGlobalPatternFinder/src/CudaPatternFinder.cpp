@@ -14,7 +14,6 @@
 #include "Acts/Surfaces/Surface.hpp"
 #include "Acts/Surfaces/detail/LineHelper.hpp"
 #include "Acts/Utilities/Enumerate.hpp"
-#include "Acts/Utilities/KDTree.hpp"
 #include "Acts/Utilities/VectorHelpers.hpp"
 #include "Acts/Utilities/detail/periodic.hpp"
 #include "ActsExamples/Utilities/CudaStream.hpp"
@@ -33,23 +32,7 @@ namespace ActsExamples {
 
 namespace {
 
-/// The search tree over the rows of the hits the finding uses
-using RowTree = Acts::KDTree<2, std::uint32_t, double, std::array, 50>;
 
-/// SeedSelector::goodForSeeding and thetaSearchWindow of a space point: the
-/// window, or nothing if the hit does not seed
-std::optional<double> seedWindow(const SeedSelector& selector,
-                                 const MuonSpacePoint& sp) {
-  const LayerIndex layer{toLayerIndex(toStationIndex(sp.id().msStation()))};
-  if (std::ranges::find(selector.m_seedinglayers, layer) ==
-          selector.m_seedinglayers.end() ||
-      (sp.isStraw() && !selector.m_cfg.seedFromMdt)) {
-    return std::nullopt;
-  }
-  return (layer == LayerIndex::Inner || layer == LayerIndex::Outer)
-             ? selector.m_cfg.thetaSearchWindow
-             : 0.5 * selector.m_cfg.thetaSearchWindow;
-}
 
 /// Writes a rotation column major
 void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
@@ -169,30 +152,25 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   auto microseconds = [](Clock::duration d) {
     return std::chrono::duration<double, std::micro>(d).count();
   };
-  using enum ExpandedSector::SectorProjector;
   const SurfaceTable& surfaces{surfaceTable(gctx)};
   const Acts::TrackingGeometry& geometry{*m_cfg.trackingGeometry};
 
-  // The global positions of the hits the finding uses and the search tree
-  // over them, as GlobalPatternFinderAlgorithm::constructTree
+  // The hits the finding uses, and the transform of every bucket into the
+  // global frame; positions, the search and the candidate lists are made on
+  // the device
   const auto treeStart = Clock::now();
   // Per row: the bucket and the space point, for the payloads of the kept
   // patterns; per bucket: its rows
   std::vector<std::uint32_t> usedBucket{};
-  std::vector<double> positionX{};
-  std::vector<double> positionY{};
-  std::vector<double> positionZ{};
   std::vector<const MuonSpacePoint*> usedPointer{};
   std::vector<double> bucketRotation(9u * spacePoints.size(), 0.);
+  std::vector<double> bucketTranslation(3u * spacePoints.size(), 0.);
   std::vector<Acts::Transform3> bucketTransform(spacePoints.size(),
                                                 Acts::Transform3::Identity());
   std::vector<std::uint32_t> bucketBegin(spacePoints.size(), 0u);
-  std::vector<std::uint32_t> bucketEnd(spacePoints.size(), 0u);
-  RowTree::vector_t treeEntries{};
   for (std::size_t k = 0u; k < spacePoints.size(); ++k) {
     const MuonSpacePointBucket& bucket{spacePoints[k]};
     bucketBegin[k] = static_cast<std::uint32_t>(usedPointer.size());
-    bucketEnd[k] = bucketBegin[k];
     if (bucket.empty()) {
       continue;
     }
@@ -200,91 +178,31 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
         bucketToGlobalTransform(gctx, geometry, bucket)};
     bucketTransform[k] = localToGlobal;
     storeRotation(localToGlobal.linear(), bucketRotation.data() + 9u * k);
-    std::optional<std::uint16_t> msSector{};
+    for (int i = 0; i < 3; ++i) {
+      bucketTranslation[3u * k + i] = localToGlobal.translation()[i];
+    }
     for (const MuonSpacePoint& sp : bucket) {
-      // Only-phi hits are not in the tree, and MDT hits only if asked for
+      // Only-phi hits are not searched, and MDT hits only if asked for
       if (!sp.id().measuresEta() || (!m_cfg.useMdtHits && sp.isStraw())) {
         continue;
       }
-      const auto row = static_cast<std::uint32_t>(usedPointer.size());
-      const Acts::Vector3 pos{localToGlobal * sp.localPosition()};
       usedBucket.push_back(static_cast<std::uint32_t>(k));
-      positionX.push_back(pos.x());
-      positionY.push_back(pos.y());
-      positionZ.push_back(pos.z());
       usedPointer.push_back(&sp);
-      if (!msSector) {
-        msSector = sp.id().sector();
-      }
-      const ExpandedSector hitExpSector{Acts::VectorHelpers::phi(pos)};
-      // A hit close to a sector border also enters the neighbouring sector
-      for (const ExpandedSector::SectorProjector proj :
-           {leftOverlap, center, rightOverlap}) {
-        const ExpandedSector expSect{*msSector, proj};
-        if (proj != center && sp.id().measuresPhi() &&
-            expSect != hitExpSector) {
-          continue;
-        }
-        // Projected onto the plane along the sector radial direction
-        const Acts::Vector3 planeNormal{expSect.normalDir()};
-        const double projR{
-            sp.id().measuresPhi()
-                ? Acts::VectorHelpers::perp(pos)
-                : Acts::VectorHelpers::perp(
-                      Acts::Vector3{pos - pos.dot(planeNormal) * planeNormal})};
-        std::array<double, 2> coords{};
-        using HitCoords = GlobalPatternFinder_t::HitCoords;
-        coords[Acts::toUnderlying(HitCoords::eTheta)] =
-            std::atan2(projR, pos.z());
-        coords[Acts::toUnderlying(HitCoords::eSector)] = expSect.sector();
-        treeEntries.emplace_back(coords, row);
-      }
     }
-    bucketEnd[k] = static_cast<std::uint32_t>(usedPointer.size());
   }
-  const RowTree tree{std::move(treeEntries)};
   if (timing != nullptr) {
     timing->treeUs = microseconds(Clock::now() - treeStart);
   }
-
-  // The candidate lists, as makeCudaCandidateLists, and the flat space points
-  const auto fillStart = Clock::now();
-  using HitCoords = GlobalPatternFinder_t::HitCoords;
-  constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
-  constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);
-  CudaCandidateListContainer lists{};
-  std::vector<std::uint32_t> candidates{};
-  for (const auto& [seedCoords, seedRow] : tree) {
-    const std::optional<double> window{
-        seedWindow(seedSelector, *usedPointer[seedRow])};
-    if (!window) {
-      continue;
-    }
-    RowTree::range_t selectRange{};
-    selectRange[sectorIdx].shrink(seedCoords[sectorIdx] - 0.1,
-                                  seedCoords[sectorIdx] + 0.1);
-    selectRange[thetaIdx].shrink(seedCoords[thetaIdx] - *window / 2.,
-                                 seedCoords[thetaIdx] + *window / 2.);
-    candidates.clear();
-    tree.rangeSearchMapDiscard(
-        selectRange, [&candidates](const auto& /*coords*/, std::uint32_t row) {
-          candidates.push_back(row);
-        });
-    lists.addSeed(seedRow, seedCoords[sectorIdx], seedCoords[thetaIdx],
-                  candidates);
-  }
-  if (timing != nullptr) {
-    timing->nSeeds = lists.nSeeds();
-    timing->nCandidates = lists.nCandidates();
-  }
-  if (lists.empty()) {
+  if (usedPointer.empty()) {
     return {};
   }
+
   // Up to the device in one copy, from page-locked memory kept between
-  // events: the columns of the used hits that the payloads read (row r being
-  // space point r, every bucket keeping its number), their positions, the
-  // bucket rotations and the lists. The payloads, which the device builds,
-  // follow the copied part in the same device block
+  // events: the columns of the used hits that the search and the payloads
+  // read (row r being space point r, every bucket keeping its number) and
+  // the bucket transforms. The positions and the payloads, which the device
+  // makes, follow the copied part in the same device block
+  const auto fillStart = Clock::now();
   std::unique_ptr<Workspace> workspace{acquireWorkspace()};
   const WorkspaceReturn giveBack{*this, workspace};
   const cudaStream_t stream{workspace->stream.get()};
@@ -292,6 +210,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   const auto nBuckets = static_cast<std::uint32_t>(spacePoints.size());
   CudaMuonSpacePointArrays deviceSpacePoints{};
   CudaUsedHitArrays used{.nHits = nUsed, .nBuckets = nBuckets};
+  CudaSearchArrays search{.nHits = nUsed, .nBuckets = nBuckets};
   std::uint32_t* deviceMissing{nullptr};
   CudaHitPayloadContainer hits{};
   std::size_t uploadBytes{0u};
@@ -312,7 +231,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     };
     auto* geometryId = column(deviceSpacePoints.geometryId, nUsed);
     auto* muonId = column(deviceSpacePoints.muonId, nUsed);
+    auto* localPositionX = column(deviceSpacePoints.localPositionX, nUsed);
     auto* localPositionY = column(deviceSpacePoints.localPositionY, nUsed);
+    auto* localPositionZ = column(deviceSpacePoints.localPositionZ, nUsed);
     auto* toNextSensorX = column(deviceSpacePoints.toNextSensorX, nUsed);
     auto* toNextSensorY = column(deviceSpacePoints.toNextSensorY, nUsed);
     auto* toNextSensorZ = column(deviceSpacePoints.toNextSensorZ, nUsed);
@@ -324,7 +245,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
         const MuonSpacePoint& sp{*usedPointer[row]};
         geometryId[row] = sp.geometryId().value();
         muonId[row] = sp.id().toInt();
+        localPositionX[row] = sp.localPosition().x();
         localPositionY[row] = sp.localPosition().y();
+        localPositionZ[row] = sp.localPosition().z();
         toNextSensorX[row] = sp.toNextSensor().x();
         toNextSensorY[row] = sp.toNextSensor().y();
         toNextSensorZ[row] = sp.toNextSensor().z();
@@ -334,17 +257,22 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       }
     }
     copy(deviceSpacePoints.bucketStart, bucketBegin);
-    copy(used.positionX, positionX);
-    copy(used.positionY, positionY);
-    copy(used.positionZ, positionZ);
     copy(used.bucketRotation, bucketRotation);
-    lists.stageForDevice(block);
+    search.bucketRotation = used.bucketRotation;
+    copy(search.bucketTranslation, bucketTranslation);
     // Zero, as the host block holds it
     auto* missing = column(deviceMissing, 1u);
     if (fill) {
       *missing = 0u;
     }
     uploadBytes = block.cursor;
+    // Made on the device
+    column(search.positionX, nUsed);
+    column(search.positionY, nUsed);
+    column(search.positionZ, nUsed);
+    used.positionX = search.positionX;
+    used.positionY = search.positionY;
+    used.positionZ = search.positionZ;
     hits.placeOnDevice(nUsed, block);
   };
   CudaStagedBlock sizing{};
@@ -369,6 +297,37 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   ACTS_CUDA_CHECK(cudaMemcpyAsync(block.device, block.host, uploadBytes,
                                   cudaMemcpyHostToDevice, stream));
+  if (timing != nullptr) {
+    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream));
+  }
+
+  // The search, which waits for the number of seeds and candidates
+  CudaSeedSelection selection{
+      .seedFromMdt = seedSelector.m_cfg.seedFromMdt,
+      .thetaSearchWindow = seedSelector.m_cfg.thetaSearchWindow};
+  for (const LayerIndex layer : seedSelector.m_seedinglayers) {
+    if (Acts::toUnderlying(layer) >= 0) {
+      selection.seedingLayers |= 1u << Acts::toUnderlying(layer);
+    }
+  }
+  CudaCandidateListContainer lists{};
+  findCudaCandidates(deviceSpacePoints, search, selection, lists,
+                     workspace->readback, stream,
+                     timing != nullptr ? &timing->searchUs : nullptr);
+  if (timing != nullptr) {
+    float ms{0.f};
+    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
+    timing->uploadUs = 1000. * ms;
+    for (cudaEvent_t& mark : uploadMarks) {
+      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
+    }
+    timing->nSeeds = lists.nSeeds();
+    timing->nCandidates = lists.nCandidates();
+  }
+  if (lists.empty()) {
+    return {};
+  }
+
   buildCudaHitPayloads(deviceSpacePoints, used,
                        CudaSurfaceTableArrays{.geometryId = surfaces.geometryId,
                                               .rotation = surfaces.rotation,
@@ -377,9 +336,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   ACTS_CUDA_CHECK(cudaMemcpyAsync(nMissing, deviceMissing,
                                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
                                   stream));
-  if (timing != nullptr) {
-    ACTS_CUDA_CHECK(cudaEventRecord(uploadMarks[1], stream));
-  }
 
   CudaPatternFinderSizes sizes{m_cfg.sizes};
   if (m_arenaBytes > 0u) {
@@ -389,14 +345,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   const CudaPatternRecordContainer event{findCudaPatternsInEta(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
       stream, timing, &workspace->readback)};
-  if (timing != nullptr) {
-    float ms{0.f};
-    ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
-    timing->uploadUs = 1000. * ms;
-    for (cudaEvent_t& mark : uploadMarks) {
-      ACTS_CUDA_CHECK(cudaEventDestroy(mark));
-    }
-  }
   if (*nMissing != 0u) {
     throw std::runtime_error(std::format(
         "CudaGlobalPatternFinder: {} hits have no measurement surface",
