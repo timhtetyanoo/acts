@@ -200,7 +200,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
         bucketToGlobalTransform(gctx, geometry, bucket)};
     bucketTransform[k] = localToGlobal;
     storeRotation(localToGlobal.linear(), bucketRotation.data() + 9u * k);
-    std::optional<std::uint16_t> msSector{};
+    // The sector of the bucket, from its first hit
+    const unsigned msSector{bucket.front().id().sector()};
     for (const MuonSpacePoint& sp : bucket) {
       // Only-phi hits are not in the tree, and MDT hits only if asked for
       if (!sp.id().measuresEta() || (!m_cfg.useMdtHits && sp.isStraw())) {
@@ -213,29 +214,28 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       positionY.push_back(pos.y());
       positionZ.push_back(pos.z());
       usedPointer.push_back(&sp);
-      if (!msSector) {
-        msSector = sp.id().sector();
-      }
-      const ExpandedSector hitExpSector{Acts::VectorHelpers::phi(pos)};
-      // A hit close to a sector border also enters the neighbouring sector
+      // As GlobalPatternFinderAlgorithm::constructTree: a phi-measuring hit
+      // enters an overlap sector if its phi is inside it, with its own theta;
+      // the others enter all three, projected onto each sector's plane
+      const bool measuresPhi{sp.id().measuresPhi()};
+      const double r2{pos.head<2>().squaredNorm()};
       for (const ExpandedSector::SectorProjector proj :
            {leftOverlap, center, rightOverlap}) {
-        const ExpandedSector expSect{*msSector, proj};
-        if (proj != center && sp.id().measuresPhi() &&
-            expSect != hitExpSector) {
+        const ExpandedSector expSect{msSector, proj};
+        if (measuresPhi && proj != center &&
+            !expSect.insideSector(Acts::VectorHelpers::phi(pos))) {
           continue;
         }
-        // Projected onto the plane along the sector radial direction
-        const Acts::Vector3 planeNormal{expSect.normalDir()};
-        const double projR{
-            sp.id().measuresPhi()
-                ? Acts::VectorHelpers::perp(pos)
-                : Acts::VectorHelpers::perp(
-                      Acts::Vector3{pos - pos.dot(planeNormal) * planeNormal})};
+        const double theta{
+            measuresPhi
+                ? Acts::VectorHelpers::theta(pos)
+                : std::atan2(
+                      std::sqrt(std::max(
+                          0., r2 - Acts::square(pos.dot(expSect.normalDir())))),
+                      pos.z())};
         std::array<double, 2> coords{};
         using HitCoords = GlobalPatternFinder_t::HitCoords;
-        coords[Acts::toUnderlying(HitCoords::eTheta)] =
-            std::atan2(projR, pos.z());
+        coords[Acts::toUnderlying(HitCoords::eTheta)] = theta;
         coords[Acts::toUnderlying(HitCoords::eSector)] = expSect.sector();
         treeEntries.emplace_back(coords, row);
       }
@@ -721,7 +721,9 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config& patCfg{finderCfg.finder};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
+  patCfg.maxThetaSizeOverlap = 2. * m_cfg.thetaSearchWindow;
   patCfg.phiTolerance = m_cfg.phiTolerance;
+  patCfg.loosenAcceptanceFactor = 2.5;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
   patCfg.minPrecisionLayers = m_cfg.minPrecisionLayers;
   patCfg.minPhiLayers = m_cfg.minPhiLayers;
