@@ -270,9 +270,6 @@ bool ExpandedSector::operator!=(const ExpandedSector& other) const {
 double ExpandedSector::phi() const {
   return sectorMap::sectorOverlapPhi(msSector(), adjacentMsSector());
 }
-Acts::Vector3 ExpandedSector::radialDir() const {
-  return Acts::makeDirectionFromPhiTheta(phi(), 90._degree);
-}
 Acts::Vector3 ExpandedSector::normalDir() const {
   return Acts::makeDirectionFromPhiTheta(phi() + 90._degree, 90._degree);
 }
@@ -624,7 +621,9 @@ GlobalPatternFinderAlgorithm::GlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config patCfg{};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
+  patCfg.maxThetaSizeOverlap = 2. * m_cfg.thetaSearchWindow;
   patCfg.phiTolerance = m_cfg.phiTolerance;
+  patCfg.loosenAcceptanceFactor = 2.5;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
   patCfg.minPrecisionLayers = m_cfg.minPrecisionLayers;
   patCfg.minPhiLayers = m_cfg.minPhiLayers;
@@ -759,53 +758,46 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
   }
   treeData.reserve(3 * hitPayloads.size());
 
-  std::uint16_t msSector = hitPayloads.front().spacePoint()->id().sector();
-  const MuonSpacePointBucket* currentBucket = hitPayloads.front().bucket;
+  // The sector entries of a hit: its own sector and the overlaps with the
+  // neighbours, common to all hits of a bucket
+  auto addEntry = [&](const double theta, const ExpandedSector& expSect,
+                      const HitPayload& hit) {
+    std::array<double, 2> coords{};
+    using HitCoords = GlobalPatternFinder_t::HitCoords;
+    coords[Acts::toUnderlying(HitCoords::eTheta)] = theta;
+    coords[Acts::toUnderlying(HitCoords::eSector)] = expSect.sector();
+    ACTS_VERBOSE(__func__ << "() Add hit with coordinates [" << coords[0]
+                          << ", " << coords[1] << "] to search tree");
+    treeData.emplace_back(std::move(coords), &hit);
+  };
   for (const HitPayload& hit : hitPayloads) {
     ACTS_VERBOSE(__func__ << "() Spacepoint: " << *hit.spacePoint());
     const Acts::Vector3& pos{hit.position};
-    const ExpandedSector hitExpSector{Acts::VectorHelpers::phi(pos)};
-    if (hit.bucket != currentBucket) {
-      currentBucket = hit.bucket;
-      msSector = hit.spacePoint()->id().sector();
+    // The sector of the bucket, from its first hit
+    const unsigned msSector{hit.bucket->front().id().sector()};
+    if (hit.spacePoint()->id().measuresPhi()) {
+      // No projection: theta is the same for all sectors
+      const double phi{Acts::VectorHelpers::phi(pos)};
+      const double theta{Acts::VectorHelpers::theta(pos)};
+      for (const ExpandedSector::SectorProjector proj :
+           {leftOverlap, center, rightOverlap}) {
+        const ExpandedSector expSect{msSector, proj};
+        if (proj != center && !expSect.insideSector(phi)) {
+          continue;
+        }
+        addEntry(theta, expSect, hit);
+      }
+      continue;
     }
-
-    // Try to duplicate the hit in the neighboring sectors if it is close to
-    // the sector border. This ensures that we can find patterns crossing the
-    // sector borders.
+    // Project the hit onto the plane along the sector radial direction, which
+    // removes the bias of the hit displacement in phi
+    const double r2{pos.head<2>().squaredNorm()};
     for (const ExpandedSector::SectorProjector proj :
          {leftOverlap, center, rightOverlap}) {
-      /// Check whether the hit belongs to the left or right sector as well
       const ExpandedSector expSect{msSector, proj};
-      if (proj != ExpandedSector::SectorProjector::center &&
-          hit.spacePoint()->id().measuresPhi() && expSect != hitExpSector) {
-        ACTS_VERBOSE("addHitToTree() Hit with "
-                     << hitExpSector << " is not compatible with " << expSect);
-        continue;
-      }
-
-      /* Project the hit onto the plane along the sector radial direction.
-       * This allows to remove the bias of hit displacement in phi direction */
-      const Acts::Vector3 planeNormal{expSect.normalDir()};
-      const double projR{hit.spacePoint()->id().measuresPhi()
-                             ? Acts::VectorHelpers::perp(pos)
-                             : Acts::VectorHelpers::perp(Acts::Vector3{
-                                   pos - pos.dot(planeNormal) * planeNormal})};
-
-      std::array<double, 2> coords{};
-      using HitCoords = GlobalPatternFinder_t::HitCoords;
-      coords[Acts::toUnderlying(HitCoords::eTheta)] =
-          std::atan2(projR, pos.z());
-      coords[Acts::toUnderlying(HitCoords::eSector)] = expSect.sector();
-
-      ACTS_VERBOSE("addHitToTree() Add hit: Z: "
-                   << pos.z() << ", R: " << Acts::VectorHelpers::perp(pos)
-                   << ", ProjR: " << projR
-                   << ", Phi: " << Acts::VectorHelpers::phi(pos) / 1_degree
-                   << ", SectorPhi: " << expSect.phi() / 1_degree
-                   << " and coordinates [" << coords[0] << ", " << coords[1]
-                   << "] to search tree");
-      treeData.emplace_back(std::move(coords), &hit);
+      const double projR{std::sqrt(
+          std::max(0., r2 - Acts::square(pos.dot(expSect.normalDir()))))};
+      addEntry(std::atan2(projR, pos.z()), expSect, hit);
     }
   }
   ACTS_VERBOSE(__func__ << "() Create a new tree with " << treeData.size()

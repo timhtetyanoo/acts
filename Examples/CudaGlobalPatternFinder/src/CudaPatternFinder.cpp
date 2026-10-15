@@ -667,7 +667,9 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config& patCfg{finderCfg.finder};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
+  patCfg.maxThetaSizeOverlap = 2. * m_cfg.thetaSearchWindow;
   patCfg.phiTolerance = m_cfg.phiTolerance;
+  patCfg.loosenAcceptanceFactor = 2.5;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
   patCfg.minPrecisionLayers = m_cfg.minPrecisionLayers;
   patCfg.minPhiLayers = m_cfg.minPhiLayers;

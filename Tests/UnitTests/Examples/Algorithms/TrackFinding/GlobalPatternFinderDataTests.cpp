@@ -35,8 +35,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -177,12 +177,12 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
       for (const ActsExamples::MuonSpacePointBucket& bucket : spacePoints) {
         nSpacePoints += bucket.size();
       }
-      timingFile
-          << event << ',' << nSpacePoints << ',' << spacePoints.size() << ','
-          << patterns.size() << ','
-          << std::chrono::duration_cast<std::chrono::microseconds>(elapsed)
-                 .count()
-          << '\n';
+      timingFile << event << ',' << nSpacePoints << ',' << spacePoints.size()
+                 << ',' << patterns.size() << ','
+                 << std::chrono::duration_cast<std::chrono::microseconds>(
+                        elapsed)
+                        .count()
+                 << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);

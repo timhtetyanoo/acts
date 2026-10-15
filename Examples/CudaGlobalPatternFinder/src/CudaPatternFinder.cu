@@ -2204,49 +2204,6 @@ constexpr std::uint8_t noSector = 0xFFu;
 /// Acts::UnitConstants::degree
 constexpr double degree = Math::pi / 180.;
 
-/// sectorMap::getSector: the muon sector of an angle
-__device__ int msSectorOfPhi(double phi) {
-  double val = (phi + Math::ExpandedSector::msSize(1)) * (8. / Math::pi);
-  if (val < 0) {
-    val += 16;
-  }
-  const int sliceIndex{static_cast<int>(val / 2)};
-  const double valueInSlice{val - 2 * sliceIndex};
-  int sector{2 * sliceIndex + 1};
-  if (valueInSlice > 1.2) {
-    ++sector;
-  }
-  return sector;
-}
-
-/// ExpandedSector(phi): the first two muon sectors the angle is inside, in
-/// the order sectorMap::getSectors lists them, as the host combines them
-__device__ unsigned expandedSectorOfPhi(double phi) {
-  namespace Sector = Math::ExpandedSector;
-  const int sector{msSectorOfPhi(phi)};
-  const int next{sector != 16 ? sector + 1 : 1};
-  const int before{sector != 1 ? sector - 1 : 16};
-  int found[3]{};
-  int n{0};
-  for (const int s : {before, sector, next}) {
-    if (Sector::insideMsSector(s, phi)) {
-      found[n++] = s;
-    }
-  }
-  if (n == 1) {
-    return (2u * static_cast<unsigned>(found[0])) % 32u;
-  }
-  // As the host: the projector is the difference of the two, modulo 16 the
-  // C++ way, added in unsigned arithmetic
-  // numberOfSectors() is unsigned there, so the difference is taken modulo
-  // 16 in unsigned arithmetic
-  const auto dS =
-      static_cast<int>(static_cast<unsigned>(found[1] - found[0]) % 16u);
-  return (2u * static_cast<unsigned>(found[0]) +
-          static_cast<unsigned>(static_cast<std::int8_t>(dS))) %
-         32u;
-}
-
 /// ExpandedSector::normalDir: makeDirectionFromPhiTheta(phi + 90 deg, 90 deg)
 __device__ Math::Vector3 normalDir(int sector) {
   const double phi{Math::ExpandedSector::phi(sector) + 90. * degree};
@@ -2343,31 +2300,31 @@ __global__ void entriesKernel(CudaMuonSpacePointArrays sp, CudaSearchArrays in,
   // The muon sector of the bucket, from its first used hit
   const auto msSector =
       static_cast<unsigned>(MuonIdBits::sector(sp.muonId[sp.bucketStart[b]]));
-  const unsigned hitSector{
-      measPhi ? expandedSectorOfPhi(std::atan2(pos.y, pos.x)) : 32u};
+  const double phi{std::atan2(pos.y, pos.x)};
+  const double r2{__dadd_rn(__dmul_rn(pos.x, pos.x), __dmul_rn(pos.y, pos.y))};
   for (int proj = -1; proj <= 1; ++proj) {
     const std::uint32_t e{projections * r +
                           static_cast<std::uint32_t>(proj + 1)};
     const unsigned sector{(2u * msSector + static_cast<unsigned>(proj)) % 32u};
     buf.entry[e] = e;
-    if (proj != 0 && measPhi && sector != hitSector) {
+    // A phi-measuring hit enters an overlap sector only if its phi is inside
+    if (proj != 0 && measPhi &&
+        !Math::ExpandedSector::inside(static_cast<int>(sector), phi)) {
       buf.thetaKey[e] = ~0ull;
       buf.sector[e] = noSector;
       buf.theta[e] = 0.;
       continue;
     }
-    double projR{0.};
-    if (measPhi) {
-      projR = std::sqrt(
-          __dadd_rn(__dmul_rn(pos.x, pos.x), __dmul_rn(pos.y, pos.y)));
-    } else {
+    // Unprojected for a phi-measuring hit, else projected onto the plane of
+    // the sector: sqrt(r^2 - (pos . n)^2)
+    double projR{std::sqrt(r2)};
+    if (!measPhi) {
       const Math::Vector3 n{normalDir(static_cast<int>(sector))};
       const double d{
           __dadd_rn(__dadd_rn(__dmul_rn(pos.x, n.x), __dmul_rn(pos.y, n.y)),
                     __dmul_rn(pos.z, n.z))};
-      const double px{__dadd_rn(pos.x, -__dmul_rn(d, n.x))};
-      const double py{__dadd_rn(pos.y, -__dmul_rn(d, n.y))};
-      projR = std::sqrt(__dadd_rn(__dmul_rn(px, px), __dmul_rn(py, py)));
+      const double rest{__dadd_rn(r2, -__dmul_rn(d, d))};
+      projR = std::sqrt(rest > 0. ? rest : 0.);
     }
     const double theta{std::atan2(projR, pos.z)};
     buf.theta[e] = theta;
