@@ -803,16 +803,10 @@ struct Candidate {
   std::uint32_t pad{0u};
 };
 
-/// One seed built by one warp. Every lane holds this object; the lanes share
-/// the patterns and the scratch of the seed, and every loop below runs the
-/// same number of times in all of them.
-///
-/// The patterns live in two regions that the layers swap between. A slot
-/// holds a pattern followed by its hit positions, as many as the seed's
-/// candidate list has layers: a pattern holds at most one hit per layer, so
-/// this cannot overflow. Regions and scratch are taken from the event's
-/// arena as the seed needs them and grow by doubling; what a region held
-/// before it grew is not needed any more when it grows.
+/// One seed built by one warp; every lane holds this object. The patterns
+/// live in two regions that the layers swap between, taken from the event's
+/// arena and grown by doubling. A slot holds a pattern and one hit position
+/// per layer of the seed's list.
 struct WarpSeed {
   SeedBuilder b;
   Arena arena;
@@ -1072,21 +1066,10 @@ struct WarpSeed {
     __syncwarp();
   }
 
-  /// The patterns of a layer, the positions [first, last) of the candidate
-  /// list, tested against the n patterns of region `from`; the continued
-  /// patterns are written to region `to`. Returns their number.
-  ///
-  ///  1. prune: a pattern that missed too many layers in this group, compared
-  ///     to the others of its family, is dropped, and of the patterns of a
-  ///     family that end on the same hit only the first in priority stays;
-  ///  2. test: every hit of the layer against every pattern, against the line
-  ///     the pattern had before the layer, 32 hits at a time;
-  ///  3. room: the patterns of the layer are counted before any is written,
-  ///     and when they do not all fit the best are kept (selectBest);
-  ///  4. rebuild: each compatible hit gives a child, the pattern with the
-  ///     hit. A pattern carries on as it is unless it took a hit of normal
-  ///     confidence.
-  /// A pattern of region `from` marked isOverlap takes no part.
+  /// Extends the n patterns of region `from` by the layer at candidate
+  /// positions [first, last) into region `to`, and returns their number:
+  /// prune, test every (pattern, hit) pair, make room (keeping the best if
+  /// short), then grow a child per accepted hit.
   __device__ __forceinline__ std::uint32_t extendLayer(std::uint32_t from,
                                                        std::uint32_t n,
                                                        std::uint32_t to,

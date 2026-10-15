@@ -244,7 +244,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   const RowTree tree{std::move(treeEntries)};
 
-  // The candidate lists, as makeCudaCandidateLists, and the flat space points
+  // The candidate lists, as the CPU seed loop's range searches
   using HitCoords = GlobalPatternFinder_t::HitCoords;
   constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
   constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);

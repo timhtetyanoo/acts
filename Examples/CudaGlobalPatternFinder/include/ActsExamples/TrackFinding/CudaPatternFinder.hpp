@@ -20,13 +20,10 @@
 
 #include <cuda_runtime.h>
 
-/// The arithmetic of the global pattern finder, written once for the host and
-/// the device. Every function is a copy of the CPU code it names, with the
-/// operations in the same order, so that in double precision it reproduces the
-/// CPU numbers bit for bit as long as floating-point contraction is off on both
-/// sides. The functions take the number type T of their arguments: the unit
-/// tests run them in double against the CPU, the pattern building kernel in
-/// Real. A change to the CPU formulas has to be made here as well.
+/// The arithmetic of the global pattern finder for the host and the device.
+/// Every function copies the CPU code it names, in the same order of
+/// operations; the kernels run it in Real, the unit tests in double against
+/// the CPU.
 namespace ActsExamples::CudaPatternMath {
 
 /// @brief The number type of the pattern building kernel: the line, the
@@ -632,10 +629,7 @@ __host__ __device__ inline bool isNeighbour(int sector1, int sector2) {
 }  // namespace ExpandedSector
 
 /// @brief PatternStateAux::updatePatternPhi: the bending plane from the phi
-///        measuring hits of a pattern and the beam spot. Without phi hits it
-///        is the centre of the sector, through the origin; with one, the line
-///        through the hit and the beam spot; with more, the weighted straight
-///        line fit of the hits and the beam spot in the transverse plane.
+///        measuring hits of a pattern and the beam spot
 /// @param nPhiLayers The number of phi layers of the pattern
 /// @param previousPhi The pattern phi so far, which fixes the fit weights
 /// @param sector The expanded sector of the pattern
@@ -842,15 +836,10 @@ CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
           beamspot.length}};
 }
 
-/// @brief Runs the candidate checks of the CPU seed loop on the device, a
-///        warp per seed: the candidate count, the group count as a
-///        reduction, the sort by layer as a sorting network and the global
-///        layer numbers as a prefix sum, with their cuts.
-///
-/// The status, the global layers and the position of the seed hit in its
-/// sorted list are written to the output columns of the lists; the position is
-/// cudaInvalidHitPosition if the seed hit is not in its own list. Both
-/// containers must be on the device. The call waits only for the stream.
+/// @brief The candidate checks of the CPU seed loop on the device, a warp per
+///        seed: the counts, the sort by layer and the layer numbers, written
+///        to the output columns of the lists. Both containers must be on the
+///        device; the call does not wait.
 void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
                       CudaCandidateListContainer& lists,
                       const CudaPatternFinderConfig& cfg, cudaStream_t stream);
@@ -879,9 +868,8 @@ struct CudaUsedHitArrays {
   std::uint32_t nBuckets{0u};
 };
 
-/// @brief Builds the hit payloads on the device, one thread per hit, from the
-///        space points (CudaMuonSpacePointArrays) and the surfaces: the
-///        quantities of makeCudaHitPayloadRow, with the formulas of HitPayload.
+/// @brief Builds the hit payloads on the device, one thread per hit, with the
+///        formulas of HitPayload.
 /// @param spacePoints Device arrays of a CudaMuonSpacePointContainer
 /// @param used The hits to build, row r of the output from row r of used
 /// @param surfaces The measurement surfaces
@@ -895,30 +883,15 @@ void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
                           const CudaHitPayloadArrays& payloads,
                           std::uint32_t* nMissingSurfaces, cudaStream_t stream);
 
-/// @brief Finds the patterns in eta of an event on the device, in one pass.
+/// @brief GlobalPatternFinder::findPatternsInEta on the device, in one pass.
 ///
-/// The seed checks run a warp per seed: the group count as a reduction, the
-/// sort by layer as a sorting network and the layer numbers as a prefix sum.
-/// Every seed is then built by a warp, all seeds at once, one layer at a
-/// time: every hit of a layer is tested against every pattern at once, with
-/// the line the pattern had before the layer, and each compatible hit gives a
-/// pattern of its own. The backward passes of all forward patterns run side
-/// by side. The overlaps, inside a seed and among all the patterns of the
-/// event, are resolved by priority (more good groups, more bending layers,
-/// more precision layers, smaller residual, then the index) rather than in
-/// seed order, and the skip rule is not applied.
-///
-/// The seeds take their memory from one arena of sizes.workspaceBytes as
-/// they need it; a pattern's hit slots are sized by the layers of its seed's
-/// list, so they cannot overflow. When the arena runs short at a layer, the
-/// seed keeps the best of that layer's patterns that fit, by the same
-/// priority, and the patterns overflow bit is set. The event's patterns are
-/// sized by what the seeds produced. Only the kept patterns are copied back:
-/// the returned records hold them alone, in seed order, as the slots of entry
-/// 0. The hits and the lists must be on the device; the call synchronizes the
-/// stream. The counts and the kept patterns come back through `readback`,
-/// page-locked memory the caller keeps between events, or through a buffer
-/// of the call's own if none is given.
+/// Every seed is built by a warp, all seeds at once, one layer at a time. The
+/// overlaps, inside a seed and among the patterns of the event, are resolved
+/// by priority instead of seed order. The seeds take their memory from one
+/// arena of sizes.workspaceBytes; when it runs short, the best patterns are
+/// kept and the overflow bit is set. Returns the kept patterns as the slots of
+/// entry 0. The hits and the lists must be on the device; the call waits for
+/// the stream. `readback` is page-locked memory kept between events, if given.
 CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
     const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
@@ -972,13 +945,9 @@ class CudaGlobalPatternFinder {
       std::unique_ptr<const Acts::Logger> logger = Acts::getDefaultLogger(
           "CudaGlobalPatternFinder", Acts::Logging::INFO));
 
-  /// @brief Finds the patterns of an event, converted to the output of the
-  ///        algorithm. The host computes
-  ///        the global positions, the search tree and the candidate lists;
-  ///        the space points go to the device, which builds the hit payloads
-  ///        and finds the patterns in eta. The host builds the payloads of the
-  ///        hits of the kept patterns only, for the phi-only hits and the
-  ///        conversion.
+  /// @brief Finds the patterns of an event: the search tree and the candidate
+  ///        lists on the host, the patterns in eta on the device, the phi-only
+  ///        hits and the conversion on the host.
   /// @param gctx Geometry context
   /// @param spacePoints The space points of the event
   /// @param seedSelector Selector of the seed hits
