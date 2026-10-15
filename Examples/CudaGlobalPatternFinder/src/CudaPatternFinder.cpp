@@ -32,8 +32,6 @@ namespace ActsExamples {
 
 namespace {
 
-
-
 /// Writes a rotation column major
 void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
   for (int c = 0; c < 3; ++c) {
@@ -217,8 +215,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   auto stage = [&](CudaStagedBlock& block) {
     const bool fill{block.host != nullptr};
     auto column = [&](auto*& device, std::size_t n) {
-      using T = std::remove_cv_t<std::remove_pointer_t<
-          std::remove_reference_t<decltype(device)>>>;
+      using T = std::remove_cv_t<
+          std::remove_pointer_t<std::remove_reference_t<decltype(device)>>>;
       const auto [host, dev] = block.take<T>(n);
       device = dev;
       return host;

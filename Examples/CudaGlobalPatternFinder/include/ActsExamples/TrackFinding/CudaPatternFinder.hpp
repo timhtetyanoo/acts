@@ -172,8 +172,7 @@ template <typename T = double>
 __host__ __device__ inline HitT<T> loadHit(const CudaHitPayloadArrays& hits,
                                            std::uint32_t row) {
   auto vector = [](double x, double y, double z) {
-    return Vector3T<T>{static_cast<T>(x), static_cast<T>(y),
-                       static_cast<T>(z)};
+    return Vector3T<T>{static_cast<T>(x), static_cast<T>(y), static_cast<T>(z)};
   };
   HitT<T> hit{};
   hit.position =
@@ -426,14 +425,6 @@ __host__ __device__ inline T angleToBendPlane(const BendPlaneT<T>& plane,
   const T dist{dot(plane.normal, pos) - plane.offset};
   const T rho{plane.normal.y * pos.x - plane.normal.x * pos.y};
   return std::atan2(dist, rho);
-}
-
-/// @brief PatternStateAux::phiAtRadius: the approximate azimuth of the
-///        bending plane at a transverse distance from the beam line
-template <typename T>
-__host__ __device__ inline T phiAtRadius(const BendPlaneT<T>& plane,
-                                         Scalar<T> radius) {
-  return plane.phi + plane.offset / radius;
 }
 
 /// @brief Station and layer numbers, as Muon::MuonStationIndex numbers them
@@ -744,8 +735,7 @@ __host__ __device__ inline BendPlaneT<T> fitBendPlane(
   const T Mxy{Sxy - weightSum * centroidX * centroidY};
   const T Myy{Syy - weightSum * square(centroidY)};
 
-  const T eigenvalSeparation{
-      std::sqrt(square(Mxx - Myy) + square(T{2} * Mxy))};
+  const T eigenvalSeparation{std::sqrt(square(Mxx - Myy) + square(T{2} * Mxy))};
   const T eigenValSeparationInv{T{1} / eigenvalSeparation};
 
   alignPhiAndStore(T{0.5} * std::atan2(T{2} * Mxy, Mxx - Myy));

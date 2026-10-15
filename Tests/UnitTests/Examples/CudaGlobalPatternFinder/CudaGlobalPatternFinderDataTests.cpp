@@ -221,9 +221,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
                  << stages.downloadUs << ',' << stages.tailUs << ','
                  << stages.nSeeds << ',' << stages.nCandidates << ','
                  << stages.nPatternsInEta << ',' << stages.largestBeam << ','
-                 << static_cast<int>(stages.overflow) << ','
-                 << stages.seedsUs << ',' << stages.buildUs << ','
-                 << stages.overlapsUs << ',' << stages.searchUs << '\n';
+                 << static_cast<int>(stages.overflow) << ',' << stages.seedsUs
+                 << ',' << stages.buildUs << ',' << stages.overlapsUs << ','
+                 << stages.searchUs << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);
