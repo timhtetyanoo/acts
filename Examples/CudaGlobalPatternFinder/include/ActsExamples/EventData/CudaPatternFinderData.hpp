@@ -263,45 +263,10 @@ class CudaHitPayloadContainer {
   /// @brief Checks whether the container is empty.
   bool empty() const noexcept { return size() == 0; }
 
-  /// @brief Sets the quantities of one hit payload.
-  /// @param index The hit payload index.
-  /// @param position The global position of the hit.
-  /// @param localPositionY The local y coordinate of the space point.
-  /// @param stationKey The station key as returned by stationKey().
-  /// @param station The station index of the hit.
-  /// @param locLayer The layer number in the sector frame.
-  void setHit(size_type index, const Acts::Vector3& position,
-              double localPositionY, std::uint32_t stationKey,
-              std::uint8_t station, std::uint8_t locLayer);
-
   /// @brief Sets every quantity of one hit payload.
   /// @param index The hit payload index.
   /// @param row The quantities of the hit.
   void setHit(size_type index, const CudaHitPayloadRow& row);
-
-  /// @brief Returns every quantity of one hit payload.
-  /// @param index The hit payload index.
-  CudaHitPayloadRow hit(size_type index) const;
-
-  /// @brief Returns the global position of a hit payload.
-  /// @param index The hit payload index.
-  Acts::Vector3 position(size_type index) const;
-
-  /// @brief Returns the local y coordinate of a hit payload.
-  /// @param index The hit payload index.
-  double localPositionY(size_type index) const;
-
-  /// @brief Returns the station key of a hit payload.
-  /// @param index The hit payload index.
-  std::uint32_t stationKey(size_type index) const;
-
-  /// @brief Returns the station index of a hit payload.
-  /// @param index The hit payload index.
-  std::uint8_t station(size_type index) const;
-
-  /// @brief Returns the layer number in the sector frame of a hit payload.
-  /// @param index The hit payload index.
-  std::uint8_t locLayer(size_type index) const;
 
   /// @brief Copies all host columns on a CUDA stream.
   /// The method waits only for the supplied stream.
@@ -315,10 +280,6 @@ class CudaHitPayloadContainer {
   /// @param size The number of hit payloads
   /// @param block The block the columns are placed in
   void placeOnDevice(size_type size, CudaStagedBlock& block);
-
-  /// @brief Copies all device columns on a CUDA stream.
-  /// The method waits only for the supplied stream.
-  void moveToHost(cudaStream_t stream);
 
   /// @brief Releases all device memory.
   void clearDevice() noexcept;
@@ -472,31 +433,11 @@ class CudaCandidateListContainer {
         std::span<const std::uint32_t>{hitIndices.begin(), hitIndices.size()});
   }
 
-  /// @brief Overwrites the header of an existing seed. The candidate range
-  ///        is left as it is
-  void setSeed(size_type seed, std::uint32_t seedHitIndex, double sector,
-               double theta);
-
-  /// @brief Overwrites one flat candidate entry
-  void setCandidate(size_type index, std::uint32_t hitIndex);
-
-  /// @brief Payload row of the seed hit
-  std::uint32_t seedHitIndex(size_type seed) const;
-
-  /// @brief Tree sector coordinate of the seed
-  double seedSector(size_type seed) const;
-
-  /// @brief Tree theta coordinate of the seed
-  double seedTheta(size_type seed) const;
-
   /// @brief First candidate of a seed, as an index into the flat list
   size_type candidateBegin(size_type seed) const;
 
   /// @brief One-past-last candidate of a seed, as an index into the flat list
   size_type candidateEnd(size_type seed) const;
-
-  /// @brief Payload row of one candidate of a seed
-  std::uint32_t candidateHitIndex(size_type seed, size_type local) const;
 
   /// @brief Payload rows of every candidate of a seed
   std::span<const std::uint32_t> candidateHitIndices(size_type seed) const;
@@ -545,7 +486,6 @@ class CudaCandidateListContainer {
   bool m_onDevice = false;
 
   void checkSeed(size_type seed) const;
-  void checkCandidate(size_type index) const;
 };
 
 /// @brief Position in a pattern's own hit list that marks an unset hit
@@ -828,22 +768,8 @@ class CudaPatternRecordContainer {
   std::uint8_t overflow(size_type seed) const;
   void setOverflow(size_type seed, std::uint8_t overflow);
 
-  /// @brief Sets every quantity of one pattern slot except the hit list
-  void setPattern(size_type patternSlot, const CudaPatternRecordRow& row);
-
   /// @brief Returns every quantity of one pattern slot except the hit list
   CudaPatternRecordRow pattern(size_type patternSlot) const;
-
-  /// @brief Sets one hit of a pattern slot
-  /// @param patternSlot The pattern slot
-  /// @param local The hit slot inside the pattern
-  /// @param hitIndex The payload row of the hit
-  /// @param globLayer The global layer number of the hit
-  void setHit(size_type patternSlot, size_type local, std::uint32_t hitIndex,
-              std::uint16_t globLayer = 0u);
-
-  /// @brief Sets how many hit slots of a pattern slot are in use
-  void setNHits(size_type patternSlot, std::uint32_t nHits);
 
   /// @brief Returns how many hit slots of a pattern slot are in use
   std::uint32_t nHits(size_type patternSlot) const;
@@ -856,14 +782,6 @@ class CudaPatternRecordContainer {
 
   /// @brief Payload rows of the used hits of a pattern slot
   std::span<const std::uint32_t> hitIndices(size_type patternSlot) const;
-
-  /// @brief Allocates the device buffers and zeroes the counts, the overflow
-  ///        flags and the slot status. Nothing is uploaded.
-  void moveToDevice(cudaStream_t stream);
-
-  /// @brief Copies the counts, the overflow flags and every slot to the host.
-  /// The method waits only for the supplied stream.
-  void moveToHost(cudaStream_t stream);
 
   /// @brief Releases all device memory.
   void clearDevice() noexcept;
