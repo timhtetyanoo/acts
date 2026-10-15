@@ -270,9 +270,6 @@ bool ExpandedSector::operator!=(const ExpandedSector& other) const {
 double ExpandedSector::phi() const {
   return sectorMap::sectorOverlapPhi(msSector(), adjacentMsSector());
 }
-Acts::Vector3 ExpandedSector::radialDir() const {
-  return Acts::makeDirectionFromPhiTheta(phi(), 90._degree);
-}
 Acts::Vector3 ExpandedSector::normalDir() const {
   return Acts::makeDirectionFromPhiTheta(phi() + 90._degree, 90._degree);
 }
