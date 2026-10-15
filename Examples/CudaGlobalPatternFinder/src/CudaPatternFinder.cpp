@@ -298,8 +298,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   auto stage = [&](CudaStagedBlock& block) {
     const bool fill{block.host != nullptr};
     auto column = [&](auto*& device, std::size_t n) {
-      using T = std::remove_cv_t<std::remove_pointer_t<
-          std::remove_reference_t<decltype(device)>>>;
+      using T = std::remove_cv_t<
+          std::remove_pointer_t<std::remove_reference_t<decltype(device)>>>;
       const auto [host, dev] = block.take<T>(n);
       device = dev;
       return host;

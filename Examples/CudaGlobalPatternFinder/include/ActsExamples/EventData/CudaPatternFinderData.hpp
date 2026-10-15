@@ -307,16 +307,13 @@ class CudaHitPayloadContainer {
   /// The method waits only for the supplied stream.
   void moveToDevice(cudaStream_t stream);
 
-  /// @brief Allocates the device columns of a number of hit payloads that a
-  ///        kernel fills, without host columns. The host accessors are not
-  ///        usable afterwards.
+  /// @brief Places the device columns of a number of hit payloads that a
+  ///        kernel fills in device memory the caller owns, from the device
+  ///        address of `block` on, without host columns. The host accessors
+  ///        are not usable afterwards. Without a host block only the bytes
+  ///        are counted.
   /// @param size The number of hit payloads
-  /// @param stream The stream the allocation is ordered on
-  void allocateDevice(size_type size, cudaStream_t stream);
-
-  /// @brief The same in device memory the caller owns: the columns of `size`
-  ///        payloads from the device address of `block` on. Without a host
-  ///        block only the bytes are counted.
+  /// @param block The block the columns are placed in
   void placeOnDevice(size_type size, CudaStagedBlock& block);
 
   /// @brief Copies all device columns on a CUDA stream.
@@ -791,25 +788,14 @@ class CudaPatternRecordContainer {
   CudaPatternRecordContainer(size_type nSeeds, size_type capacityPerSeed,
                              size_type maxHitsPerPattern);
 
-  /// @brief Records that live on the device only, for the kernels to fill:
-  ///        the device columns are allocated on the stream and the counts,
-  ///        the overflow flags and the slot status zeroed. There are no host
-  ///        columns.
-  static CudaPatternRecordContainer onDevice(size_type nSeeds,
-                                             size_type capacityPerSeed,
-                                             size_type maxHitsPerPattern,
-                                             cudaStream_t stream);
-
   /// @brief Copies the first slots of device records into the host columns
-  ///        of this container, as many as it has: the slot columns, their hit
-  ///        slots and the per-seed columns. The source must have the same hit
+  ///        of this container, as many as it has, from a host copy of the
+  ///        device block the source columns live in: column c is read at
+  ///        hostCopy + (c - deviceBase). The source must have the same hit
   ///        slots per pattern and at least as many slots and seeds.
-  /// The method waits only for the supplied stream.
-  void copyFromDevice(const CudaPatternRecordArrays& source,
-                      cudaStream_t stream);
-
-  /// @brief The same from a host copy of the device block the source columns
-  ///        live in: column c is read at hostCopy + (c - deviceBase).
+  /// @param source The device columns
+  /// @param deviceBase The start of the device block
+  /// @param hostCopy The host copy of the device block
   void copyFromHostCopy(const CudaPatternRecordArrays& source,
                         const char* deviceBase, const char* hostCopy);
 

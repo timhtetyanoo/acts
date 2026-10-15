@@ -226,8 +226,10 @@ Math::HitT<Real> toReal(const Math::Hit& hit) {
   Math::HitT<Real> out{};
   out.position = Math::convert<Real>(hit.position);
   out.sensorDirection = Math::convert<Real>(hit.sensorDirection);
-  out.etaMeasurementDirection = Math::convert<Real>(hit.etaMeasurementDirection);
-  out.phiMeasurementDirection = Math::convert<Real>(hit.phiMeasurementDirection);
+  out.etaMeasurementDirection =
+      Math::convert<Real>(hit.etaMeasurementDirection);
+  out.phiMeasurementDirection =
+      Math::convert<Real>(hit.phiMeasurementDirection);
   out.localPositionY = static_cast<Real>(hit.localPositionY);
   out.etaCovariance = static_cast<Real>(hit.etaCovariance);
   out.phiCovariance = static_cast<Real>(hit.phiCovariance);

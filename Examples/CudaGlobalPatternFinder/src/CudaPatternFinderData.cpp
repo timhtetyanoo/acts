@@ -386,23 +386,6 @@ void CudaHitPayloadContainer::moveToDevice(cudaStream_t stream) {
   m_onDevice = true;
 }
 
-void CudaHitPayloadContainer::allocateDevice(size_type size,
-                                             cudaStream_t stream) {
-  clearDevice();
-  m_size = size;
-  m_host = {};
-  auto all = [size](const auto& /*hostColumn*/) { return size; };
-  std::size_t bytes{0u};
-  carveColumns(hitPayloadColumns, m_host, m_device, nullptr, bytes, all);
-  char* block{nullptr};
-  ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&block),
-                                  std::max<std::size_t>(bytes, 1u), stream));
-  std::size_t cursor{0u};
-  carveColumns(hitPayloadColumns, m_host, m_device, block, cursor, all);
-  m_block = block;
-  m_onDevice = true;
-}
-
 void CudaHitPayloadContainer::moveToHost(cudaStream_t stream) {
   if (!m_onDevice) {
     return;
@@ -650,62 +633,6 @@ CudaPatternRecordContainer::CudaPatternRecordContainer(
   m_host.lastInsertedHit.assign(slots, cudaInvalidHitPosition);
   m_host.prevLayerHit.assign(slots, cudaInvalidHitPosition);
   m_host.lineAnchorHit.assign(slots, cudaInvalidHitPosition);
-}
-
-CudaPatternRecordContainer CudaPatternRecordContainer::onDevice(
-    size_type nSeeds, size_type capacityPerSeed, size_type maxHitsPerPattern,
-    cudaStream_t stream) {
-  CudaPatternRecordContainer records{};
-  records.m_nSeeds = nSeeds;
-  records.m_capacityPerSeed = capacityPerSeed;
-  records.m_maxHitsPerPattern = maxHitsPerPattern;
-  const size_type slots{records.nSlots()};
-  const size_type hitSlots{slots * maxHitsPerPattern};
-  CudaPatternRecordArrays& device{records.m_device};
-  auto bySlot = [slots](const auto& /*hostColumn*/) { return slots; };
-  auto byHit = [hitSlots](const auto& /*hostColumn*/) { return hitSlots; };
-  auto bySeed = [nSeeds](const auto& /*hostColumn*/) { return nSeeds; };
-  // Every column in one block
-  char* block{nullptr};
-  for (int pass = 0; pass < 2; ++pass) {
-    std::size_t cursor{0u};
-    carveColumns(patternSlotColumns, records.m_host, device, block, cursor,
-                 bySlot);
-    carveColumns(patternHitColumns, records.m_host, device, block, cursor,
-                 byHit);
-    carveColumns(patternSeedColumns, records.m_host, device, block, cursor,
-                 bySeed);
-    if (pass == 0) {
-      ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&block),
-                                      std::max<std::size_t>(cursor, 1u),
-                                      stream));
-    }
-  }
-  records.m_block = block;
-  zeroDeviceColumn(device.nPatterns, nSeeds, stream);
-  zeroDeviceColumn(device.overflow, nSeeds, stream);
-  zeroDeviceColumn(device.status, slots, stream);
-  device.nSeeds = static_cast<std::uint32_t>(nSeeds);
-  device.capacityPerSeed = static_cast<std::uint32_t>(capacityPerSeed);
-  device.maxHitsPerPattern = static_cast<std::uint32_t>(maxHitsPerPattern);
-  records.m_onDevice = true;
-  return records;
-}
-
-void CudaPatternRecordContainer::copyFromDevice(
-    const CudaPatternRecordArrays& source, cudaStream_t stream) {
-  if (source.maxHitsPerPattern != m_maxHitsPerPattern) {
-    throw std::invalid_argument(
-        "CudaPatternRecordContainer::copyFromDevice: the hit slots per "
-        "pattern differ");
-  }
-  // The first slots of the source, which has at least as many as this one
-  CudaPatternRecordArrays& sourceColumns{
-      const_cast<CudaPatternRecordArrays&>(source)};
-  patternColumns(m_host, sourceColumns,
-                 [stream](auto& hostColumn, const auto& deviceColumn) {
-                   copyColumnToHost(hostColumn, deviceColumn, stream);
-                 });
 }
 
 CudaPatternRecordContainer::CudaPatternRecordContainer(
@@ -1066,8 +993,8 @@ void CudaCandidateListContainer::stageForDevice(CudaStagedBlock& block) {
   }
   candidateInputColumns(
       m_host, m_device, [&](const auto& hostColumn, auto& deviceColumn) {
-        using T = typename std::remove_reference_t<
-            decltype(hostColumn)>::value_type;
+        using T =
+            typename std::remove_reference_t<decltype(hostColumn)>::value_type;
         const auto [host, device] = block.take<T>(hostColumn.size());
         if (place) {
           if (host != nullptr) {
@@ -1079,8 +1006,8 @@ void CudaCandidateListContainer::stageForDevice(CudaStagedBlock& block) {
   // Zeroed, so that a seed the kernel has not reached reads as pending
   candidateOutputColumns(
       m_host, m_device, [&](const auto& hostColumn, auto& deviceColumn) {
-        using T = typename std::remove_reference_t<
-            decltype(hostColumn)>::value_type;
+        using T =
+            typename std::remove_reference_t<decltype(hostColumn)>::value_type;
         const auto [host, device] = block.take<T>(hostColumn.size());
         if (place) {
           if (host != nullptr) {
@@ -1106,18 +1033,16 @@ void CudaPatternRecordContainer::copyFromHostCopy(
   }
   CudaPatternRecordArrays& sourceColumns{
       const_cast<CudaPatternRecordArrays&>(source)};
-  patternColumns(m_host, sourceColumns,
-                 [&](auto& hostColumn, const auto& deviceColumn) {
-                   if (hostColumn.empty()) {
-                     return;
-                   }
-                   const char* at{
-                       hostCopy +
-                       (reinterpret_cast<const char*>(deviceColumn) -
-                        deviceBase)};
-                   std::memcpy(hostColumn.data(), at,
-                               hostColumn.size() * sizeof(hostColumn[0]));
-                 });
+  patternColumns(
+      m_host, sourceColumns, [&](auto& hostColumn, const auto& deviceColumn) {
+        if (hostColumn.empty()) {
+          return;
+        }
+        const char* at{hostCopy + (reinterpret_cast<const char*>(deviceColumn) -
+                                   deviceBase)};
+        std::memcpy(hostColumn.data(), at,
+                    hostColumn.size() * sizeof(hostColumn[0]));
+      });
 }
 
 }  // namespace ActsExamples

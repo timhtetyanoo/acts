@@ -87,12 +87,12 @@ static_assert(alignof(Pattern) <= 8u,
               "the slots of patterns are copied in 8-byte words");
 
 /// The result of the line test of GlobalPatternFinder
-enum class Decision : std::uint8_t { addHit, branchPattern, rejectHit };
+enum class Decision : std::uint8_t { eAddHit, eBranchPattern, eRejectHit };
 struct LineTest {
   Real residual{0};
   Real sigma{0};
   std::uint8_t nDof{0u};
-  Decision decision{Decision::rejectHit};
+  Decision decision{Decision::eRejectHit};
 };
 
 /// The quantities of a pattern that the comparisons between two patterns
@@ -414,15 +414,15 @@ struct SeedBuilder {
       return LineTest{};
     }
     auto makeResult = [&](Decision decision) {
-      const Math::LineResidualT<Real> res{Math::lineResidual(
-          Math::LineT<Real>{pat.linePos, pat.lineDir, pat.leverArm,
-                            pat.useBeamspot},
-          pat.plane, pat.nPhiLayers, hit(pat.lineAnchorHit),
-          hit(pat.lastInsertedHit), testHit, beamspot())};
-      LineTest out{res.residual, res.sigma, res.nDof, Decision::rejectHit};
-      Real accWindow{static_cast<Real>(res.nDof == 1u ? cfg.nResidualSigma
-                                                      : cfg.cut2Dof) *
-                     res.sigma};
+      const Math::LineResidualT<Real> res{
+          Math::lineResidual(Math::LineT<Real>{pat.linePos, pat.lineDir,
+                                               pat.leverArm, pat.useBeamspot},
+                             pat.plane, pat.nPhiLayers, hit(pat.lineAnchorHit),
+                             hit(pat.lastInsertedHit), testHit, beamspot())};
+      LineTest out{res.residual, res.sigma, res.nDof, Decision::eRejectHit};
+      Real accWindow{
+          static_cast<Real>(res.nDof == 1u ? cfg.nResidualSigma : cfg.cut2Dof) *
+          res.sigma};
       if (pat.useBeamspot || testHit.station != group(pat.lastInsertedHit) ||
           (testHit.station != group(pat.prevLayerHit) &&
            globLayer(test) == globLayer(pat.lastInsertedHit))) {
@@ -435,7 +435,7 @@ struct SeedBuilder {
     };
     if (globLayer(test) != globLayer(pat.lastInsertedHit)) {
       updateLineParameters(pat);
-      return makeResult(Decision::addHit);
+      return makeResult(Decision::eAddHit);
     }
     if (test == pat.lastInsertedHit) {
       return LineTest{};
@@ -443,7 +443,7 @@ struct SeedBuilder {
     if (globLayer(pat.lineAnchorHit) == globLayer(pat.lastInsertedHit)) {
       return LineTest{};
     }
-    return makeResult(Decision::branchPattern);
+    return makeResult(Decision::eBranchPattern);
   }
 
   /// PatternStateAux::addHit
@@ -888,8 +888,8 @@ struct WarpSeed {
     target = target > lanesPerWarp ? target : lanesPerWarp;
     if (scratchCap < target) {
       const unsigned long long maskBytes{4ull * target * maxChunks};
-      const unsigned long long testBytes{sizeof(LineTest) * target *
-                                         maxChunks * lanesPerWarp};
+      const unsigned long long testBytes{sizeof(LineTest) * target * maxChunks *
+                                         lanesPerWarp};
       // The tests first, at the alignment of the block
       const unsigned long long bytes{testBytes + 2ull * maskBytes +
                                      4ull * target + 3ull * target};
@@ -1175,7 +1175,7 @@ struct WarpSeed {
         const LineTest res{b.checkLine(pattern(from, i),
                                        static_cast<std::uint16_t>(chunk + h),
                                        chunkHits[h])};
-        if (res.decision != Decision::addHit) {
+        if (res.decision != Decision::eAddHit) {
           continue;
         }
         tests[(i * maxChunks + c) * lanesPerWarp + h] = res;
@@ -1472,7 +1472,7 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
   __shared__ alignas(RealHit) unsigned char
       chunkStorage[warpsPerBlock * lanesPerWarp * sizeof(RealHit)];
   RealHit* chunkHits{reinterpret_cast<RealHit*>(chunkStorage) +
-                       (threadIdx.x / lanesPerWarp) * lanesPerWarp};
+                     (threadIdx.x / lanesPerWarp) * lanesPerWarp};
   WarpSeed warp{.b = seedBuilder(hits, lists, cfg, seed, maxHits),
                 .arena = arena,
                 .stride = stride,
@@ -1984,8 +1984,9 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
       const std::uint8_t flags{hits.flags[rows[i]]};
       info[i] = static_cast<std::uint8_t>(
           (hits.station[rows[i]] & CandidateInfo::groupMask) |
-          ((flags & CudaHitFlags::measuresPhi) != 0u ? CandidateInfo::measuresPhi
-                                                     : 0u) |
+          ((flags & CudaHitFlags::measuresPhi) != 0u
+               ? CandidateInfo::measuresPhi
+               : 0u) |
           ((flags & CudaHitFlags::precision) != 0u ? CandidateInfo::precision
                                                    : 0u));
     }
