@@ -306,9 +306,8 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
 
   // Anchor and last hit far apart, then close enough to need the beam spot
   for (const auto [anchor, last] : {std::pair{0u, 2u}, std::pair{1u, 3u}}) {
-    PatternStateAux pat{gctx, OrderedHit{&hits.payloads[anchor], 0u},
-                        4,    beamspot,
-                        &cfg, logger.get()};
+    PatternStateAux pat{gctx, OrderedHit{&hits.payloads[anchor], 0u}, 4, &cfg,
+                        logger.get()};
     // A bending plane off the origin, with a correlated covariance
     pat.patPhi = std::atan2(hits.payloads[1].position.y(),
                             hits.payloads[1].position.x());
@@ -320,7 +319,6 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
     pat.bendPlaneCov[Acts::toUnderlying(BendPlaneCov::ePhiS)] = -1.e-2;
     pat.lineAnchorHit = OrderedHit{&hits.payloads[anchor], 0u};
     pat.lastInsertedHit = OrderedHit{&hits.payloads[last], 5u};
-    pat.needLineUpdate = true;
     pat.updateLineParameters(gctx, beamspot);
 
     const Math::BendPlane plane{
@@ -423,18 +421,19 @@ BOOST_AUTO_TEST_CASE(CudaBendPlaneFitMatchesCpu) {
   for (const std::vector<std::uint32_t>& phiRows :
        {std::vector<std::uint32_t>{}, std::vector<std::uint32_t>{4u},
         std::vector<std::uint32_t>{1u, 4u, 6u}}) {
-    PatternStateAux pat{gctx,   OrderedHit{&hits.payloads[0], 0u},
-                        sector, beamspot,
-                        &cfg,   logger.get()};
+    PatternStateAux pat{gctx, OrderedHit{&hits.payloads[0], 0u}, sector, &cfg,
+                        logger.get()};
     for (const std::uint32_t row : phiRows) {
       pat.hitsPerGroup[ActsExamples::PatternTopology::groupIndex(
                            hits.payloads[row])]
           .push_back(OrderedHit{&hits.payloads[row], 0u});
     }
-    pat.nPhiLayers = phiRows.size();
+    // The regression freezes its weights at the current bending plane
     const double previousPhi{0.3};
     pat.patPhi = previousPhi;
-    pat.updatePatternPhi(gctx, beamspot);
+    pat.bendPlaneNorm =
+        Vector3{-std::sin(previousPhi), std::cos(previousPhi), 0.};
+    pat.updateBendPlane(gctx, beamspot);
 
     // Visit the same hits, group by group
     auto forEachPhiHit = [&](auto&& fn) {

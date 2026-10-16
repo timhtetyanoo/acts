@@ -54,14 +54,21 @@ struct Pattern {
   std::uint16_t lastInsertedHit{0u};
   std::uint16_t prevLayerHit{0u};
   std::uint16_t lineAnchorHit{0u};
+  /// Second point of the pattern line. Stays put when a hit is added until
+  /// the line is refitted
+  std::uint16_t lineEndHit{0u};
   std::uint16_t nHits{0u};
   std::uint8_t nPrecisionLayers{0u};
   std::uint8_t nTriggerLayers{0u};
   std::uint8_t nPhiLayers{0u};
+  /// Pending PatternState updates: bending plane, line anchor, line
+  std::uint8_t needUpdate{0u};
   std::int8_t sector{0};
   bool useBeamspot{false};
-  bool needLineUpdate{false};
   bool isOverlap{false};
+  static constexpr std::uint8_t kBend = 1u << 0u;
+  static constexpr std::uint8_t kAnchor = 1u << 1u;
+  static constexpr std::uint8_t kLine = 1u << 2u;
   /// Forward pattern this backward pattern descends from; patterns are only
   /// pruned and compared within a family
   std::uint16_t family{0u};
@@ -126,8 +133,7 @@ template <typename RowOfA, typename RowOfB>
 __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
                                const CudaPatternFinderConfig& cfg,
                                const PatternInfo& a, RowOfA rowOfA,
-                               std::uint32_t goodA, const PatternInfo& b,
-                               RowOfB rowOfB, std::uint32_t goodB) {
+                               const PatternInfo& b, RowOfB rowOfB) {
   namespace Sector = Math::ExpandedSector;
   if (!Sector::isNeighbour(a.sector, b.sector)) {
     return false;
@@ -154,11 +160,12 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
       return false;
     }
   }
-  // Two space points share a hit if they come from the same measurement
+  // The same space point, or two space points from the same measurement
   auto overlaps = [&hits](std::uint32_t row1, std::uint32_t row2) {
-    return hits.geometryId[row1] == hits.geometryId[row2] &&
-           std::abs(hits.localPositionY[row1] - hits.localPositionY[row2]) <
-               Math::epsilon;
+    return row1 == row2 ||
+           (hits.geometryId[row1] == hits.geometryId[row2] &&
+            std::abs(hits.localPositionY[row1] - hits.localPositionY[row2]) <
+                Math::epsilon);
   };
   // Space points of one measurement lie on one surface, hence in one group
   std::uint32_t nSharedInGroup[Math::Station::nGroups]{};
@@ -171,20 +178,35 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
       }
     }
   }
+  std::uint32_t nHitsA[Math::Station::nGroups]{};
+  std::uint32_t nHitsB[Math::Station::nGroups]{};
+  for (std::uint32_t i = 0u; i < a.nHits; ++i) {
+    ++nHitsA[hits.station[rowOfA(i)]];
+  }
+  for (std::uint32_t j = 0u; j < b.nHits; ++j) {
+    ++nHitsB[hits.station[rowOfB(j)]];
+  }
   std::uint32_t nSharedHits{0u};
   std::uint32_t nSharedGroups{0u};
+  std::uint32_t nCommonGroups{0u};
   for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
+    if (nHitsA[g] == 0u || nHitsB[g] == 0u) {
+      continue;
+    }
+    ++nCommonGroups;
     nSharedHits += nSharedInGroup[g];
-    if (nSharedInGroup[g] >= cfg.minGroupLayers) {
+    // A group is shared when most hits of the smaller pattern in it are shared
+    const std::uint32_t smaller{nHitsA[g] < nHitsB[g] ? nHitsA[g] : nHitsB[g]};
+    if (2u * nSharedInGroup[g] > smaller) {
       ++nSharedGroups;
     }
   }
   const std::uint32_t minHits{a.nBendingLayers() < b.nBendingLayers()
                                   ? a.nBendingLayers()
                                   : b.nBendingLayers()};
-  const std::uint32_t minGroups{goodA < goodB ? goodA : goodB};
-  return 2u * nSharedHits >= minHits &&
-         nSharedGroups >= (minGroups < 2u ? minGroups : 2u);
+  const std::uint32_t groupCut{cfg.minGroups < nCommonGroups ? cfg.minGroups
+                                                             : nCommonGroups};
+  return 2u * nSharedHits >= minHits && nSharedGroups >= groupCut;
 }
 
 /// Operations on the patterns of one seed: line tests, hit insertion, fits,
@@ -259,15 +281,24 @@ struct SeedBuilder {
   }
 
   /// Refits the bending plane from the phi hits, group by group in insertion
-  /// order
-  __device__ void updatePatternPhi(Pattern& pat) {
+  /// order, and records how many there are
+  __device__ void updateBendPlane(Pattern& pat) {
+    pat.needUpdate = (pat.needUpdate & ~Pattern::kBend) | Pattern::kLine;
+    std::uint32_t nPhi{0u};
+    const std::uint16_t* phiPosAll{hitsOf(pat)};
+    for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
+      if (measuresPhi(phiPosAll[i])) {
+        ++nPhi;
+      }
+    }
+    pat.nPhiLayers = static_cast<std::uint8_t>(nPhi);
     const std::uint16_t* hitPos{hitsOf(pat)};
     // List up to maxListed phi hits once; with more, scan all hits per group
     constexpr std::uint32_t maxListed{32u};
     std::uint16_t phiPos[maxListed];
     std::uint8_t phiGroup[maxListed];
     std::uint32_t nListed{0u};
-    if (pat.nPhiLayers <= maxListed) {
+    if (nPhi <= maxListed) {
       for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
         const std::uint16_t pos{hitPos[i]};
         if (measuresPhi(pos)) {
@@ -277,7 +308,7 @@ struct SeedBuilder {
         }
       }
     }
-    const bool listed{pat.nPhiLayers <= maxListed};
+    const bool listed{nPhi <= maxListed};
     auto forEachPhiHit = [&](auto&& fn) {
       for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
         if (listed) {
@@ -302,62 +333,113 @@ struct SeedBuilder {
                                    beamspot(), forEachPhiHit);
   }
 
-  /// The anchor becomes the hit closest in layer to refHit, in the closest
-  /// group other than refHit's own
+  __device__ static std::uint32_t layerDistance(std::uint16_t a,
+                                                std::uint16_t b) {
+    return a > b ? static_cast<std::uint32_t>(a - b)
+                 : static_cast<std::uint32_t>(b - a);
+  }
+
+  /// The anchor becomes the hit closest in layer to refHit outside refHit's
+  /// group. With only one group it is the hit furthest from refHit.
   __device__ void moveLineAnchorHit(Pattern& pat, std::uint16_t refHit) {
+    pat.needUpdate = (pat.needUpdate & ~Pattern::kAnchor) | Pattern::kLine;
+    const std::uint16_t* hitPos{hitsOf(pat)};
+    const std::uint16_t refLayer{globLayer(refHit)};
     if (countGroups(pat, false) < 2u) {
-      pat.lineAnchorHit = pat.lastInsertedHit;
+      std::uint16_t best{hitPos[0]};
+      std::uint32_t bestDist{0u};
+      for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
+        const std::uint32_t dist{layerDistance(globLayer(hitPos[i]), refLayer)};
+        if (dist > bestDist) {
+          bestDist = dist;
+          best = hitPos[i];
+        }
+      }
+      pat.lineAnchorHit = best;
       return;
     }
-    auto layerDist = [](int a, int b) { return a > b ? a - b : b - a; };
-    const int refLayer{globLayer(refHit)};
     const std::uint8_t refGroup{group(refHit)};
-    const std::uint16_t* hitPos{hitsOf(pat)};
-    int bestDist{INT_MAX};
-    std::uint32_t bestGroup{0u};
+    std::uint32_t bestDist{UINT_MAX};
     for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
       if (g == refGroup) {
         continue;
       }
       for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
-        if (group(hitPos[i]) == g) {
-          const int dist{layerDist(globLayer(hitPos[i]), refLayer)};
-          if (dist < bestDist) {
-            bestDist = dist;
-            bestGroup = g;
-          }
-          break;
+        if (group(hitPos[i]) != g) {
+          continue;
         }
-      }
-    }
-    int bestHitDist{INT_MAX};
-    for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
-      if (group(hitPos[i]) != bestGroup) {
-        continue;
-      }
-      const int dist{layerDist(globLayer(hitPos[i]), refLayer)};
-      if (dist < bestHitDist) {
-        bestHitDist = dist;
-        pat.lineAnchorHit = hitPos[i];
+        const std::uint32_t dist{layerDistance(globLayer(hitPos[i]), refLayer)};
+        if (dist < bestDist) {
+          bestDist = dist;
+          pat.lineAnchorHit = hitPos[i];
+        }
+        if (dist == 1u) {
+          return;
+        }
       }
     }
   }
 
   __device__ void updateLineParameters(Pattern& pat) {
-    if (!pat.needLineUpdate) {
-      return;
-    }
+    pat.needUpdate &= ~Pattern::kLine;
+    pat.lineEndHit = pat.lastInsertedHit;
     const Math::LineT<Real> line{Math::lineThroughHits(
         Math::projectToPhiPlane(hit(pat.lineAnchorHit), pat.plane.normal,
                                 pat.plane.offset),
-        Math::projectToPhiPlane(hit(pat.lastInsertedHit), pat.plane.normal,
+        Math::projectToPhiPlane(hit(pat.lineEndHit), pat.plane.normal,
                                 pat.plane.offset),
         cfg.minHitDistance4Line, beamspot())};
     pat.linePos = line.position;
     pat.lineDir = line.direction;
     pat.leverArm = line.leverArm;
     pat.useBeamspot = line.useBeamspot;
-    pat.needLineUpdate = false;
+  }
+
+  /// Applies the updates booked by addHit. Entering a group that has no hit
+  /// yet draws the line across the previous group instead of the old anchor.
+  __device__ void syncState(Pattern& pat, bool searchInNewGroup) {
+    if ((pat.needUpdate & Pattern::kBend) != 0u) {
+      updateBendPlane(pat);
+    }
+    if ((pat.needUpdate & Pattern::kAnchor) != 0u) {
+      pat.lineAnchorHit = pat.prevLayerHit;
+      pat.needUpdate = (pat.needUpdate & ~Pattern::kAnchor) | Pattern::kLine;
+    }
+    const std::uint8_t lastGroup{group(pat.lastInsertedHit)};
+    if (searchInNewGroup && lastGroup != group(pat.lineAnchorHit)) {
+      const std::uint16_t* hitPos{hitsOf(pat)};
+      std::uint16_t furthest{pat.lastInsertedHit};
+      std::uint32_t bestDist{0u};
+      for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
+        if (group(hitPos[i]) != lastGroup) {
+          continue;
+        }
+        const std::uint32_t dist{layerDistance(globLayer(hitPos[i]),
+                                               globLayer(pat.lastInsertedHit))};
+        if (dist > bestDist) {
+          bestDist = dist;
+          furthest = hitPos[i];
+        }
+      }
+      const RealVector3 delta{
+          Math::projectToPhiPlane(hit(furthest), pat.plane.normal,
+                                  pat.plane.offset) -
+          Math::projectToPhiPlane(hit(pat.lastInsertedHit), pat.plane.normal,
+                                  pat.plane.offset)};
+      if (furthest != pat.lastInsertedHit &&
+          Math::dot(delta, delta) >=
+              Math::square(static_cast<Real>(cfg.minHitDistance4Line))) {
+        pat.lineAnchorHit = furthest;
+        pat.needUpdate |= Pattern::kLine;
+      } else if (globLayer(pat.lineAnchorHit) >
+                 globLayer(pat.lastInsertedHit)) {
+        pat.lineAnchorHit = pat.lastInsertedHit;
+        pat.needUpdate |= Pattern::kLine;
+      }
+    }
+    if ((pat.needUpdate & Pattern::kLine) != 0u) {
+      updateLineParameters(pat);
+    }
   }
 
   __device__ bool isPhiCompatible(const Pattern& pat, const RealHit& h) {
@@ -382,14 +464,17 @@ struct SeedBuilder {
           Math::lineResidual(Math::LineT<Real>{pat.linePos, pat.lineDir,
                                                pat.leverArm, pat.useBeamspot},
                              pat.plane, pat.nPhiLayers, hit(pat.lineAnchorHit),
-                             hit(pat.lastInsertedHit), testHit, beamspot())};
+                             hit(pat.lineEndHit), testHit, beamspot())};
       LineTest out{res.residual, res.sigma, res.nDof, Decision::eRejectHit};
+      const bool searchInNewGroup{testHit.station !=
+                                  group(pat.lastInsertedHit)};
+      const bool searchInNewLayer{globLayer(test) !=
+                                  globLayer(pat.lastInsertedHit)};
       Real accWindow{
           static_cast<Real>(res.nDof == 1u ? cfg.nResidualSigma : cfg.cut2Dof) *
           res.sigma};
-      if (pat.useBeamspot || testHit.station != group(pat.lastInsertedHit) ||
-          (testHit.station != group(pat.prevLayerHit) &&
-           globLayer(test) == globLayer(pat.lastInsertedHit))) {
+      if (pat.useBeamspot || searchInNewGroup ||
+          (testHit.station != group(pat.prevLayerHit) && !searchInNewLayer)) {
         accWindow *= static_cast<Real>(cfg.loosenAcceptanceFactor);
       }
       if (res.residual < accWindow) {
@@ -398,7 +483,6 @@ struct SeedBuilder {
       return out;
     };
     if (globLayer(test) != globLayer(pat.lastInsertedHit)) {
-      updateLineParameters(pat);
       return makeResult(Decision::eAddHit);
     }
     if (test == pat.lastInsertedHit) {
@@ -423,8 +507,7 @@ struct SeedBuilder {
       ++pat.nTriggerLayers;
     }
     if (measuresPhi(test)) {
-      ++pat.nPhiLayers;
-      updatePatternPhi(pat);
+      pat.needUpdate |= Pattern::kBend;
     }
     const bool isNewGroup{group(test) != group(pat.lastInsertedHit)};
     pat.prevLayerHit = pat.lastInsertedHit;
@@ -436,14 +519,13 @@ struct SeedBuilder {
     pat.lastResidual = res.residual;
     pat.lastNDoF = res.nDof;
     if (isNewGroup) {
-      moveLineAnchorHit(pat, test);
+      pat.needUpdate |= Pattern::kAnchor;
     }
-    pat.needLineUpdate = true;
+    pat.needUpdate |= Pattern::kLine;
   }
 
   __device__ bool areOverlapping(const Pattern& a, const Pattern& b) {
-    return ::areOverlapping(hits, cfg, info(a), rowsOf(a), countGroups(a, true),
-                            info(b), rowsOf(b), countGroups(b, true));
+    return ::areOverlapping(hits, cfg, info(a), rowsOf(a), info(b), rowsOf(b));
   }
 
   __device__ void makeSeedPattern(Pattern& pat, std::uint16_t seedPos,
@@ -452,6 +534,7 @@ struct SeedBuilder {
     pat.lastInsertedHit = seedPos;
     pat.prevLayerHit = seedPos;
     pat.lineAnchorHit = seedPos;
+    pat.lineEndHit = seedPos;
     pat.patTheta = Math::theta(hit(seedPos).position);
     pat.sector = sector;
     hitsOf(pat)[0] = seedPos;
@@ -461,11 +544,20 @@ struct SeedBuilder {
     } else {
       ++pat.nTriggerLayers;
     }
+    // The sector plane stands until the first sync counts the phi hits
+    const Real sectorPhi{Math::ExpandedSector::phi<Real>(sector)};
+    pat.plane.phi = sectorPhi;
+    pat.plane.offset = 0;
+    pat.plane.normal =
+        RealVector3{-std::sin(sectorPhi), std::cos(sectorPhi), 0};
+    pat.plane.covPhiPhi =
+        Math::square(Math::ExpandedSector::size<Real>(sector)) / Real{3};
+    pat.plane.covSS = 0;
+    pat.plane.covPhiS = 0;
     if (measuresPhi(seedPos)) {
-      ++pat.nPhiLayers;
+      pat.needUpdate |= Pattern::kBend;
     }
-    updatePatternPhi(pat);
-    pat.needLineUpdate = true;
+    pat.needUpdate |= Pattern::kLine;
   }
 
   __device__ bool passPatternCuts(const Pattern& pat) {
@@ -519,9 +611,10 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   out.lastInsertedHit[slot] = ownPosition(pat.lastInsertedHit);
   out.prevLayerHit[slot] = ownPosition(pat.prevLayerHit);
   out.lineAnchorHit[slot] = ownPosition(pat.lineAnchorHit);
-  out.flags[slot] =
-      (pat.useBeamspot ? CudaPatternFlags::useBeamspot : 0u) |
-      (pat.needLineUpdate ? CudaPatternFlags::needLineUpdate : 0u);
+  out.flags[slot] = (pat.useBeamspot ? CudaPatternFlags::useBeamspot : 0u) |
+                    ((pat.needUpdate & Pattern::kLine) != 0u
+                         ? CudaPatternFlags::needLineUpdate
+                         : 0u);
   out.status[slot] = CudaPatternStatus::ok;
   for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
     out.hitIndex[out.hitSlot(slot, i)] = builder.rows[hitPos[i]];
@@ -1037,7 +1130,8 @@ struct WarpSeed {
     __syncwarp();
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
       if ((flags[i] & flagDropped) == 0u) {
-        b.updateLineParameters(pattern(from, i));
+        Pattern& pat{pattern(from, i)};
+        b.syncState(pat, b.group(pat.lastInsertedHit) != layerGroup);
       }
     }
     __syncwarp();
@@ -1244,24 +1338,23 @@ struct WarpSeed {
       current = 1u - current;
       first = last;
     }
+    // Restart every forward pattern at the seed, then resolve overlaps.
+    // The core fits the restarted line before comparing the patterns.
+    for (std::uint32_t f = lane; f < n; f += lanesPerWarp) {
+      Pattern& start{pattern(current, f)};
+      start.family = static_cast<std::uint16_t>(f);
+      if (start.isOverlap) {
+        continue;
+      }
+      start.lastInsertedHit = seedPos;
+      b.moveLineAnchorHit(start, seedPos);
+      b.syncState(start, false);
+    }
+    __syncwarp();
     if (n > 1u) {
       resolveOverlaps(current, n, false);
     }
 
-    // Backward: every forward pattern restarts at the seed as its own family
-    for (std::uint32_t f = lane; f < n; f += lanesPerWarp) {
-      Pattern& start{pattern(current, f)};
-      if (start.isOverlap) {
-        continue;
-      }
-      b.moveLineAnchorHit(start, seedPos);
-      start.lastInsertedHit = seedPos;
-      start.lastResidual = 0.;
-      start.lastResSigma = 0.;
-      start.lastNDoF = 0u;
-      start.family = static_cast<std::uint16_t>(f);
-    }
-    __syncwarp();
     std::uint32_t last{seedPos};
     while (last > 0u && b.globLayer(last - 1u) == seedLayer) {
       --last;
@@ -1280,6 +1373,13 @@ struct WarpSeed {
     for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
       Pattern& pat{pattern(current, k)};
       pat.isOverlap = pat.isOverlap || !b.passPatternCuts(pat);
+    }
+    __syncwarp();
+    for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
+      Pattern& pat{pattern(current, k)};
+      if (!pat.isOverlap) {
+        b.syncState(pat, false);
+      }
     }
     __syncwarp();
     if (n > 1u) {
@@ -1600,12 +1700,22 @@ __device__ void linkPair(const CudaHitPayloadArrays& hits,
   const std::size_t word{static_cast<std::size_t>(lower) * wordsPerRow +
                          upper / 32u};
   if (areOverlapping(hits, cfg, iFirst ? infoI : infoJ, rowsOf(upper),
-                     good[upper], iFirst ? infoJ : infoI, rowsOf(lower),
-                     good[lower])) {
+                     iFirst ? infoJ : infoI, rowsOf(lower))) {
     atomicOr(&buffers.links[word], bit);
   }
   const std::uint32_t seedLower{buffers.seedOf[lower]};
   if (buffers.seedOf[upper] != seedLower) {
+    // A middle-layer seed is counted in half the theta window of an
+    // inner or outer seed, matching SeedSelector::thetaSearchWindow
+    const std::uint8_t seedLayer{
+        Math::layerOf(hits.station[lists.seedHitIndex[seedLower]])};
+    const Real thetaCut{seedLayer == Math::Layer::Inner ||
+                                seedLayer == Math::Layer::Outer
+                            ? static_cast<Real>(cfg.maxThetaSizeOverlap)
+                            : static_cast<Real>(0.5 * cfg.maxThetaSizeOverlap)};
+    if (std::abs(infoI.patTheta - infoJ.patTheta) > thetaCut) {
+      return;
+    }
     const std::uint32_t seedRow{lists.seedHitIndex[seedLower]};
     const auto upperRows = rowsOf(upper);
     for (std::uint32_t k = 0u; k < event.nHits[upper]; ++k) {
