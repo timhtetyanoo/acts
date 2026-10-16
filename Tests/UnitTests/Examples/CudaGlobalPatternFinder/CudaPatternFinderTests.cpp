@@ -231,14 +231,13 @@ Math::HitT<Real> toReal(const Math::Hit& hit) {
   return out;
 }
 
-/// @brief Bitwise equality of a CPU and a device vector
+/// @brief Bitwise equality of an Eigen vector and a device vector
 bool same(const Vector3& cpu, const Math::Vector3& device) {
   return cpu.x() == device.x && cpu.y() == device.y && cpu.z() == device.z;
 }
 
-/// @brief The candidate checks of GlobalPatternFinder::findPatternsInEta on
-///        one list, written with the CPU types. The sort is stable, as the
-///        device sort is
+/// @brief Reference seed checks of one candidate list, written with the
+///        host types of the pattern finder. Uses a stable sort.
 struct CpuSeed {
   std::uint8_t status{ActsExamples::CudaSeedStatus::pending};
   std::vector<std::uint32_t> rows{};
@@ -371,10 +370,9 @@ BOOST_AUTO_TEST_CASE(CudaPatternLineMatchesCpu) {
           BOOST_CHECK_EQUAL(static_cast<int>(cpu.nDof),
                             static_cast<int>(device.nDof));
 
-          // The same in the number type of the kernel, to its precision. A hit
-          // on the line, such as the anchor or the last hit itself, has no
-          // residual in either: below Acts::s_epsilon for the CPU, and below
-          // the precision of Real here
+          // The same in Real, to its precision. Skip hits on the line, such
+          // as the anchor or the last hit, whose residual is below the
+          // precision of Real.
           if (cpu.residual < 1e-6) {
             continue;
           }
@@ -438,7 +436,7 @@ BOOST_AUTO_TEST_CASE(CudaBendPlaneFitMatchesCpu) {
     pat.patPhi = previousPhi;
     pat.updatePatternPhi(gctx, beamspot);
 
-    // The device visits the same hits, group by group
+    // Visit the same hits, group by group
     auto forEachPhiHit = [&](auto&& fn) {
       for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
         for (const std::uint32_t row : phiRows) {

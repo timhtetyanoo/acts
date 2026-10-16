@@ -79,8 +79,8 @@ ProcessCode RootMuonGlobalPatternWriter::writeT(
   std::lock_guard lock{m_mutex};
   m_eventId = ctx.eventNumber;
 
-  /// The patterns refer to the space points of the event. Their place in the
-  /// input container identifies a hit across runs of the pattern recognition
+  // The patterns refer to the space points of the event. Their place in the
+  // input container identifies a hit across runs of the pattern recognition
   const MuonSpacePointContainer& spacePoints = m_inputSpacePoints(ctx);
   std::unordered_map<const MuonSpacePoint*, std::pair<std::size_t, std::size_t>>
       hitIndices{};

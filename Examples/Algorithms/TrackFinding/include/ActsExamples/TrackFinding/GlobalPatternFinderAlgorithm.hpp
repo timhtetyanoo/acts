@@ -43,7 +43,6 @@ namespace ActsExamples {
 /// current sector and the left sector is of interest, or 0 to indicate that the
 /// sector center is of interest and finally 1 to indicate that the sector to
 /// the right is of interest.
-/// /
 class ExpandedSector {
  public:
   /// @brief Type of the index of the expanded sector
@@ -163,11 +162,11 @@ bool isPrecisionHit(const MuonSpacePoint& hit);
 /// @brief Base class for hit struct containing hit information.
 struct HitPayload {
   /// @brief Constructor with parameters
+  /// @param gctx The geometry context
   /// @param sp The space point
   /// @param bucket The space point bucket
   /// @param localToGlobal The transformation from local to global coordinates
-  /// @param locLayer The layer number in the sector frame
-  /// @param station The station index
+  /// @param measSurface The measurement surface of the space point
   explicit HitPayload(const Acts::GeometryContext& gctx,
                       const MuonSpacePoint* sp,
                       const MuonSpacePointBucket* bucket,
@@ -338,7 +337,7 @@ struct MuonGlobalPattern {
   // window from pattern finding
   double meanNormResidual2{0.};
 };
-/// @brief Abrivation of the MuonGlobalPattern container type
+/// @brief Container of MuonGlobalPattern
 using MuonGlobalPatternContainer = std::vector<MuonGlobalPattern>;
 
 /// @brief Algorithm performing global pattern recognition.

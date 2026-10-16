@@ -34,9 +34,8 @@ using namespace Acts::UnitLiterals;
 
 namespace {
 
-/// @brief Parts of Muon::MuonSectorMapping (MuonDetDescrUtils) used by the ExpandedSector.
-///        Free functions instead of a class; called as sectorMap::f() in place
-///        of sectorMap.f()
+/// @brief Sector geometry of the muon spectrometer used by ExpandedSector:
+///        sizes, central phi and overlaps of the 16 sectors
 namespace sectorMap {
 
 constexpr double s_oneEightsOfPi{std::numbers::pi / 8.};         //  pi/8
@@ -329,7 +328,7 @@ StIndex toStationIndex(MuonSpacePoint::MuonId::StationName index) {
     case ChIndex::EEL:
     case ChIndex::EES:
       return StIndex::EE;
-    /// Don't do anything for
+    // No station index for these
     case ChIndex::MaxVal:
     case ChIndex::UnDef:
       break;
@@ -751,7 +750,7 @@ SearchTreeData GlobalPatternFinderAlgorithm::constructTree(
   }
 
   SearchTree_t::vector_t treeData{};
-  // An event without any precision hit leaves nothing to order below
+  // An event without eta hits gives an empty tree
   if (hitPayloads.empty()) {
     return SearchTreeData{std::move(hitPayloads),
                           SearchTree_t{std::move(treeData)}};
