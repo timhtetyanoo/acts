@@ -6,11 +6,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// The pattern finding in eta on the device: a warp builds each seed one
-/// layer at a time, with memory taken from one arena as it needs it, and the
-/// patterns of the event compete by priority, independently of the seed
-/// order. The tests, the residuals, the fits and the cuts are those of
-/// GlobalPatternFinder and PatternStateAux, written once for the device below.
+/// @file
+/// @brief Pattern finding in eta on the device: one warp per seed, one layer
+/// at a time, then overlap resolution over the event by priority.
 
 #include "ActsExamples/TrackFinding/CudaPatternFinder.hpp"
 #include "ActsExamples/Utilities/CudaUtilities.hpp"
@@ -28,14 +26,11 @@ namespace {
 using namespace ActsExamples;
 namespace Math = CudaPatternMath;
 
-/// The number type of the pattern building, and its hits, line, bending
-/// plane and beam spot
 using Real = Math::Real;
 using RealHit = Math::HitT<Real>;
 using RealVector3 = Math::Vector3T<Real>;
 
-/// What the building reads of a candidate at every step, packed into a byte
-/// per candidate by the seed checks: the group and two flags
+/// Bit layout of the per-candidate byte written by the seed checks
 struct CandidateInfo {
   static constexpr std::uint8_t groupMask = 0x7u;
   static constexpr std::uint8_t measuresPhi = 0x8u;
@@ -43,14 +38,11 @@ struct CandidateInfo {
 };
 static_assert(Math::Station::nGroups <= CandidateInfo::groupMask + 1u);
 
-/// One pattern while it is built: PatternStateAux with its hits, the last
-/// inserted hit, the last hit of the previous layer and the line anchor held
-/// as positions in the seed's sorted candidate list. A position names both
-/// the hit and its global layer, as the CPU's OrderedHit does
+/// A pattern under construction. Hits are positions in the seed's sorted
+/// candidate list; the slot holds the pattern followed by its hit positions.
 struct Pattern {
   RealVector3 linePos{};
   RealVector3 lineDir{};
-  /// The bending plane: patPhi, patPhiOffset, bendPlaneNorm and bendPlaneCov
   Math::BendPlaneT<Real> plane{};
   Real leverArm{0};
   Real sumNormResidual2{0};
@@ -70,14 +62,13 @@ struct Pattern {
   bool useBeamspot{false};
   bool needLineUpdate{false};
   bool isOverlap{false};
-  /// The forward pattern a backward pattern descends from, in the
-  /// layer-by-layer finding; it fits the padding at the end of the struct
+  /// Forward pattern this backward pattern descends from; patterns are only
+  /// pruned and compared within a family
   std::uint16_t family{0u};
 
   __device__ std::uint32_t nBendingLayers() const {
     return nPrecisionLayers + nTriggerLayers;
   }
-  /// PatternStateAux::getMeanResidual2
   __device__ Real meanResidual2() const {
     return sumNormResidual2 / (nDoF > 1u ? static_cast<Real>(nDoF) : Real{1});
   }
@@ -86,7 +77,6 @@ struct Pattern {
 static_assert(alignof(Pattern) <= 8u,
               "the slots of patterns are copied in 8-byte words");
 
-/// The result of the line test of GlobalPatternFinder
 enum class Decision : std::uint8_t { eAddHit, eBranchPattern, eRejectHit };
 struct LineTest {
   Real residual{0};
@@ -95,9 +85,6 @@ struct LineTest {
   Decision decision{Decision::eRejectHit};
 };
 
-/// The quantities of a pattern that the comparisons between two patterns
-/// read. The hits are read through a function from the position in the
-/// pattern's hit list to the payload row
 struct PatternInfo {
   std::int8_t sector{0};
   Real patTheta{0};
@@ -108,7 +95,6 @@ struct PatternInfo {
   std::uint32_t nPhiLayers{0u};
   std::uint32_t nPrecisionLayers{0u};
   std::uint32_t nTriggerLayers{0u};
-  /// PatternStateAux::getMeanResidual2
   Real meanResidual2{0};
   std::uint32_t nHits{0u};
 
@@ -117,8 +103,6 @@ struct PatternInfo {
   }
 };
 
-/// PatternStateAux::countGroups: the number of groups with at least minHits
-/// hits
 template <typename RowOf>
 __device__ std::uint32_t countGroups(const CudaHitPayloadArrays& hits,
                                      std::uint32_t nHits, RowOf rowOf,
@@ -136,8 +120,8 @@ __device__ std::uint32_t countGroups(const CudaHitPayloadArrays& hits,
   return nGroups;
 }
 
-/// GlobalPatternFinder::areOverlapping. goodA and goodB
-/// are the numbers of good groups of the two patterns
+/// Overlap: neighbouring sectors, close in theta and phi, and enough shared
+/// hits and groups
 template <typename RowOfA, typename RowOfB>
 __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
                                const CudaPatternFinderConfig& cfg,
@@ -152,7 +136,6 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
       static_cast<Real>(cfg.maxThetaSizeOverlap)) {
     return false;
   }
-  // The phi of both patterns at a common radius, where the first one lives
   const Real refR{a.anchorRadius};
   const Real phiA{a.patPhi + a.patPhiOffset / refR};
   const Real phiB{b.patPhi + b.patPhiOffset / refR};
@@ -171,15 +154,13 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
       return false;
     }
   }
-  // HitPayload::overlaps: the same measurement in two space points
+  // Two space points share a hit if they come from the same measurement
   auto overlaps = [&hits](std::uint32_t row1, std::uint32_t row2) {
     return hits.geometryId[row1] == hits.geometryId[row2] &&
            std::abs(hits.localPositionY[row1] - hits.localPositionY[row2]) <
                Math::epsilon;
   };
-  // The hits of a shared by b, per group. The CPU counts them group by
-  // group; two space points of one measurement sit on one surface and so in
-  // one group, so a single pass over the pairs counts the same
+  // Space points of one measurement lie on one surface, hence in one group
   std::uint32_t nSharedInGroup[Math::Station::nGroups]{};
   for (std::uint32_t i = 0u; i < a.nHits; ++i) {
     const std::uint32_t rowA{rowOfA(i)};
@@ -202,24 +183,19 @@ __device__ bool areOverlapping(const CudaHitPayloadArrays& hits,
                                   ? a.nBendingLayers()
                                   : b.nBendingLayers()};
   const std::uint32_t minGroups{goodA < goodB ? goodA : goodB};
-  // nSharedHits >= 0.5 * minHits, in integers
   return 2u * nSharedHits >= minHits &&
          nSharedGroups >= (minGroups < 2u ? minGroups : 2u);
 }
 
-/// The operations of GlobalPatternFinder and PatternStateAux on the patterns
-/// of one seed, wherever they are stored. A pattern lives in a slot that holds
-/// the pattern followed by its maxHits hit positions
+/// Operations on the patterns of one seed: line tests, hit insertion, fits,
+/// cuts and overlap checks
 struct SeedBuilder {
   const CudaHitPayloadArrays& hits;
   const CudaPatternFinderConfig& cfg;
   const std::uint32_t* rows;
   const std::uint16_t* globLayers;
-  /// CandidateInfo of each candidate, read at one place instead of through
-  /// its row
   const std::uint8_t* infos;
   std::uint32_t maxHits;
-  /// CudaPatternOverflow bits of what did not fit
   std::uint8_t overflow{0u};
 
   __device__ std::uint16_t* hitsOf(const Pattern& pat) {
@@ -230,7 +206,6 @@ struct SeedBuilder {
   __device__ RealHit hit(std::uint16_t pos) const {
     return Math::loadHit<Real>(hits, rows[pos]);
   }
-  /// The beam spot in the number type of the building
   __device__ Math::BeamspotT<Real> beamspot() const {
     return Math::convert<Real>(cfg.beamspot);
   }
@@ -247,9 +222,7 @@ struct SeedBuilder {
     return (infos[pos] & CandidateInfo::precision) != 0u;
   }
 
-  /// Copies a pattern and its hits into another slot, in 8-byte words: the
-  /// slots start at multiples of 8 and their stride is one, so the words up
-  /// to the last hit stay inside the slot
+  /// Copies in 8-byte words; slots are 8-byte aligned
   __device__ void copy(const Pattern& from, Pattern& to) {
     if (&from == &to) {
       return;
@@ -263,7 +236,6 @@ struct SeedBuilder {
     }
   }
 
-  /// The payload row of each hit of a pattern
   __device__ auto rowsOf(const Pattern& pat) {
     const std::uint16_t* hitPos{hitsOf(pat)};
     return [this, hitPos](std::uint32_t i) { return rows[hitPos[i]]; };
@@ -281,19 +253,16 @@ struct SeedBuilder {
         .meanResidual2 = pat.meanResidual2(),
         .nHits = pat.nHits};
   }
-  /// PatternStateAux::countGroups
   __device__ std::uint32_t countGroups(const Pattern& pat, bool onlyGood) {
     return ::countGroups(hits, pat.nHits, rowsOf(pat),
                          onlyGood ? cfg.minGroupLayers : 1u);
   }
 
-  /// PatternStateAux::updatePatternPhi. The phi hits are visited group by
-  /// group, in the order they entered each group, as on the CPU
+  /// Refits the bending plane from the phi hits, group by group in insertion
+  /// order
   __device__ void updatePatternPhi(Pattern& pat) {
     const std::uint16_t* hitPos{hitsOf(pat)};
-    // The phi hits gathered in one pass over the pattern, then visited group
-    // by group; a pattern with more phi hits than the list holds is visited
-    // straight from its hits
+    // List up to maxListed phi hits once; with more, scan all hits per group
     constexpr std::uint32_t maxListed{32u};
     std::uint16_t phiPos[maxListed];
     std::uint8_t phiGroup[maxListed];
@@ -333,8 +302,8 @@ struct SeedBuilder {
                                    beamspot(), forEachPhiHit);
   }
 
-  /// PatternStateAux::moveLineAnchorHit: the anchor is the hit closest in layer
-  /// to the reference hit, in the group closest to it other than its own
+  /// The anchor becomes the hit closest in layer to refHit, in the closest
+  /// group other than refHit's own
   __device__ void moveLineAnchorHit(Pattern& pat, std::uint16_t refHit) {
     if (countGroups(pat, false) < 2u) {
       pat.lineAnchorHit = pat.lastInsertedHit;
@@ -350,7 +319,6 @@ struct SeedBuilder {
       if (g == refGroup) {
         continue;
       }
-      // The first hit that entered the group
       for (std::uint16_t i = 0u; i < pat.nHits; ++i) {
         if (group(hitPos[i]) == g) {
           const int dist{layerDist(globLayer(hitPos[i]), refLayer)};
@@ -375,7 +343,6 @@ struct SeedBuilder {
     }
   }
 
-  /// PatternStateAux::updateLineParameters
   __device__ void updateLineParameters(Pattern& pat) {
     if (!pat.needLineUpdate) {
       return;
@@ -393,7 +360,6 @@ struct SeedBuilder {
     pat.needLineUpdate = false;
   }
 
-  /// GlobalPatternFinder::isPhiCompatible
   __device__ bool isPhiCompatible(const Pattern& pat, const RealHit& h) {
     if (pat.nPhiLayers > 0u) {
       return !(std::abs(Math::angleToBendPlane(pat.plane, h.position)) >
@@ -402,11 +368,9 @@ struct SeedBuilder {
     return Math::ExpandedSector::inside(pat.sector, Math::phi(h.position));
   }
 
-  /// GlobalPatternFinder::checkLineCompatibility
   __device__ LineTest checkLine(Pattern& pat, std::uint16_t test) {
     return checkLine(pat, test, hit(test));
   }
-  /// The same, with the test hit already loaded
   __device__ LineTest checkLine(Pattern& pat, std::uint16_t test,
                                 const RealHit& testHit) {
     if ((testHit.flags & CudaHitFlags::measuresPhi) != 0u &&
@@ -446,7 +410,6 @@ struct SeedBuilder {
     return makeResult(Decision::eBranchPattern);
   }
 
-  /// PatternStateAux::addHit
   __device__ void addHit(Pattern& pat, std::uint16_t test,
                          const LineTest& res) {
     if (pat.nHits == maxHits) {
@@ -478,13 +441,11 @@ struct SeedBuilder {
     pat.needLineUpdate = true;
   }
 
-  /// GlobalPatternFinder::areOverlapping
   __device__ bool areOverlapping(const Pattern& a, const Pattern& b) {
     return ::areOverlapping(hits, cfg, info(a), rowsOf(a), countGroups(a, true),
                             info(b), rowsOf(b), countGroups(b, true));
   }
 
-  /// The constructor of PatternStateAux
   __device__ void makeSeedPattern(Pattern& pat, std::uint16_t seedPos,
                                   std::int8_t sector) {
     pat = Pattern{};
@@ -507,7 +468,6 @@ struct SeedBuilder {
     pat.needLineUpdate = true;
   }
 
-  /// GlobalPatternFinder::passPatternCuts
   __device__ bool passPatternCuts(const Pattern& pat) {
     return pat.nTriggerLayers >= cfg.minStripEtaLayers &&
            pat.nPrecisionLayers >= cfg.minPrecisionLayers &&
@@ -516,8 +476,7 @@ struct SeedBuilder {
   }
 };
 
-/// Writes a finalized pattern to an output slot. The hit references become
-/// positions in the pattern's own hit list
+/// Hit references become indices into the pattern's own hit list
 __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
                              const std::uint16_t* hitPos,
                              const CudaPatternRecordArrays& out,
@@ -570,7 +529,6 @@ __device__ void writePattern(const SeedBuilder& builder, const Pattern& pat,
   }
 }
 
-/// Copies a pattern record between two containers
 __device__ void copyRecord(const CudaPatternRecordArrays& from,
                            std::uint32_t fromSlot,
                            const CudaPatternRecordArrays& to,
@@ -615,7 +573,6 @@ __device__ void copyRecord(const CudaPatternRecordArrays& from,
   }
 }
 
-/// A finalized pattern record seen by the comparisons
 __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
                                   std::uint32_t slot) {
   return PatternInfo{
@@ -635,13 +592,11 @@ __device__ PatternInfo recordInfo(const CudaPatternRecordArrays& r,
 
 constexpr unsigned fullMask = 0xFFFFFFFFu;
 constexpr unsigned lanesPerWarp = 32u;
-/// Warps of a block of the kernels that work a warp per seed
 constexpr unsigned warpsPerBlock = 4u;
 
-/// Whether pattern a comes before pattern b in the priority order: more good
-/// groups, more bending layers, more precision layers, a smaller mean squared
-/// normalised residual, and the smaller index. A strict total order, unlike
-/// isBetter, so that the rounds below have a single answer.
+/// Priority order: more good groups, more bending layers, more precision
+/// layers, smaller mean squared normalised residual, then smaller index. The
+/// index makes the order total, so overlap resolution has a unique result.
 __device__ bool outranks(const PatternInfo& a, std::uint32_t goodA,
                          std::uint32_t indexA, const PatternInfo& b,
                          std::uint32_t goodB, std::uint32_t indexB) {
@@ -663,7 +618,6 @@ __device__ bool outranks(const PatternInfo& a, std::uint32_t goodA,
   return indexA < indexB;
 }
 
-/// The k-th set bit of a mask, counted from the lowest
 __device__ std::uint32_t nthSetBit(std::uint32_t mask, std::uint32_t k) {
   for (std::uint32_t i = 0u; i < k; ++i) {
     mask &= mask - 1u;
@@ -671,8 +625,7 @@ __device__ std::uint32_t nthSetBit(std::uint32_t mask, std::uint32_t k) {
   return static_cast<std::uint32_t>(__ffs(static_cast<int>(mask)) - 1);
 }
 
-/// Exclusive prefix sum of count(i) over i < n by the lanes of a warp, into
-/// out. Returns the total, the same in every lane
+/// Warp-wide exclusive prefix sum of count(i) into out; returns the total
 template <typename Count>
 __device__ std::uint32_t warpExclusiveScan(std::uint32_t n, Count count,
                                            std::uint32_t* out,
@@ -697,22 +650,18 @@ __device__ std::uint32_t warpExclusiveScan(std::uint32_t n, Count count,
   return carry;
 }
 
-/// Bits of the per-pattern flags of a layer
 constexpr std::uint8_t flagDropped = 1u << 0u;
 constexpr std::uint8_t flagNormalHit = 1u << 1u;
-/// The pattern lost the selection of the patterns that fit and does not
-/// carry on
+/// Not selected when memory ran short
 constexpr std::uint8_t flagNoCarry = 1u << 2u;
 
-/// Decision of a pattern in the rounds
 constexpr std::uint8_t undecided = 0u;
 constexpr std::uint8_t kept = 1u;
 constexpr std::uint8_t dropped = 2u;
 
-/// The device memory of an event's pattern building: one block that all seeds
-/// take from as they need it, through one counter. Patterns and their scratch
-/// are taken below patternLimit; the rest is kept for choosing the best
-/// patterns of a layer when the patterns ran out of room
+/// One block that all seeds allocate from through a shared counter. Memory
+/// above patternLimit is reserved for selecting the best patterns when a
+/// layer runs out of room.
 struct Arena {
   char* base{nullptr};
   unsigned long long* used{nullptr};
@@ -720,9 +669,7 @@ struct Arena {
   unsigned long long patternLimit{0u};
 };
 
-/// Takes `want` bytes below `limit`, in multiples of 8. With partial, takes
-/// what is left below the limit when that is less than wanted. Returns the
-/// start, and the bytes taken in granted; nullptr and zero if none
+/// With partial, takes what is left below limit if less than want
 __device__ __forceinline__ char* arenaTake(const Arena& arena,
                                            unsigned long long want,
                                            unsigned long long limit,
@@ -754,9 +701,6 @@ __device__ __forceinline__ char* arenaTake(const Arena& arena,
   }
 }
 
-/// What a seed leaves for the event: the region holding its patterns, the
-/// bytes of one slot and the hits a slot holds, and the slots of its kept
-/// patterns
 struct SeedResult {
   const char* region{nullptr};
   const std::uint32_t* keptSlots{nullptr};
@@ -765,8 +709,6 @@ struct SeedResult {
   std::uint32_t maxHits{0u};
 };
 
-/// Totals of the event over its seeds, read back by the host to size the
-/// event's patterns
 struct EventCounts {
   unsigned int nPatterns{0u};
   unsigned int maxHits{0u};
@@ -774,9 +716,7 @@ struct EventCounts {
   unsigned int overflow{0u};
 };
 
-/// The priority key of a pattern as one sortable number: good groups,
-/// bending layers, precision layers, then the mean squared normalised
-/// residual, smaller being better. Larger keys come first
+/// The priority order as one integer, larger being better
 __device__ __forceinline__ std::uint64_t priorityKey(std::uint32_t good,
                                                      std::uint32_t bending,
                                                      std::uint32_t precision,
@@ -785,8 +725,7 @@ __device__ __forceinline__ std::uint64_t priorityKey(std::uint32_t good,
     return static_cast<std::uint64_t>(v < max ? v : max);
   };
   const float residual{static_cast<float>(meanResidual2)};
-  // Positive floats order as their bits; a residual that is not a number
-  // ranks last
+  // Non-negative floats order as their bit patterns; NaN ranks last
   const std::uint64_t residualRank{
       residual >= 0.f ? ~static_cast<std::uint64_t>(__float_as_uint(residual)) &
                             0xFFFFFFFFull
@@ -795,36 +734,28 @@ __device__ __forceinline__ std::uint64_t priorityKey(std::uint32_t good,
          (clamp(precision, 0xFFu) << 36u) | (residualRank << 4u);
 }
 
-/// One candidate of the selection: its key and its place in the order the
-/// patterns of a layer are written
 struct Candidate {
   std::uint64_t key{0u};
   std::uint32_t order{0u};
   std::uint32_t pad{0u};
 };
 
-/// One seed built by one warp; every lane holds this object. The patterns
-/// live in two regions that the layers swap between, taken from the event's
-/// arena and grown by doubling. A slot holds a pattern and one hit position
-/// per layer of the seed's list.
+/// The pattern building of one seed by one warp. Patterns live in two
+/// regions that alternate between layers, grown by doubling.
 struct WarpSeed {
   SeedBuilder b;
   Arena arena;
   std::uint32_t stride;
-  /// The most chunks of 32 hits one layer of the seed has
   std::uint32_t maxChunks;
   RealHit* chunkHits;
   std::uint32_t lane;
 
-  /// The two regions, as named fields: an array indexed at run time would
-  /// live in local memory
+  /// Named fields: an array indexed at run time would live in local memory
   char* region0{nullptr};
   char* region1{nullptr};
   std::uint32_t regionCap0{0u};
   std::uint32_t regionCap1{0u};
-  /// Per pattern of the region being extended: for each chunk of the layer,
-  /// the hits it accepts and those of them with low confidence, [pattern]
-  /// [chunk]; prefix sums or good groups; the flags; the round decisions
+  /// Per-pattern scratch; the masks are indexed [pattern][chunk]
   std::uint32_t scratchCap{0u};
   std::uint32_t* acceptMask{nullptr};
   std::uint32_t* lowMask{nullptr};
@@ -832,11 +763,8 @@ struct WarpSeed {
   std::uint8_t* flags{nullptr};
   std::uint8_t* state{nullptr};
   std::uint8_t* nextState{nullptr};
-  /// The line test of every pattern and hit the pattern accepts, [pattern]
-  /// [chunk][hit], so that the child that takes the hit does not compute it
-  /// again
+  /// [pattern][chunk][hit], reused when the child is built
   LineTest* tests{nullptr};
-  /// The most patterns the seed held at once
   std::uint32_t largestBeam{0u};
 
   __device__ __forceinline__ char* regionOf(std::uint32_t r) const {
@@ -851,7 +779,6 @@ struct WarpSeed {
                                        static_cast<std::size_t>(k) * stride);
   }
 
-  /// arenaTake by lane 0, the result in every lane
   __device__ __forceinline__ char* take(unsigned long long want,
                                         unsigned long long limit, bool partial,
                                         unsigned long long& granted) {
@@ -866,10 +793,8 @@ struct WarpSeed {
     return reinterpret_cast<char*>(start);
   }
 
-  /// Makes room in region r, whose content is not needed any more, for
-  /// `count` patterns, and scratch for as many. The scratch of the first
-  /// nLive patterns, the ones being extended, is kept. Returns how many
-  /// patterns there is room for, at most count
+  /// Room for count patterns in region r, keeping the scratch of the nLive
+  /// patterns being extended. Returns how many fit.
   __device__ __forceinline__ std::uint32_t reserve(std::uint32_t r,
                                                    std::uint32_t count,
                                                    std::uint32_t nLive) {
@@ -877,14 +802,12 @@ struct WarpSeed {
     if (count <= cap && count <= scratchCap) {
       return count;
     }
-    // Grows by doubling, from one warp's worth
     std::uint32_t target{count > 2u * cap ? count : 2u * cap};
     target = target > lanesPerWarp ? target : lanesPerWarp;
     if (scratchCap < target) {
       const unsigned long long maskBytes{4ull * target * maxChunks};
       const unsigned long long testBytes{sizeof(LineTest) * target * maxChunks *
                                          lanesPerWarp};
-      // The tests first, at the alignment of the block
       const unsigned long long bytes{testBytes + 2ull * maskBytes +
                                      4ull * target + 3ull * target};
       unsigned long long got{0u};
@@ -936,8 +859,6 @@ struct WarpSeed {
     return room < count ? room : count;
   }
 
-  /// The priority key of the pattern a candidate would give: pattern i of
-  /// region `from` with the hit at position pos of the candidate list
   __device__ __forceinline__ std::uint64_t childKey(Pattern& parent,
                                                     std::uint16_t pos) {
     const LineTest res{b.checkLine(parent, pos)};
@@ -958,11 +879,8 @@ struct WarpSeed {
             (parent.nDoF + res.nDof));
   }
 
-  /// When the patterns of a layer do not all fit: keeps the `room` best of
-  /// the candidates, by the priority key, and takes the others out of the
-  /// masks and the carries. A candidate is a would-be pattern, a pattern with
-  /// one hit it accepted or a pattern carrying on. The order of a candidate
-  /// is its place in the writing order, which breaks ties
+  /// Keeps the `room` best children and carries of a layer when they do not
+  /// all fit; ties are broken by output order
   __device__ __forceinline__ void selectBest(
       std::uint32_t from, std::uint32_t n, std::uint32_t first,
       std::uint32_t nChunks, std::uint32_t total, std::uint32_t room) {
@@ -983,7 +901,7 @@ struct WarpSeed {
     unsigned long long got{0u};
     char* block{take(8ull + 16ull * total, arena.size, false, got)};
     if (block == nullptr) {
-      // Not even room to rank them: the candidates written last are dropped
+      // No memory to rank them: drop the last ones in output order
       std::uint32_t nTaken{0u};
       if (lane == 0u) {
         for (std::uint32_t c = 0u; c < nChunks; ++c) {
@@ -1035,8 +953,7 @@ struct WarpSeed {
       }
     }
     __syncwarp();
-    // Best first: the larger key, then the earlier order. The network only
-    // ever puts the better element first, so the padding is never touched
+    // Bitonic sort, best first; the padding beyond total is never read
     auto better = [](const Candidate& a, const Candidate& c) {
       return a.key > c.key || (a.key == c.key && a.order < c.order);
     };
@@ -1066,10 +983,6 @@ struct WarpSeed {
     __syncwarp();
   }
 
-  /// Extends the n patterns of region `from` by the layer at candidate
-  /// positions [first, last) into region `to`, and returns their number:
-  /// prune, test every (pattern, hit) pair, make room (keeping the best if
-  /// short), then grow a child per accepted hit.
   __device__ __forceinline__ std::uint32_t extendLayer(std::uint32_t from,
                                                        std::uint32_t n,
                                                        std::uint32_t to,
@@ -1122,8 +1035,6 @@ struct WarpSeed {
       flags[i] = drop ? flagDropped : 0u;
     }
     __syncwarp();
-    // The line of each pattern for this layer, as the first test on a new
-    // layer updates it on the CPU
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
       if ((flags[i] & flagDropped) == 0u) {
         b.updateLineParameters(pattern(from, i));
@@ -1180,7 +1091,7 @@ struct WarpSeed {
     }
     __syncwarp();
 
-    // 3. Room for all of them, or the best that fit
+    // 3. Make room for all children, or keep the best that fit
     auto carries = [&](std::uint32_t i) {
       return (flags[i] & (flagDropped | flagNormalHit | flagNoCarry)) == 0u;
     };
@@ -1202,7 +1113,7 @@ struct WarpSeed {
       selectBest(from, n, first, nChunks, total, room);
     }
 
-    // 4. Rebuild, chunk after chunk, then the patterns that carry on
+    // 4. Grow: one child per accepted hit, then the patterns that carry on
     std::uint32_t nOut{0u};
     for (std::uint32_t c = 0u; c < nChunks; ++c) {
       const std::uint32_t chunk{first + c * lanesPerWarp};
@@ -1229,8 +1140,7 @@ struct WarpSeed {
         const auto test = static_cast<std::uint16_t>(chunk + h);
         Pattern& child{pattern(to, nOut + t)};
         b.copy(pattern(from, lo), child);
-        // The child is its parent with the same line, so the test of the
-        // parent is the child's
+        // The child has its parent's line, so the parent's test applies
         b.addHit(child, test, tests[(lo * maxChunks + c) * lanesPerWarp + h]);
       }
       nOut += nChildren;
@@ -1250,12 +1160,9 @@ struct WarpSeed {
     return nOut;
   }
 
-  /// The overlaps among the n patterns of a region, by priority, in place: in
-  /// each round, a pattern that no undecided or kept pattern above it
-  /// overlaps is kept, and one that a kept pattern above it overlaps is
-  /// dropped. With perFamily, only patterns of the same family compete. The
-  /// dropped patterns are marked isOverlap; a pattern marked already takes no
-  /// part
+  /// In each round, a pattern not overlapped by a higher-ranked undecided or
+  /// kept pattern is kept, and one overlapped by a higher-ranked kept pattern
+  /// is dropped
   __device__ __forceinline__ void resolveOverlaps(std::uint32_t r,
                                                   std::uint32_t n,
                                                   bool perFamily) {
@@ -1308,7 +1215,6 @@ struct WarpSeed {
     __syncwarp();
   }
 
-  /// Builds the patterns of a seed. Returns where its kept patterns are
   __device__ __forceinline__ SeedResult build(std::uint16_t seedPos,
                                               std::uint32_t nCands,
                                               std::int8_t sector) {
@@ -1324,7 +1230,7 @@ struct WarpSeed {
     std::uint32_t current{0u};
     std::uint32_t n{1u};
 
-    // Forward: the layers after the seed layer, outwards
+    // Forward: the layers after the seed layer
     std::uint32_t first{seedPos + 1u};
     while (first < nCands && b.globLayer(first) == seedLayer) {
       ++first;
@@ -1342,8 +1248,7 @@ struct WarpSeed {
       resolveOverlaps(current, n, false);
     }
 
-    // Backward: every forward pattern from the seed inwards, side by side.
-    // Each is a family of its own
+    // Backward: every forward pattern restarts at the seed as its own family
     for (std::uint32_t f = lane; f < n; f += lanesPerWarp) {
       Pattern& start{pattern(current, f)};
       if (start.isOverlap) {
@@ -1371,8 +1276,7 @@ struct WarpSeed {
       last = begin;
     }
 
-    // The quality cuts, then the overlaps inside each family, as at the end
-    // of each backward pass of the CPU, then among all of them
+    // Quality cuts, then overlaps within each family, then across families
     for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
       Pattern& pat{pattern(current, k)};
       pat.isOverlap = pat.isOverlap || !b.passPatternCuts(pat);
@@ -1383,7 +1287,6 @@ struct WarpSeed {
       resolveOverlaps(current, n, false);
     }
 
-    // List the kept patterns
     const std::uint32_t nKept{warpExclusiveScan(
         n,
         [&](std::uint32_t k) {
@@ -1405,7 +1308,6 @@ struct WarpSeed {
   }
 };
 
-/// The builder of a seed whose patterns hold maxHits hits
 __device__ SeedBuilder seedBuilder(const CudaHitPayloadArrays& hits,
                                    const CudaCandidateArrays& lists,
                                    const CudaPatternFinderConfig& cfg,
@@ -1418,8 +1320,6 @@ __device__ SeedBuilder seedBuilder(const CudaHitPayloadArrays& hits,
                      .maxHits = maxHits};
 }
 
-/// Builds every seed of the event, one warp per seed, with memory from the
-/// arena
 __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
                                     CudaCandidateArrays lists,
                                     CudaPatternFinderConfig cfg, Arena arena,
@@ -1437,8 +1337,7 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
       lists.seedPosition[seed] == cudaInvalidHitPosition) {
     return;
   }
-  // The hits of a pattern: one per layer of the list. The chunks: the most
-  // hits one layer has, in chunks of 32
+  // At most one hit per layer of the list
   const std::uint32_t nCands{lists.end(seed) - lists.begin(seed)};
   const std::uint16_t* globLayers{lists.candidateGlobLayer + lists.begin(seed)};
   const auto maxHits = static_cast<std::uint32_t>(globLayers[nCands - 1u] + 1u);
@@ -1450,8 +1349,7 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
   const std::uint32_t stride{static_cast<std::uint32_t>(
       (sizeof(Pattern) + maxHits * sizeof(std::uint16_t) + 7u) & ~7u)};
 
-  // The hits of the chunk being tested, per warp of the block. Raw storage,
-  // since shared memory takes no constructors
+  // Raw storage: shared memory variables cannot have constructors
   __shared__ alignas(RealHit) unsigned char
       chunkStorage[warpsPerBlock * lanesPerWarp * sizeof(RealHit)];
   RealHit* chunkHits{reinterpret_cast<RealHit*>(chunkStorage) +
@@ -1480,11 +1378,8 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
   }
 }
 
-/// The memory of the event's patterns, taken from the arena on the device
-/// once the seeds are built, so that the host does not wait for their
-/// number: the patterns of every seed, the kept ones, the good groups, the
-/// links of every pair, the round decisions and where each seed's patterns
-/// start. nKept is written by the compaction
+/// Allocated on the device once the seeds are built, so the host does not
+/// wait for their number
 struct EventBuffers {
   CudaPatternRecordArrays event{};
   CudaPatternRecordArrays compacted{};
@@ -1495,7 +1390,6 @@ struct EventBuffers {
   std::uint32_t* firstOfSeed{nullptr};
   std::uint32_t* seedOf{nullptr};
   std::uint32_t* seedLinks{nullptr};
-  /// The block the compacted records live in, which goes back in one copy
   char* compactedBase{nullptr};
   unsigned long long compactedBytes{0u};
   std::uint32_t nPatterns{0u};
@@ -1503,8 +1397,7 @@ struct EventBuffers {
   std::uint32_t nKept{0u};
 };
 
-/// Points the columns of pattern records with n slots of maxHits hits into
-/// memory from base on, or only counts their bytes if base is nullptr
+/// With a null base, only advances cursor
 __device__ void carveRecords(CudaPatternRecordArrays& r, char* base,
                              unsigned long long& cursor, std::uint32_t n,
                              std::uint32_t maxHits) {
@@ -1558,9 +1451,8 @@ __device__ void carveRecords(CudaPatternRecordArrays& r, char* base,
   r.maxHitsPerPattern = maxHits;
 }
 
-/// Takes the event's buffers from the arena, sized by the totals of the
-/// seeds. When the arena has not room for them, the event keeps no patterns
-/// and gets the eventPatterns bit. Runs in one thread
+/// If the buffers do not fit, the event keeps no patterns and gets the
+/// eventPatterns overflow bit
 __global__ void carveEventKernel(Arena arena, EventCounts* counts,
                                  std::uint32_t nSeeds, EventBuffers* buffers) {
   if (blockIdx.x != 0u || threadIdx.x != 0u) {
@@ -1609,8 +1501,6 @@ __global__ void carveEventKernel(Arena arena, EventCounts* counts,
   *buffers = out;
 }
 
-/// Copies the kept patterns of every seed to the event's records, in seed
-/// order, which are sized to hold them all. Runs in one block
 __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
                                      CudaCandidateArrays lists,
                                      CudaPatternFinderConfig cfg,
@@ -1622,8 +1512,6 @@ __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
   }
   const CudaPatternRecordArrays event{buffers->event};
   std::uint32_t* firstOfSeed{buffers->firstOfSeed};
-  // The first slot of every seed, an exclusive scan over the block: within
-  // each warp by shuffles, then over the warp totals
   __shared__ std::uint32_t warpTotals[32];
   __shared__ std::uint32_t nTotal;
   const std::uint32_t lane{threadIdx.x % lanesPerWarp};
@@ -1688,9 +1576,8 @@ __global__ void appendPatternsKernel(CudaHitPayloadArrays hits,
   }
 }
 
-/// The links of one pair of the event's patterns: the overlap link, and the
-/// seed link if the pattern that outranks holds the seed hit of the other
-/// and the two come from different seeds
+/// Seed link: the higher-ranked pattern holds the other's seed hit and they
+/// come from different seeds
 __device__ void linkPair(const CudaHitPayloadArrays& hits,
                          const CudaCandidateArrays& lists,
                          const CudaPatternFinderConfig& cfg,
@@ -1730,13 +1617,8 @@ __device__ void linkPair(const CudaHitPayloadArrays& hits,
   }
 }
 
-/// The links between the patterns of the event: bit j of row i is set if
-/// pattern j outranks pattern i and overlaps it, by the overlap test of the
-/// pattern that outranks; in the seed links, if pattern j outranks pattern i
-/// and holds the seed hit of i, as GlobalPatternFinder counts the patterns
-/// that hold a seed. Both only for pairs that pass the cheap sector and theta
-/// test. The threads of the grid stride over the pairs; the rows must be
-/// zeroed
+/// Bit j of row i is set if pattern j ranks above pattern i and overlaps it
+/// (overlap links) or holds its seed hit (seed links). Rows must be zeroed.
 __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
                                         CudaCandidateArrays lists,
                                         CudaPatternFinderConfig cfg,
@@ -1750,7 +1632,6 @@ __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
        pair += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
     const auto i = static_cast<std::uint32_t>(pair / n);
     const auto j = static_cast<std::uint32_t>(pair % n);
-    // The cheap part of the overlap test first
     if (j <= i ||
         !Math::ExpandedSector::isNeighbour(event.sector[i], event.sector[j]) ||
         std::abs(static_cast<Real>(event.patTheta[i]) -
@@ -1762,8 +1643,6 @@ __global__ void linkEventPatternsKernel(CudaHitPayloadArrays hits,
   }
 }
 
-/// The good groups of each pattern of the event, and the links zeroed. The
-/// threads of the grid stride over them
 __global__ void countEventGroupsKernel(CudaHitPayloadArrays hits,
                                        CudaPatternFinderConfig cfg,
                                        const EventBuffers* buffers) {
@@ -1787,13 +1666,9 @@ __global__ void countEventGroupsKernel(CudaHitPayloadArrays hits,
   }
 }
 
-/// The overlaps among the patterns of the event, by priority, as
-/// WarpSeed::resolveOverlaps does it for a seed, on the links; and the limit
-/// of GlobalPatternFinder on the patterns that hold a seed, without its order:
-/// a pattern is dropped if its seed hit is in maxSeedAttempts kept patterns
-/// of other seeds that outrank it. The result is that of taking the patterns
-/// one by one in priority order. The dropped patterns get the status
-/// rejected. Runs in one block
+/// Rounds over the links. A pattern is also dropped if its seed hit is held
+/// by maxSeedAttempts higher-ranked kept patterns of other seeds. The result
+/// equals accepting the patterns one by one in priority order.
 __global__ void resolveEventOverlapsKernel(const EventBuffers* buffers,
                                            std::uint32_t maxSeedAttempts) {
   const std::uint32_t n{buffers->nPatterns};
@@ -1858,8 +1733,6 @@ __global__ void resolveEventOverlapsKernel(const EventBuffers* buffers,
   }
 }
 
-/// The quantities of a hit that PatternTopology::layerSorter and sameLayer
-/// read, without the rest of the payload
 __device__ Math::Hit loadSortHit(const CudaHitPayloadArrays& hits,
                                  std::uint32_t row) {
   Math::Hit hit{};
@@ -1872,12 +1745,8 @@ __device__ Math::Hit loadSortHit(const CudaHitPayloadArrays& hits,
   return hit;
 }
 
-/// The candidate checks of GlobalPatternFinder::findPatternsInEta for one
-/// seed, by the lanes of a warp: the group count as a reduction, the sort by
-/// layer as a sorting network over the list padded to a power of two, and
-/// the global layer numbers as a prefix sum over the new-layer flags. The
-/// status, the seed position and the global layers go to the output columns
-/// of the lists
+/// One warp per seed: group counts, bitonic sort by layer, and global layer
+/// numbers by prefix sum
 __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
                                    CudaCandidateArrays lists,
                                    CudaPatternFinderConfig cfg) {
@@ -1902,7 +1771,6 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
     return;
   }
 
-  // Groups with at least minGroupLayers candidates
   std::uint32_t counts[Math::Station::nGroups]{};
   for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
     ++counts[hits.station[rows[i]]];
@@ -1921,9 +1789,7 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
     return;
   }
 
-  // Sort by layer. In this form of the bitonic network every comparison puts
-  // the smaller element first, so the padding beyond n, larger than all, is
-  // never touched
+  // The padding beyond n is never read
   std::uint32_t padded{1u};
   while (padded < n) {
     padded <<= 1u;
@@ -1947,7 +1813,6 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
     }
   }
 
-  // Global layer numbers
   std::uint32_t carry{0u};
   for (std::uint32_t base = 0u; base < n; base += lanesPerWarp) {
     const std::uint32_t i{base + lane};
@@ -1980,7 +1845,6 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
     return;
   }
 
-  // The first position of the seed hit in its sorted list
   std::uint32_t seedPos{cudaInvalidHitPosition};
   for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
     if (rows[i] == lists.seedHitIndex[seed] && i < seedPos) {
@@ -1994,14 +1858,12 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
   setStatus(CudaSeedStatus::accepted);
 }
 
-/// The column-major rotation of a surface or a bucket times a vector
 __device__ Math::Vector3 rotate(const double* rotation, double x, double y,
                                 double z) {
   return {rotation[0] * x + rotation[3] * y + rotation[6] * z,
           rotation[1] * x + rotation[4] * y + rotation[7] * z,
           rotation[2] * x + rotation[5] * y + rotation[8] * z};
 }
-/// Column c of a column-major rotation
 __device__ Math::Vector3 column(const double* rotation, std::uint32_t c) {
   return {rotation[3u * c], rotation[3u * c + 1u], rotation[3u * c + 2u]};
 }
@@ -2009,8 +1871,7 @@ __device__ Math::Vector3 cross(const Math::Vector3& a, const Math::Vector3& b) {
   return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
-/// The raw MuonSpacePoint::MuonId fields the pattern finding reads, with the
-/// bit layout of MuonSpacePoint.cpp
+/// Bit layout of MuonSpacePoint::MuonId, see MuonSpacePoint.cpp
 namespace MuonIdBits {
 __device__ std::uint32_t stationName(std::uint32_t raw) {
   return raw & 0xFu;
@@ -2033,13 +1894,12 @@ __device__ bool measuresPhi(std::uint32_t raw) {
 __device__ std::uint32_t detLayer(std::uint32_t raw) {
   return ((raw >> 17u) & 0xFu) + 1u;
 }
-/// MuonId::TechField
 constexpr std::uint32_t mdt = 0u;
 constexpr std::uint32_t tgc = 3u;
 constexpr std::uint32_t sTgc = 4u;
 constexpr std::uint32_t mm = 5u;
-/// toStationIndex of the StationName order BIS, BIL, BMS, BML, BOS, BOL, BEE,
-/// EIS, EIL, EMS, EML, EOS, EOL, EES, EEL
+/// StationName order: BIS, BIL, BMS, BML, BOS, BOL, BEE, EIS, EIL, EMS, EML,
+/// EOS, EOL, EES, EEL
 __device__ std::uint8_t station(std::uint32_t stationName) {
   constexpr std::uint8_t map[15]{0u, 0u, 1u, 1u, 2u, 2u, 3u, 4u,
                                  4u, 5u, 5u, 6u, 6u, 7u, 7u};
@@ -2047,8 +1907,6 @@ __device__ std::uint8_t station(std::uint32_t stationName) {
 }
 }  // namespace MuonIdBits
 
-/// One hit payload per thread, the device version of makeCudaHitPayloadRow
-/// with the HitPayload formulas
 __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
                                        CudaUsedHitArrays used,
                                        CudaSurfaceTableArrays surfaces,
@@ -2058,8 +1916,6 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
   if (r >= used.nHits) {
     return;
   }
-  // Row r of the payloads is space point r of the container, which holds the
-  // used hits only
   const std::uint32_t s{r};
   const std::uint32_t raw{sp.muonId[s]};
   const std::uint64_t geometryId{sp.geometryId[s]};
@@ -2092,7 +1948,6 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
            ? CudaHitFlags::precision
            : 0u));
 
-  // The measurement surface
   std::uint32_t lo{0u};
   std::uint32_t hi{surfaces.nSurfaces};
   while (lo < hi) {
@@ -2113,12 +1968,11 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
     atomicAdd(nMissingSurfaces, 1u);
   } else {
     const double* rot{surfaces.rotation + 9u * lo};
-    // HitPayload: only the eta strips of two-dimensional TGC measurements can
-    // be tilted against their phi strips
+    // Only the eta strips of two-dimensional TGC measurements can be
+    // non-orthogonal to their phi strips
     bool nonOrthogonal{false};
     double stripAngle{0.};
     if (measEta && measPhi && !straw && tech == MuonIdBits::tgc) {
-      // The bucket of the hit: the last one that starts at or before it
       std::uint32_t bucket{0u};
       std::uint32_t pastBucket{used.nBuckets};
       while (pastBucket - bucket > 1u) {
@@ -2139,7 +1993,6 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
         nonOrthogonal = true;
       }
     }
-    // HitPayload::globalSensorDirection
     Math::Vector3 sensorDir{};
     if (straw) {
       sensorDir = column(rot, 2u);
@@ -2149,7 +2002,6 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
     } else {
       sensorDir = column(rot, 1u);
     }
-    // HitPayload::stripMeasurementDirections, for the hits that measure eta
     if (measEta) {
       out.sensorDirectionX[r] = sensorDir.x;
       out.sensorDirectionY[r] = sensorDir.y;
@@ -2171,9 +2023,6 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
   out.phiMeasurementDirectionZ[r] = phiDir.z;
 }
 
-/// Copies the patterns of status ok of the event pool to the start of the
-/// output records, in order, and their number and the overflow bits. Runs in
-/// one block
 __global__ void compactEventPatternsKernel(EventBuffers* buffers) {
   __shared__ std::uint32_t warpTotals[32];
   __shared__ std::uint32_t chunkBase;
@@ -2267,8 +2116,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     throw std::invalid_argument(
         "findCudaPatternsInEta: the workspace has to have some memory");
   }
-  // The memory pool keeps what is freed between events, so that taking the
-  // memory of the next event costs nothing
+  // Keep freed memory in the pool between events
   {
     int device{0};
     ACTS_CUDA_CHECK(cudaGetDevice(&device));
@@ -2289,7 +2137,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
       ACTS_CUDA_CHECK(cudaEventRecord(marks[i], stream));
     }
   };
-  // Device memory of the event, released once its work is done
   std::vector<void*> buffers{};
   auto allocate = [&](auto*& ptr, std::size_t count) {
     ACTS_CUDA_CHECK(cudaMallocAsync(
@@ -2307,14 +2154,11 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   const unsigned nWarpBlocks{(nSeeds + warpsPerBlock - 1u) / warpsPerBlock};
 
   mark(0u);
-  // The seed checks
   prepareCudaSeeds(hits, lists, cfg, stream);
 
-  // Every seed at once, with the memory of the arena; then the totals, which
-  // size the event's patterns
   Arena arena{};
   arena.size = sizes.workspaceBytes & ~7ull;
-  // A sixteenth is kept for choosing the best patterns when they run short
+  // A sixteenth is reserved for selecting the best patterns
   arena.patternLimit = arena.size - arena.size / 16u;
   allocate(arena.base, arena.size);
   allocate(arena.used, 1u);
@@ -2331,8 +2175,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
                                     cfg, arena, results, counts);
     ACTS_CUDA_CHECK(cudaGetLastError());
   }
-  // The event's buffers, sized on the device by what the seeds produced,
-  // then the patterns of every seed, the links of every pair and the rounds
   EventBuffers* eventBuffers{nullptr};
   allocate(eventBuffers, 1u);
   carveEventKernel<<<1, 1, 0, stream>>>(arena, counts, nSeeds, eventBuffers);
@@ -2350,12 +2192,10 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   resolveEventOverlapsKernel<<<1, 1024, 0, stream>>>(eventBuffers,
                                                      cfg.maxSeedAttempts);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  // Only the kept patterns go back: compacted on the device, their number
-  // read, then their slots copied
+  // Only the kept patterns are copied back
   compactEventPatternsKernel<<<1, 256, 0, stream>>>(eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
   mark(1u);
-  // The counts, then the block of the kept patterns, into page-locked memory
   CudaPinnedBuffer ownReadback{};
   CudaPinnedBuffer& pinned{readback != nullptr ? *readback : ownReadback};
   constexpr std::size_t countsAt{(sizeof(EventBuffers) + 15u) & ~15u};

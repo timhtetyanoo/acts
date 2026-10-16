@@ -33,11 +33,9 @@ namespace ActsExamples {
 
 namespace {
 
-/// The search tree over the rows of the hits the finding uses
 using RowTree = Acts::KDTree<2, std::uint32_t, double, std::array, 50>;
 
-/// SeedSelector::goodForSeeding and thetaSearchWindow of a space point: the
-/// window, or nothing if the hit does not seed
+/// Theta search window, or nothing if the space point does not seed
 std::optional<double> seedWindow(const SeedSelector& selector,
                                  const MuonSpacePoint& sp) {
   const LayerIndex layer{toLayerIndex(toStationIndex(sp.id().msStation()))};
@@ -51,7 +49,6 @@ std::optional<double> seedWindow(const SeedSelector& selector,
              : 0.5 * selector.m_cfg.thetaSearchWindow;
 }
 
-/// Writes a rotation column major
 void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
   for (int c = 0; c < 3; ++c) {
     for (int r = 0; r < 3; ++r) {
@@ -62,9 +59,8 @@ void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
 
 }  // namespace
 
-/// What one event needs on the device side, kept between events: the stream,
-/// page-locked memory for the copies up and back, and the device block of
-/// the inputs. Events running at the same time take different ones
+/// Per-event device resources, reused between events; concurrent events use
+/// separate workspaces
 struct CudaGlobalPatternFinder::Workspace {
   CudaStream stream{};
   CudaPinnedBuffer upload{};
@@ -143,8 +139,7 @@ CudaGlobalPatternFinder::surfaceTable(const Acts::GeometryContext& gctx) const {
                                cudaMemcpyHostToDevice));
     ACTS_DEBUG(__func__ << "() " << ids.size()
                         << " measurement surfaces on the device");
-    // The memory the pattern building takes from, a share of what the device
-    // has free once the table is there
+    // The arena takes a fraction of the free memory left after the table
     if (m_cfg.workspaceFraction > 0.) {
       std::size_t free{0u};
       std::size_t total{0u};
@@ -174,10 +169,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   const SurfaceTable& surfaces{surfaceTable(gctx)};
   const Acts::TrackingGeometry& geometry{*m_cfg.trackingGeometry};
 
-  // The global positions of the hits the finding uses and the search tree
-  // over them, as GlobalPatternFinderAlgorithm::constructTree
-  // Per row: the bucket and the space point, for the payloads of the kept
-  // patterns; per bucket: its rows
+  // Global positions of the used hits and the search tree over them
   std::vector<std::uint32_t> usedBucket{};
   std::vector<double> positionX{};
   std::vector<double> positionY{};
@@ -200,10 +192,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
         bucketToGlobalTransform(gctx, geometry, bucket)};
     bucketTransform[k] = localToGlobal;
     storeRotation(localToGlobal.linear(), bucketRotation.data() + 9u * k);
-    // The sector of the bucket, from its first hit
     const unsigned msSector{bucket.front().id().sector()};
     for (const MuonSpacePoint& sp : bucket) {
-      // Only-phi hits are not in the tree, and MDT hits only if asked for
       if (!sp.id().measuresEta() || (!m_cfg.useMdtHits && sp.isStraw())) {
         continue;
       }
@@ -214,9 +204,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       positionY.push_back(pos.y());
       positionZ.push_back(pos.z());
       usedPointer.push_back(&sp);
-      // As GlobalPatternFinderAlgorithm::constructTree: a phi-measuring hit
-      // enters an overlap sector if its phi is inside it, with its own theta;
-      // the others enter all three, projected onto each sector's plane
+      // A phi-measuring hit enters an overlap sector only if its phi is
+      // inside it, with its own theta. Other hits enter all three sectors,
+      // projected onto each sector's plane.
       const bool measuresPhi{sp.id().measuresPhi()};
       const double r2{pos.head<2>().squaredNorm()};
       for (const ExpandedSector::SectorProjector proj :
@@ -244,7 +234,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   const RowTree tree{std::move(treeEntries)};
 
-  // The candidate lists, as the CPU seed loop's range searches
   using HitCoords = GlobalPatternFinder_t::HitCoords;
   constexpr auto sectorIdx = Acts::toUnderlying(HitCoords::eSector);
   constexpr auto thetaIdx = Acts::toUnderlying(HitCoords::eTheta);
@@ -276,11 +265,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   if (lists.empty()) {
     return {};
   }
-  // Up to the device in one copy, from page-locked memory kept between
-  // events: the columns of the used hits that the payloads read (row r being
-  // space point r, every bucket keeping its number), their positions, the
-  // bucket rotations and the lists. The payloads, which the device builds,
-  // follow the copied part in the same device block
+  // One upload from reused page-locked memory; the payloads, built on the
+  // device, follow in the same device block
   std::unique_ptr<Workspace> workspace{acquireWorkspace()};
   const WorkspaceReturn giveBack{*this, workspace};
   const cudaStream_t stream{workspace->stream.get()};
@@ -335,7 +321,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     copy(used.positionZ, positionZ);
     copy(used.bucketRotation, bucketRotation);
     lists.stageForDevice(block);
-    // Zero, as the host block holds it
     auto* missing = column(deviceMissing, 1u);
     if (fill) {
       *missing = 0u;
@@ -345,7 +330,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   };
   CudaStagedBlock sizing{};
   stage(sizing);
-  // The number of hits without a surface comes back after the block
   const std::size_t missingAt{(sizing.cursor + 15u) & ~std::size_t{15u}};
   CudaStagedBlock block{
       .host = workspace->upload.reserve(missingAt + sizeof(std::uint32_t)),
@@ -356,7 +340,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     timing->hostPreUs = microseconds(Clock::now() - hostPreStart);
   }
 
-  // The copy, then the payload kernel, which counts towards the kernels
   std::array<cudaEvent_t, 3> uploadMarks{};
   if (timing != nullptr) {
     for (cudaEvent_t& mark : uploadMarks) {
@@ -385,7 +368,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   if (m_arenaBytes > 0u) {
     sizes.workspaceBytes = m_arenaBytes;
   }
-  // Waits for the stream, so the count of hits without a surface is there
   const CudaPatternRecordContainer event{findCudaPatternsInEta(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
       stream, timing, &workspace->readback)};
@@ -411,8 +393,6 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
                           << "); the seeds that did not fit have no patterns");
   }
 
-  // The payloads of the hits of the kept patterns, on the host, for the
-  // phi-only hits and the conversion
   const auto hostPostStart = Clock::now();
   std::vector<std::optional<HitPayload>> payloads(usedPointer.size());
   auto payloadOf = [&](std::uint32_t row) -> const HitPayload& {
@@ -458,7 +438,6 @@ CudaGlobalPatternFinder::finishPatterns(
     addPhiOnlyHits(gctx, beamspot, onlyPhiProvider, patterns);
   }
 
-  // GlobalPatternFinder::convertToPattern
   std::vector<OutputPattern> output{};
   output.reserve(patterns.size());
   for (PatternStateAux& pat : patterns) {
@@ -502,7 +481,7 @@ CudaGlobalPatternFinder::makePatternState(
   pat.prevLayerHit = row.prevLayerHit != cudaInvalidHitPosition
                          ? orderedHit(row.prevLayerHit)
                          : pat.lastInsertedHit;
-  // The device keeps an anchor that a branch replaced; it is not in the hits
+  // The anchor may no longer be one of the pattern's hits
   pat.lineAnchorHit = row.lineAnchorHit != cudaInvalidHitPosition
                           ? orderedHit(row.lineAnchorHit)
                           : pat.lastInsertedHit;
@@ -536,7 +515,6 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
     const OnlyPhiHitsProvider& onlyPhiProvider,
     std::vector<PatternStateAux>& patterns) const {
   using OrderedHit = PatternStateAux::OrderedHit;
-  // GlobalPatternFinder::isPhiCompatible
   auto isPhiCompatible = [&](const PatternStateAux& pat,
                              const HitPayload& hit) {
     const Acts::Vector3 pos{hit.globalPosition(gctx)};
@@ -545,8 +523,8 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
     }
     return pat.sector.insideSector(Acts::VectorHelpers::phi(pos));
   };
-  // The pattern line in the group of a phi hit, from its eta hits or from
-  // the closest eta hits around it
+  // Pattern line in the group of a phi hit, from the group's eta hits or
+  // from the closest eta hits around it
   auto computePatternLineInGroup = [&](PatternStateAux& pat,
                                        const HitPayload& phiHit) -> bool {
     const auto phiHitGroup{PatternTopology::groupIndex(phiHit)};
@@ -718,7 +696,6 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   selectorCfg.seedFromInner = m_cfg.seedFromInner;
   m_seedSelector = std::make_unique<SeedSelector>(std::move(selectorCfg));
 
-  // The mapping of GlobalPatternFinderAlgorithm
   CudaGlobalPatternFinder::Config finderCfg{};
   GlobalPatternFinder_t::Config& patCfg{finderCfg.finder};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
@@ -767,7 +744,6 @@ ProcessCode CudaGlobalPatternFinderAlgorithm::execute(
 
 MuonGlobalPatternContainer toMuonGlobalPatterns(
     const std::vector<GlobalPatternFinder_t::OutputPattern>& found) {
-  // GlobalPatternFinderAlgorithm::convertToPattern
   MuonGlobalPatternContainer patterns{};
   patterns.reserve(found.size());
   for (const auto& candidate : found) {

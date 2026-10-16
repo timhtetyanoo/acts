@@ -20,25 +20,18 @@
 
 #include <cuda_runtime.h>
 
-/// The arithmetic of the global pattern finder for the host and the device.
-/// Every function copies the CPU code it names, in the same order of
-/// operations; the kernels run it in Real, the unit tests in double against
-/// the CPU.
+/// @brief Arithmetic of the global pattern finder for the host and the device
 namespace ActsExamples::CudaPatternMath {
 
-/// @brief The number type of the pattern building kernel: the line, the
-///        residual and its uncertainty, and the bending plane fit. The hit
-///        payloads, the layer order and the output stay in double
+/// Floating-point type of the pattern building kernel; hit payloads, layer
+/// sorting and output use double
 using Real = float;
 
-/// @brief A scalar argument that takes the number type of the other arguments
 template <typename T>
 using Scalar = std::type_identity_t<T>;
 
-/// @brief Acts::s_epsilon
 constexpr double epsilon = 3. * DBL_EPSILON;
 
-/// @brief Acts::s_epsilon, in the number type T
 template <typename T>
 __host__ __device__ constexpr T epsilonOf() {
   if constexpr (std::is_same_v<T, float>) {
@@ -47,7 +40,6 @@ __host__ __device__ constexpr T epsilonOf() {
     return T{3} * DBL_EPSILON;
   }
 }
-/// @brief The machine epsilon of the number type T
 template <typename T>
 __host__ __device__ constexpr T machineEpsilon() {
   if constexpr (std::is_same_v<T, float>) {
@@ -56,7 +48,6 @@ __host__ __device__ constexpr T machineEpsilon() {
     return DBL_EPSILON;
   }
 }
-/// @brief The largest value of the number type T
 template <typename T>
 __host__ __device__ constexpr T largest() {
   if constexpr (std::is_same_v<T, float>) {
@@ -68,7 +59,6 @@ __host__ __device__ constexpr T largest() {
 
 constexpr double pi = 3.14159265358979323846;
 
-/// @brief Plain three-vector, usable in a kernel
 template <typename T>
 struct Vector3T {
   T x{0};
@@ -77,7 +67,6 @@ struct Vector3T {
 };
 using Vector3 = Vector3T<double>;
 
-/// @brief The same vector in another number type
 template <typename To, typename From>
 __host__ __device__ inline Vector3T<To> convert(const Vector3T<From>& a) {
   return {static_cast<To>(a.x), static_cast<To>(a.y), static_cast<To>(a.z)};
@@ -115,25 +104,22 @@ template <typename T>
 __host__ __device__ inline T square(T x) {
   return x * x;
 }
-/// @brief Acts::VectorHelpers::perp and Acts::fastHypot(x, y)
 template <typename T>
 __host__ __device__ inline T perp(const Vector3T<T>& a) {
   return std::sqrt(a.x * a.x + a.y * a.y);
 }
 
-/// @brief Acts::VectorHelpers::phi
 template <typename T>
 __host__ __device__ inline T phi(const Vector3T<T>& a) {
   return std::atan2(a.y, a.x);
 }
 
-/// @brief Acts::VectorHelpers::theta
 template <typename T>
 __host__ __device__ inline T theta(const Vector3T<T>& a) {
   return std::atan2(perp(a), a.z);
 }
 
-/// @brief Acts::detail::difference_periodic
+/// lhs - rhs, mapped to [-range/2, range/2)
 template <typename T>
 __host__ __device__ inline T differencePeriodic(T lhs, Scalar<T> rhs,
                                                 Scalar<T> range) {
@@ -146,7 +132,6 @@ __host__ __device__ inline T differencePeriodic(T lhs, Scalar<T> rhs,
   return delta;
 }
 
-/// @brief The quantities of one hit that the arithmetic reads
 template <typename T>
 struct HitT {
   Vector3T<T> position{};
@@ -164,7 +149,6 @@ struct HitT {
 };
 using Hit = HitT<double>;
 
-/// @brief Reads one row of the hit payload columns, in the number type T
 template <typename T = double>
 __host__ __device__ inline HitT<T> loadHit(const CudaHitPayloadArrays& hits,
                                            std::uint32_t row) {
@@ -194,7 +178,6 @@ __host__ __device__ inline HitT<T> loadHit(const CudaHitPayloadArrays& hits,
   return hit;
 }
 
-/// @brief The same, from a row of the host container
 inline Hit makeHit(const CudaHitPayloadRow& row) {
   auto toVector = [](const Acts::Vector3& v) {
     return Vector3{v.x(), v.y(), v.z()};
@@ -215,10 +198,8 @@ inline Hit makeHit(const CudaHitPayloadRow& row) {
   return hit;
 }
 
-/// @brief PatternStateAux::intrinsicVariance: the hit covariance contracted
-///        along a direction. A projected hit has its position along the
-///        sensor taken by the projection, so the measurement along the sensor
-///        drops out
+/// Variance of a hit's position along c. For a projected hit, the
+/// measurement along the sensor does not contribute.
 template <typename T>
 __host__ __device__ inline T intrinsicVariance(const HitT<T>& hit,
                                                const Vector3T<T>& c,
@@ -231,7 +212,6 @@ __host__ __device__ inline T intrinsicVariance(const HitT<T>& hit,
     const T vDotRsq{square(dot(hit.sensorDirection, c))};
     return discVar * (dot(c, c) - vDotRsq) + vDotRsq * hit.phiCovariance;
   }
-  // A strip measures phi as well exactly when it has a second direction
   const bool hasSecond{(hit.flags & CudaHitFlags::measuresPhi) != 0u};
   const T bendTerm{hit.etaCovariance *
                    square(dot(hit.etaMeasurementDirection, c))};
@@ -244,11 +224,8 @@ __host__ __device__ inline T intrinsicVariance(const HitT<T>& hit,
               : hit.phiCovariance * square(dot(hit.sensorDirection, c)));
 }
 
-/// @brief PatternStateAux::projToPhiPlane: the hit moved along its sensor
-///        onto the bending plane, the plane of normal n through offset * n,
-///        Acts::PlanarHelper::intersectPlane. A sensor parallel to the plane
-///        has no intersection; the CPU then takes the position of an invalid
-///        intersection, which is the origin, and so does this
+/// Moves a hit along its sensor onto the plane with normal n through
+/// offset * n; the origin if the sensor is parallel to the plane
 template <typename T>
 __host__ __device__ inline Vector3T<T> projectToPhiPlane(
     const HitT<T>& hit, const Vector3T<T>& n, Scalar<T> planeOffset) {
@@ -261,7 +238,6 @@ __host__ __device__ inline Vector3T<T> projectToPhiPlane(
   return hit.position + path * hit.sensorDirection;
 }
 
-/// @brief The pattern line, as PatternStateAux holds it
 template <typename T>
 struct LineT {
   Vector3T<T> position{};
@@ -271,7 +247,6 @@ struct LineT {
 };
 using Line = LineT<double>;
 
-/// @brief The beam spot, PatternStateAux::BeamspotInfo
 template <typename T>
 struct BeamspotT {
   Vector3T<T> position{};
@@ -280,18 +255,14 @@ struct BeamspotT {
 };
 using Beamspot = BeamspotT<double>;
 
-/// @brief The same beam spot in another number type
 template <typename To, typename From>
 __host__ __device__ inline BeamspotT<To> convert(const BeamspotT<From>& b) {
   return {convert<To>(b.position), static_cast<To>(b.radius),
           static_cast<To>(b.length)};
 }
 
-/// @brief PatternStateAux::updateLineParameters: the line through the
-///        projected anchor and last hit, or through the beam spot when the two
-///        are closer than minHitDistance
-/// @param anchor The anchor hit projected onto the bending plane
-/// @param last The last hit projected onto the bending plane
+/// Through the beam spot instead of the anchor when the two hits are closer
+/// than minHitDistance
 template <typename T>
 __host__ __device__ inline LineT<T> lineThroughHits(
     const Vector3T<T>& anchor, const Vector3T<T>& last,
@@ -311,9 +282,8 @@ __host__ __device__ inline LineT<T> lineThroughHits(
   return line;
 }
 
-/// @brief The bending plane of a pattern: its phi, its offset from the origin
-///        along the normal n = (-sin phi, cos phi, 0) and the covariance of
-///        phi and offset, PatternStateAux::BendPlaneCov ePhiPhi, eSS, ePhiS
+/// Bending plane: phi, offset from the origin along the normal
+/// n = (-sin phi, cos phi, 0), and the covariance of phi and offset
 template <typename T>
 struct BendPlaneT {
   T phi{0};
@@ -325,8 +295,6 @@ struct BendPlaneT {
 };
 using BendPlane = BendPlaneT<double>;
 
-/// @brief Residual of a test hit against the pattern line, its uncertainty
-///        and its degrees of freedom, PatternStateAux::LineTestRes
 template <typename T>
 struct LineResidualT {
   T residual{0};
@@ -335,14 +303,8 @@ struct LineResidualT {
 };
 using LineResidual = LineResidualT<double>;
 
-/// @brief PatternStateAux::computeLineResidual
-/// @param line The pattern line
-/// @param plane The bending plane of the pattern
-/// @param nPhiLayers The number of phi layers of the pattern
-/// @param anchor The line anchor hit
-/// @param last The last inserted hit
-/// @param test The hit tested against the line
-/// @param beamspot The beam spot
+/// Residual of a test hit against the pattern line, with its uncertainty
+/// from the anchor, last and test hits and the bending plane
 template <typename T>
 __host__ __device__ inline LineResidualT<T> lineResidual(
     const LineT<T>& line, const BendPlaneT<T>& plane, std::uint32_t nPhiLayers,
@@ -414,8 +376,7 @@ __host__ __device__ inline LineResidualT<T> lineResidual(
   return res;
 }
 
-/// @brief PatternStateAux::angleToBendPlane: the angle between a point and
-///        the bending plane, as seen from the origin
+/// Seen from the origin
 template <typename T>
 __host__ __device__ inline T angleToBendPlane(const BendPlaneT<T>& plane,
                                               const Vector3T<T>& pos) {
@@ -424,11 +385,10 @@ __host__ __device__ inline T angleToBendPlane(const BendPlaneT<T>& plane,
   return std::atan2(dist, rho);
 }
 
-/// @brief Station and layer numbers, as Muon::MuonStationIndex numbers them
+/// Numbered as in Muon::MuonStationIndex
 namespace Station {
 constexpr std::uint8_t BI = 0u, BM = 1u, BO = 2u, BE = 3u, EI = 4u, EM = 5u,
                        EO = 6u, EE = 7u;
-/// @brief PatternTopology::nGroups
 constexpr std::uint8_t nGroups = 8u;
 }  // namespace Station
 namespace Layer {
@@ -436,12 +396,10 @@ constexpr std::uint8_t Inner = 0u, Middle = 1u, Outer = 2u, Extended = 3u,
                        BarrelExtended = 4u;
 }
 
-/// @brief ActsExamples::isBarrel
 __host__ __device__ inline bool isBarrel(std::uint8_t station) {
   return station <= Station::BE;
 }
 
-/// @brief ActsExamples::toLayerIndex
 __host__ __device__ inline std::uint8_t layerOf(std::uint8_t station) {
   switch (station) {
     case Station::BI:
@@ -460,14 +418,11 @@ __host__ __device__ inline std::uint8_t layerOf(std::uint8_t station) {
   }
 }
 
-/// @brief PatternTopology::groupIndex
 __host__ __device__ inline std::uint8_t groupIndex(const Hit& hit) {
   return hit.station;
 }
 
-/// @brief PatternTopology::layerSorter: whether hit 1 comes before hit 2. Two
-///        hits in BO and EO, which the CPU rejects with an exception, are
-///        ordered as false here
+/// A BO and an EO hit, not expected in one pattern, compare false
 __host__ __device__ inline bool layerSorter(const Hit& hit1, const Hit& hit2) {
   const std::uint8_t st1{hit1.station};
   const std::uint8_t st2{hit2.station};
@@ -512,7 +467,6 @@ __host__ __device__ inline bool layerSorter(const Hit& hit1, const Hit& hit2) {
   return st1 == Station::BM;
 }
 
-/// @brief PatternTopology::sameLayer
 __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
   if (hit1.station != hit2.station) {
     return false;
@@ -527,30 +481,27 @@ __host__ __device__ inline bool sameLayer(const Hit& hit1, const Hit& hit2) {
   return std::abs(delta) <= epsilon;
 }
 
-/// @brief The expanded sectors of ActsExamples::ExpandedSector: the 16 muon
-///        sectors and the 16 overlaps between neighbours, numbered 0 to 31.
-///        Even numbers are sector centres, odd ones the overlap with the next
-///        sector
+/// The 16 muon sectors and the 16 overlaps between neighbours, numbered 0 to
+/// 31: even numbers are sector centres, odd ones the overlap with the next
 namespace ExpandedSector {
 constexpr int nMsSectors = 16;
 constexpr int nExpanded = 2 * nMsSectors;
 constexpr double oneEighthOfPi = pi / 8.;
 constexpr double overlap = 0.1 * oneEighthOfPi;
 
-/// @brief sectorMap::sectorSize: half size of a muon sector, without overlap
+/// Half width without overlap
 template <typename T = double>
 __host__ __device__ inline T msSize(int msSector) {
   return static_cast<T>(msSector % 2 == 0 ? 0.4 * oneEighthOfPi
                                           : 0.6 * oneEighthOfPi);
 }
 
-/// @brief sectorMap::sectorWidth
+/// Half width with overlap
 template <typename T = double>
 __host__ __device__ inline T msWidth(int msSector) {
   return msSize<T>(msSector) + static_cast<T>(overlap);
 }
 
-/// @brief sectorMap::sectorPhi
 template <typename T = double>
 __host__ __device__ inline T msPhi(int msSector) {
   const T piT{static_cast<T>(pi)};
@@ -560,7 +511,6 @@ __host__ __device__ inline T msPhi(int msSector) {
   return -piT * (T{2} - T(msSector - 1) / T{8});
 }
 
-/// @brief sectorMap::insideSector
 template <typename T>
 __host__ __device__ inline bool insideMsSector(int msSector, T phi) {
   const T piT{static_cast<T>(pi)};
@@ -574,12 +524,11 @@ __host__ __device__ inline bool insideMsSector(int msSector, T phi) {
   return !(dphi < -msWidth<T>(msSector)) && !(dphi > msWidth<T>(msSector));
 }
 
-/// @brief ExpandedSector::msSector
 __host__ __device__ inline int msSector(int sector) {
   return sector < 2 ? nMsSectors : sector / 2;
 }
 
-/// @brief ExpandedSector::adjacentMsSector
+/// The other sector of an overlap, or the sector itself for a centre
 __host__ __device__ inline int adjacentMsSector(int sector) {
   const int ms{msSector(sector)};
   if (sector % 2 == 0) {
@@ -588,7 +537,6 @@ __host__ __device__ inline int adjacentMsSector(int sector) {
   return ms == nMsSectors ? 1 : ms + 1;
 }
 
-/// @brief ExpandedSector::phi
 template <typename T = double>
 __host__ __device__ inline T phi(int sector) {
   const int s1{msSector(sector)};
@@ -596,7 +544,7 @@ __host__ __device__ inline T phi(int sector) {
   if (s1 == s2) {
     return msPhi<T>(s1);
   }
-  // The overlap starts at the upper edge of the first sector of the pair
+  // An overlap is centred at the upper edge of its first sector
   T phiO{msPhi<T>(s1) + msSize<T>(s1)};
   if (phiO > static_cast<T>(pi)) {
     phiO -= 2 * static_cast<T>(pi);
@@ -604,7 +552,6 @@ __host__ __device__ inline T phi(int sector) {
   return phiO;
 }
 
-/// @brief ExpandedSector::sectorSize
 template <typename T = double>
 __host__ __device__ inline T size(int sector) {
   const int s1{msSector(sector)};
@@ -614,30 +561,20 @@ __host__ __device__ inline T size(int sector) {
   return msWidth<T>(s1) - msSize<T>(s1);
 }
 
-/// @brief ExpandedSector::insideSector
 template <typename T>
 __host__ __device__ inline bool inside(int sector, T phi) {
   return insideMsSector(msSector(sector), phi) &&
          insideMsSector(adjacentMsSector(sector), phi);
 }
 
-/// @brief ExpandedSector::isNeighbour
 __host__ __device__ inline bool isNeighbour(int sector1, int sector2) {
   const int dS{std::abs(sector2 - sector1)};
   return (dS < nExpanded - dS ? dS : nExpanded - dS) <= 1;
 }
 }  // namespace ExpandedSector
 
-/// @brief PatternStateAux::updatePatternPhi: the bending plane from the phi
-///        measuring hits of a pattern and the beam spot
-/// @param nPhiLayers The number of phi layers of the pattern
-/// @param previousPhi The pattern phi so far, which fixes the fit weights
-/// @param sector The expanded sector of the pattern
-/// @param beamspot The beam spot
-/// @param forEachPhiHit Calls its argument with every phi measuring hit of
-///        the pattern, group by group, in the order they were added
-/// @return The bending plane. A fit without weight or without a defined
-///         direction, where the CPU throws, gives non-finite values
+/// Fits the bending plane to the phi hits of a pattern, visited by
+/// forEachPhiHit, and the beam spot; non-finite if the fit is undefined
 template <typename T, typename ForEachPhiHit>
 __host__ __device__ inline BendPlaneT<T> fitBendPlane(
     std::uint32_t nPhiLayers, Scalar<T> previousPhi, int sector,
@@ -645,7 +582,6 @@ __host__ __device__ inline BendPlaneT<T> fitBendPlane(
   constexpr T halfPi{static_cast<T>(pi / 2.)};
   constexpr T piT{static_cast<T>(pi)};
   BendPlaneT<T> plane{};
-  // The solution closest to the sector's direction
   auto alignPhiAndStore = [&](T newPatPhi) {
     const T refPhi{ExpandedSector::phi<T>(sector)};
     while (newPatPhi - refPhi > halfPi) {
@@ -666,7 +602,7 @@ __host__ __device__ inline BendPlaneT<T> fitBendPlane(
     return plane;
   }
   if (nPhiLayers == 1u) {
-    // A copy: the visitor may hand over a hit that lives only for the call
+    // Copy the hit, which may only live for the duration of the call
     HitT<T> phiHit{};
     forEachPhiHit([&](const HitT<T>& hit) { phiHit = hit; });
     const T bsX{beamspot.position.x};
@@ -751,12 +687,10 @@ __host__ __device__ inline BendPlaneT<T> fitBendPlane(
 
 namespace ActsExamples {
 
-/// @brief The constants of the GlobalPatternFinder config that the kernels
-///        read
+/// @brief Pattern finder configuration read by the kernels
 struct CudaPatternFinderConfig {
   double nResidualSigma{3.};
-  /// @brief The residual cut of a hit with two degrees of freedom, as
-  ///        GlobalPatternFinder computes it from nResidualSigma
+  /// Residual cut for two degrees of freedom, from nResidualSigma
   double cut2Dof{0.};
   double phiTolerance{3. * CudaPatternMath::pi / 180.};
   double loosenAcceptanceFactor{2.};
@@ -773,44 +707,34 @@ struct CudaPatternFinderConfig {
   CudaPatternMath::Beamspot beamspot{};
 };
 
-/// @brief The device memory of the pattern finding. The finding runs once
-///        per event; what does not fit is chosen by priority and reported,
-///        never built again.
+/// @brief Device memory of the pattern finding. If the patterns do not fit,
+///        the best ones are kept and the overflow is reported.
 struct CudaPatternFinderSizes {
-  /// @brief Device memory the seeds of an event take from as they need it,
-  ///        and the event's patterns after them
+  /// Arena for the patterns of one event
   std::size_t workspaceBytes{std::size_t{1} << 30u};
 };
 
-/// @brief Where the time of one event went, in microseconds, and what the
-///        event held. The host stages are wall time, the others are measured
-///        with CUDA events on the stream.
+/// @brief Time per stage of one event in microseconds: wall time on the
+///        host, CUDA events on the device
 struct CudaPatternFinderTiming {
-  /// @brief Host, before the copy: everything the device input needs
   double hostPreUs{0.};
-  /// @brief Copy of the input to the device
   double uploadUs{0.};
-  /// @brief Every kernel of the event, from the first to the last
   double kernelsUs{0.};
-  /// @brief Copy of the event's patterns to the host
   double downloadUs{0.};
-  /// @brief Host, after the copy: phi-only hits and the conversion of the
-  ///        patterns
+  /// Phi-only hits and conversion of the patterns
   double hostPostUs{0.};
   std::size_t nSeeds{0u};
   std::size_t nCandidates{0u};
-  /// @brief Patterns in eta accepted on the device
   std::size_t nPatternsInEta{0u};
-  /// @brief The most patterns one seed held at once
+  /// Most patterns one seed held at once
   std::size_t largestBeam{0u};
-  /// @brief CudaPatternOverflow bits of what did not fit; zero if everything
-  ///        fitted
+  /// CudaPatternOverflow bits
   std::uint8_t overflow{0u};
 };
 
-/// @brief Copies the constants out of the CPU config
-/// @tparam Config ActsExamples::GlobalPatternFinder_t::Config
-/// @tparam Beamspot ActsExamples::GlobalPatternFinder_t::BeamspotInfo
+/// @brief Kernel configuration from the pattern finder configuration
+/// @tparam Config GlobalPatternFinder_t::Config
+/// @tparam Beamspot GlobalPatternFinder_t::BeamspotInfo
 template <typename Config, typename Beamspot>
 CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
                                                     const Beamspot& beamspot) {
@@ -836,29 +760,23 @@ CudaPatternFinderConfig makeCudaPatternFinderConfig(const Config& cfg,
           beamspot.length}};
 }
 
-/// @brief The candidate checks of the CPU seed loop on the device, a warp per
-///        seed: the counts, the sort by layer and the layer numbers, written
-///        to the output columns of the lists. Both containers must be on the
-///        device; the call does not wait.
+/// @brief Seed checks on the device: group counts, sorting by layer and
+///        global layer numbers, written to the lists. Asynchronous.
 void prepareCudaSeeds(const CudaHitPayloadContainer& hits,
                       CudaCandidateListContainer& lists,
                       const CudaPatternFinderConfig& cfg, cudaStream_t stream);
 
-/// @brief The measurement surfaces of the tracking geometry on the device,
-///        sorted by geometry identifier: the rotation of surface s, column
-///        major, is rotation[9 * s, 9 * s + 9). The arrays are not owned.
+/// @brief Measurement surfaces on the device, sorted by geometry identifier;
+///        the column-major rotation of surface s is rotation[9 * s, 9 * s + 9)
 struct CudaSurfaceTableArrays {
   const std::uint64_t* geometryId{nullptr};
   const double* rotation{nullptr};
   std::uint32_t nSurfaces{0u};
 };
 
-/// @brief The positions of the hits the pattern finding uses, which the host
-///        computes for the search tree, and the rotation of each bucket into
-///        the global frame, column major, rotation[9 * b, 9 * b + 9). Row r is
-///        space point r of the CudaMuonSpacePointContainer, which holds these
-///        hits only; its bucket ranges number the buckets. The arrays are not
-///        owned.
+/// @brief Global positions of the used hits and the column-major rotation of
+///        each bucket into the global frame, rotation[9 * b, 9 * b + 9). Row r
+///        is space point r of the CudaMuonSpacePointContainer.
 struct CudaUsedHitArrays {
   const double* positionX{nullptr};
   const double* positionY{nullptr};
@@ -868,30 +786,21 @@ struct CudaUsedHitArrays {
   std::uint32_t nBuckets{0u};
 };
 
-/// @brief Builds the hit payloads on the device, one thread per hit, with the
-///        formulas of HitPayload.
-/// @param spacePoints Device arrays of a CudaMuonSpacePointContainer
-/// @param used The hits to build, row r of the output from row r of used
-/// @param surfaces The measurement surfaces
-/// @param payloads Device arrays of the output, with used.nHits rows
-/// @param nMissingSurfaces Device counter of the hits whose surface is not in
-///        the table, which the CPU rejects with an exception
-/// @param stream The stream; the call does not wait
+/// @brief Builds the hit payloads on the device. Asynchronous.
+/// @param nMissingSurfaces Device counter of hits whose surface is not in
+///        the table
 void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
                           const CudaUsedHitArrays& used,
                           const CudaSurfaceTableArrays& surfaces,
                           const CudaHitPayloadArrays& payloads,
                           std::uint32_t* nMissingSurfaces, cudaStream_t stream);
 
-/// @brief GlobalPatternFinder::findPatternsInEta on the device, in one pass.
-///
-/// Every seed is built by a warp, all seeds at once, one layer at a time. The
-/// overlaps, inside a seed and among the patterns of the event, are resolved
-/// by priority instead of seed order. The seeds take their memory from one
-/// arena of sizes.workspaceBytes; when it runs short, the best patterns are
-/// kept and the overflow bit is set. Returns the kept patterns as the slots of
-/// entry 0. The hits and the lists must be on the device; the call waits for
-/// the stream. `readback` is page-locked memory kept between events, if given.
+/// @brief Finds the patterns in eta of an event on the device: one warp per
+///        seed, then overlap resolution over the event by priority. If the
+///        arena runs short, the best patterns are kept and the overflow bit
+///        is set. Synchronises the stream.
+/// @param readback Page-locked memory reused between events, if given
+/// @return The kept patterns, as the slots of entry 0
 CudaPatternRecordContainer findCudaPatternsInEta(
     const CudaHitPayloadContainer& hits, CudaCandidateListContainer& lists,
     const CudaPatternFinderConfig& cfg, const CudaPatternFinderSizes& sizes,
@@ -900,8 +809,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
 
 }  // namespace ActsExamples
 
-// The driver works with the CPU types of the pattern finder, which the device
-// code does not need
+// Host-only part: depends on the host types of the pattern finder
 #ifndef __CUDACC__
 #include "Acts/Utilities/Logger.hpp"
 #include "ActsExamples/Framework/DataHandle.hpp"
@@ -916,9 +824,8 @@ CudaPatternRecordContainer findCudaPatternsInEta(
 
 namespace ActsExamples {
 
-/// @brief GlobalPatternFinder_t::findPatterns on the GPU. The patterns in eta
-///        are found by findCudaPatternsInEta; the phi-only hits are added and
-///        the patterns converted on the host, as the CPU does it.
+/// @brief Global pattern finder with the patterns in eta found on the GPU;
+///        the search tree, phi-only hits and conversion run on the host
 class CudaGlobalPatternFinder {
  public:
   using OutputPattern = GlobalPatternFinder_t::OutputPattern;
@@ -926,17 +833,13 @@ class CudaGlobalPatternFinder {
   using BeamspotInfo = GlobalPatternFinder_t::BeamspotInfo;
 
   struct Config {
-    /// @brief The configuration of the CPU pattern finder
     GlobalPatternFinder_t::Config finder{};
-    /// @brief The sizes of the device buffers
     CudaPatternFinderSizes sizes{};
-    /// @brief The tracking geometry, whose surfaces go to the device once,
-    ///        and whether MDT hits take part
+    /// Its surfaces are uploaded at the first event
     std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
     bool useMdtHits{true};
-    /// @brief The share of the device's free memory the pattern building
-    ///        takes, measured at the first event. Zero takes
-    ///        sizes.workspaceBytes instead
+    /// Fraction of the free device memory used for the arena; zero uses
+    /// sizes.workspaceBytes
     double workspaceFraction{0.5};
   };
 
@@ -945,14 +848,7 @@ class CudaGlobalPatternFinder {
       std::unique_ptr<const Acts::Logger> logger = Acts::getDefaultLogger(
           "CudaGlobalPatternFinder", Acts::Logging::INFO));
 
-  /// @brief Finds the patterns of an event: the search tree and the candidate
-  ///        lists on the host, the patterns in eta on the device, the phi-only
-  ///        hits and the conversion on the host.
-  /// @param gctx Geometry context
-  /// @param spacePoints The space points of the event
-  /// @param seedSelector Selector of the seed hits
-  /// @param onlyPhiProvider Provider of the phi-only hits of a pattern
-  /// @param beamspot The beam spot
+  /// @brief Finds the patterns of an event
   /// @param timing Filled with the time of each stage, if given
   MuonGlobalPatternContainer findPatterns(
       const Acts::GeometryContext& gctx,
@@ -964,25 +860,20 @@ class CudaGlobalPatternFinder {
   ~CudaGlobalPatternFinder();
 
  private:
-  /// @brief The hit payload of a row of the device hit columns
   using PayloadOf = std::function<const HitPayload&(std::uint32_t row)>;
 
-  /// @brief A pattern found on the device as the CPU's PatternStateAux
   PatternStateAux makePatternState(const Acts::GeometryContext& gctx,
                                    const PayloadOf& payloadOf,
                                    const CudaPatternRecordContainer& event,
                                    std::size_t slot,
                                    const BeamspotInfo& beamspot) const;
 
-  /// @brief The patterns of status ok of entry 0 of the records, with their
-  ///        phi-only hits, converted to the output
   std::vector<OutputPattern> finishPatterns(
       const Acts::GeometryContext& gctx, const PayloadOf& payloadOf,
       const CudaPatternRecordContainer& event,
       const OnlyPhiHitsProvider& onlyPhiProvider,
       const BeamspotInfo& beamspot) const;
 
-  /// @brief The measurement surfaces on the device, filled at the first event
   struct SurfaceTable {
     std::uint64_t* geometryId{nullptr};
     double* rotation{nullptr};
@@ -991,16 +882,12 @@ class CudaGlobalPatternFinder {
   const SurfaceTable& surfaceTable(const Acts::GeometryContext& gctx) const;
   mutable SurfaceTable m_surfaces{};
   mutable std::once_flag m_surfacesOnce{};
-  /// @brief The bytes of the pattern building, from workspaceFraction; zero
-  ///        takes sizes.workspaceBytes
   mutable std::size_t m_arenaBytes{0u};
 
-  /// @brief The stream and the transfer memory of one event, kept between
-  ///        events; one per event in flight
+  /// Stream and transfer buffers, one per event in flight
   struct Workspace;
   std::unique_ptr<Workspace> acquireWorkspace() const;
   void releaseWorkspace(std::unique_ptr<Workspace> workspace) const;
-  /// @brief Gives the workspace back when the event is done
   struct WorkspaceReturn {
     const CudaGlobalPatternFinder& finder;
     std::unique_ptr<Workspace>& workspace;
@@ -1009,7 +896,6 @@ class CudaGlobalPatternFinder {
   mutable std::mutex m_workspaceMutex{};
   mutable std::vector<std::unique_ptr<Workspace>> m_workspaces{};
 
-  /// @brief GlobalPatternFinder::addPhiOnlyHits
   void addPhiOnlyHits(const Acts::GeometryContext& gctx,
                       const BeamspotInfo& beamspot,
                       const OnlyPhiHitsProvider& onlyPhiProvider,
@@ -1021,27 +907,20 @@ class CudaGlobalPatternFinder {
   std::unique_ptr<const Acts::Logger> m_logger;
 };
 
-/// @brief GlobalPatternFinderAlgorithm::convertToPattern: the space points of
-///        the patterns, which point into the payloads the patterns were found
-///        with, so it is called while those are alive
+/// @brief The patterns point into their hit payloads, which must be alive
 MuonGlobalPatternContainer toMuonGlobalPatterns(
     const std::vector<GlobalPatternFinder_t::OutputPattern>& found);
 
-/// @brief GlobalPatternFinderAlgorithm with the pattern finding on the GPU.
-///        It reads the same space points and writes the same patterns; the
-///        search tree, the phi-only hits and the conversion of the patterns
-///        stay on the host.
+/// @brief GlobalPatternFinderAlgorithm with the patterns in eta found on the
+///        GPU
 class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
  public:
   struct Config : GlobalPatternFinderAlgorithm::Config {
-    /// @brief Device memory of the pattern building, used when
-    ///        workspaceFraction is zero
+    /// Arena size when workspaceFraction is zero
     std::size_t workspaceBytes{std::size_t{1} << 30u};
-    /// @brief Share of the device's free memory for the pattern building,
-    ///        see CudaGlobalPatternFinder::Config
+    /// See CudaGlobalPatternFinder::Config
     double workspaceFraction{0.5};
-    /// @brief Key of the CudaPatternFinderTiming of each event in the event
-    ///        store; nothing is written if empty
+    /// Event store key of the timing; not written if empty
     std::string outTiming{};
   };
 

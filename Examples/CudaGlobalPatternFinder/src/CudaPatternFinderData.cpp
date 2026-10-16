@@ -20,9 +20,8 @@
 
 namespace {
 
-/// The host column and the device column of every field of the hit payloads.
-/// The allocation, the release and the copies below work on this list, so a
-/// new column is added here and in the two structures only.
+/// Every hit payload column; a new column is added here and in the two
+/// structures only
 constexpr auto hitPayloadColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.positionX, device.positionX);
   visit(host.positionY, device.positionY);
@@ -54,9 +53,6 @@ constexpr auto hitPayloadColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.flags, device.flags);
 };
 
-/// The host column and the device column of every input field of the
-/// candidate lists. Offsets are one longer than the per-seed columns; the visit
-/// uses each vector's own size.
 constexpr auto candidateInputColumns = [](auto& host, auto& device,
                                           auto&& visit) {
   visit(host.seedHitIndex, device.seedHitIndex);
@@ -66,7 +62,6 @@ constexpr auto candidateInputColumns = [](auto& host, auto& device,
   visit(host.candidateIndices, device.candidateIndices);
 };
 
-/// The columns the seed preparation kernel writes
 constexpr auto candidateOutputColumns = [](auto& host, auto& device,
                                            auto&& visit) {
   visit(host.seedStatus, device.seedStatus);
@@ -80,8 +75,6 @@ constexpr auto candidateColumns = [](auto& host, auto& device, auto&& visit) {
   candidateOutputColumns(host, device, visit);
 };
 
-/// The host column and the device column of every per-slot field of the
-/// pattern records
 constexpr auto patternSlotColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.sector, device.sector);
 
@@ -127,13 +120,11 @@ constexpr auto patternSlotColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.status, device.status);
 };
 
-/// Per hit slot
 constexpr auto patternHitColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.hitIndex, device.hitIndex);
   visit(host.globLayer, device.globLayer);
 };
 
-/// Per seed
 constexpr auto patternSeedColumns = [](auto& host, auto& device, auto&& visit) {
   visit(host.nPatterns, device.nPatterns);
   visit(host.overflow, device.overflow);
@@ -145,7 +136,6 @@ constexpr auto patternColumns = [](auto& host, auto& device, auto&& visit) {
   patternSeedColumns(host, device, visit);
 };
 
-/// Sets a device column to zero on a stream
 template <typename T>
 void zeroDeviceColumn(T* deviceColumn, std::size_t size, cudaStream_t stream) {
   if (size == 0 || deviceColumn == nullptr) {
@@ -154,15 +144,12 @@ void zeroDeviceColumn(T* deviceColumn, std::size_t size, cudaStream_t stream) {
   ACTS_CUDA_CHECK(cudaMemsetAsync(deviceColumn, 0, size * sizeof(T), stream));
 }
 
-/// The bytes of a column of `count` elements inside a block, kept aligned
 template <typename T>
 std::size_t blockBytes(const T* /*column*/, std::size_t count) {
   return (count * sizeof(T) + 15u) & ~std::size_t{15u};
 }
 
-/// Points the columns of a list into a block, each with count(hostColumn)
-/// elements, from the cursor on; adds their bytes to `bytes` if the block is
-/// still to be allocated (block == nullptr)
+/// With a null block, only advances cursor
 template <typename Columns, typename Host, typename Device, typename Count>
 void carveColumns(Columns&& columns, Host& host, Device& device, char* block,
                   std::size_t& cursor, Count count) {
@@ -179,10 +166,7 @@ void carveColumns(Columns&& columns, Host& host, Device& device, char* block,
   });
 }
 
-/// All device columns of a list in one block from the device's memory pool,
-/// in the order of the stream: one allocation instead of one per column, for
-/// containers that are rebuilt every event. Returns the block, which the
-/// container releases at once
+/// All device columns in one stream-ordered allocation
 template <typename Columns, typename Host, typename Device>
 void* allocateColumns(Columns&& columns, Host& host, Device& device,
                       cudaStream_t stream) {
@@ -200,12 +184,10 @@ void* allocateColumns(Columns&& columns, Host& host, Device& device,
   return block;
 }
 
-/// Returns a block of columns to the pool. The containers are released once
-/// the work on their columns has completed, so the release does not need the
-/// stream that used them
+/// Only once all work on the block has completed
 inline void freeBlock(void*& block) noexcept {
   if (block != nullptr) {
-    // Called from noexcept destructors, so a failure cannot be reported
+    // Called from noexcept destructors, so errors are ignored
     (void)cudaFreeAsync(block, cudaStreamPerThread);
     block = nullptr;
   }
