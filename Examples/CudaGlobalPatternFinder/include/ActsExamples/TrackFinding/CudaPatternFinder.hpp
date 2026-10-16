@@ -574,7 +574,9 @@ __host__ __device__ inline bool isNeighbour(int sector1, int sector2) {
 }  // namespace ExpandedSector
 
 /// Fits the bending plane to the phi hits of a pattern, visited by
-/// forEachPhiHit, and the beam spot; non-finite if the fit is undefined
+/// forEachPhiHit, and the beam spot. No phi hit uses the sector centre.
+/// One or more phi hits share one regression; weights are frozen at
+/// previousPhi, which is the current plane.
 template <typename T, typename ForEachPhiHit>
 __host__ __device__ inline BendPlaneT<T> fitBendPlane(
     std::uint32_t nPhiLayers, Scalar<T> previousPhi, int sector,
@@ -599,32 +601,6 @@ __host__ __device__ inline BendPlaneT<T> fitBendPlane(
     plane.covPhiPhi = square(ExpandedSector::size<T>(sector)) / T{3};
     plane.covSS = 0;
     plane.covPhiS = 0;
-    return plane;
-  }
-  if (nPhiLayers == 1u) {
-    // Copy the hit, which may only live for the duration of the call
-    HitT<T> phiHit{};
-    forEachPhiHit([&](const HitT<T>& hit) { phiHit = hit; });
-    const T bsX{beamspot.position.x};
-    const T bsY{beamspot.position.y};
-    const T dX{phiHit.position.x - bsX};
-    const T dY{phiHit.position.y - bsY};
-    alignPhiAndStore(std::atan2(dY, dX));
-    plane.offset = dot(plane.normal, beamspot.position);
-
-    const T eRX{plane.normal.y};
-    const T eRY{-plane.normal.x};
-    const T lever{dX * eRX + dY * eRY};
-    const T rhoBS{bsX * eRX + bsY * eRY};
-    const T rhoHit{rhoBS + lever};
-
-    const T varBS{square(beamspot.radius)};
-    const T varHit{intrinsicVariance(phiHit, plane.normal, false)};
-    const T invL2{T{1} / square(lever)};
-
-    plane.covPhiPhi = (varHit + varBS) * invL2;
-    plane.covPhiS = -(rhoBS * varHit + rhoHit * varBS) * invL2;
-    plane.covSS = (square(rhoBS) * varHit + square(rhoHit) * varBS) * invL2;
     return plane;
   }
 

@@ -416,7 +416,7 @@ CudaGlobalPatternFinder::PatternStateAux
 CudaGlobalPatternFinder::makePatternState(
     const Acts::GeometryContext& gctx, const PayloadOf& payloadOf,
     const CudaPatternRecordContainer& event, std::size_t slot,
-    const BeamspotInfo& beamspot) const {
+    const BeamspotInfo& /*beamspot*/) const {
   using OrderedHit = PatternStateAux::OrderedHit;
   using BendPlaneCov = PatternStateAux::BendPlaneCov;
   const CudaPatternRecordRow row{event.pattern(slot)};
@@ -424,8 +424,8 @@ CudaGlobalPatternFinder::makePatternState(
     return OrderedHit{&payloadOf(event.hitIndex(slot, i)),
                       event.globLayer(slot, i)};
   };
-  PatternStateAux pat{gctx,     orderedHit(0u), row.sector,
-                      beamspot, &m_cfg.finder,  m_logger.get()};
+  PatternStateAux pat{gctx, orderedHit(0u), row.sector, &m_cfg.finder,
+                      m_logger.get()};
   pat.hitsPerGroup = {};
   for (std::size_t i = 0u; i < row.nHits; ++i) {
     const OrderedHit hit{orderedHit(i)};
@@ -460,7 +460,10 @@ CudaGlobalPatternFinder::makePatternState(
   pat.nTriggerLayers = row.nTriggerLayers;
   pat.nPhiLayers = row.nPhiLayers;
   pat.useBeamspot = (row.flags & CudaPatternFlags::useBeamspot) != 0u;
-  pat.needLineUpdate = (row.flags & CudaPatternFlags::needLineUpdate) != 0u;
+  // The device syncs the pattern before keeping it: the line ends at the
+  // last inserted hit and nothing is left to update
+  pat.lineEndHit = pat.lastInsertedHit;
+  pat.needUpdate.fill(false);
   return pat;
 }
 
@@ -477,67 +480,6 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
     }
     return pat.sector.insideSector(Acts::VectorHelpers::phi(pos));
   };
-  // Pattern line in the group of a phi hit, from the group's eta hits or
-  // from the closest eta hits around it
-  auto computePatternLineInGroup = [&](PatternStateAux& pat,
-                                       const HitPayload& phiHit) -> bool {
-    const auto phiHitGroup{PatternTopology::groupIndex(phiHit)};
-    const auto& groupHits{pat.hitsPerGroup[phiHitGroup]};
-
-    // useBeamspot flags whether the line could be drawn from the hits
-    pat.useBeamspot = true;
-    pat.needLineUpdate = true;
-
-    if (groupHits.size() > 1) {
-      const auto [minIt, maxIt]{std::ranges::minmax_element(
-          groupHits, {}, [](const OrderedHit& c) { return c.globLayer; })};
-      pat.lineAnchorHit = *minIt;
-      pat.lastInsertedHit = *maxIt;
-      pat.updateLineParameters(gctx, BeamspotInfo{});
-    }
-    if (pat.useBeamspot && !groupHits.empty()) {
-      pat.needLineUpdate = true;
-      pat.moveLineAnchorHit(groupHits.front());
-      pat.lastInsertedHit =
-          *std::ranges::max_element(groupHits, {}, [&](const OrderedHit& c) {
-            return (pat.projToPhiPlane(gctx, *c) -
-                    pat.projToPhiPlane(gctx, *pat.lineAnchorHit))
-                .norm();
-          });
-      pat.updateLineParameters(gctx, BeamspotInfo{});
-    }
-    if (pat.useBeamspot) {
-      pat.needLineUpdate = true;
-      const OrderedHit* lowerHit{nullptr};
-      const OrderedHit* upperHit{nullptr};
-      for (const auto& [group, hits] : Acts::enumerate(pat.hitsPerGroup)) {
-        if (hits.empty() || group == phiHitGroup) {
-          continue;
-        }
-        if (PatternTopology::layerSorter(*hits.front(), phiHit)) {
-          const OrderedHit& lowerInGroup{*std::ranges::max_element(
-              hits, {}, [](const OrderedHit& c) { return c.globLayer; })};
-          if (!lowerHit || lowerInGroup.globLayer > lowerHit->globLayer) {
-            lowerHit = &lowerInGroup;
-          }
-        } else {
-          const OrderedHit& upperInGroup{*std::ranges::min_element(
-              hits, {}, [](const OrderedHit& c) { return c.globLayer; })};
-          if (!upperHit || upperInGroup.globLayer < upperHit->globLayer) {
-            upperHit = &upperInGroup;
-          }
-        }
-      }
-      if (!lowerHit || !upperHit) {
-        return false;
-      }
-      pat.lineAnchorHit = *lowerHit;
-      pat.lastInsertedHit = *upperHit;
-      pat.updateLineParameters(gctx, BeamspotInfo{});
-    }
-    return !pat.useBeamspot;
-  };
-
   std::vector<PatternStateAux> survivingPatterns{};
   survivingPatterns.reserve(patterns.size());
   for (PatternStateAux& pat : patterns) {
@@ -563,7 +505,7 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
           continue;
         }
         if (!patternLineGroup || *patternLineGroup != group) {
-          if (!computePatternLineInGroup(pat, newHit)) {
+          if (!pat.defineLineAroundHit(gctx, newHit)) {
             continue;
           }
           patternLineGroup = static_cast<PatternTopology::GroupIdx>(group);
@@ -608,9 +550,8 @@ void CudaGlobalPatternFinder::addPhiOnlyHits(
           *it = std::move(newHit);
         } else {
           pat.phiOnlyHits.push_back(std::move(newHit));
-          pat.nPhiLayers++;
         }
-        pat.updatePatternPhi(gctx, beamspot);
+        pat.updateBendPlane(gctx, beamspot);
       }
     }
     if (pat.nPhiLayers < m_cfg.finder.minPhiLayers) {
