@@ -65,7 +65,7 @@ ActsExamples::MuonSpacePoint makeSpacePoint(MuonId::StationName station,
   sp.setGeometryId(Acts::GeometryIdentifier{layer + 1u});
   sp.defineCoordinates(Acts::Vector3{pos}, Acts::Vector3::UnitX(),
                        Acts::Vector3::UnitY());
-  /// The covariance is ordered as precision, non-precision & time
+  // The covariance is ordered as precision, non-precision & time
   sp.setCovariance(0.09, 0., 0.);
   return sp;
 }
@@ -77,32 +77,32 @@ BOOST_AUTO_TEST_SUITE(GlobalPatternFinderSuite)
 BOOST_AUTO_TEST_CASE(expanded_sector) {
   using SectorProjector = ExpandedSector::SectorProjector;
 
-  /// The expanded sector is twice the ms sector plus the projector
+  // The expanded sector is twice the ms sector plus the projector
   const ExpandedSector centreOfOne{1u, SectorProjector::center};
   BOOST_CHECK_EQUAL(centreOfOne.sector(), 2);
   BOOST_CHECK_EQUAL(centreOfOne.msSector(), 1u);
   BOOST_CHECK(centreOfOne.projector() == SectorProjector::center);
   BOOST_CHECK_EQUAL(centreOfOne.adjacentMsSector(), 1u);
-  /// Sector 1 is centred at phi = 0
+  // Sector 1 is centred at phi = 0
   BOOST_CHECK_SMALL(centreOfOne.phi(), 1.e-9);
   BOOST_CHECK(centreOfOne.insideSector(0.));
 
-  /// A hit at phi = 0 is well inside sector 1 and not in an overlap
+  // A hit at phi = 0 is well inside sector 1 and not in an overlap
   const ExpandedSector fromPhi{0.};
   BOOST_CHECK_EQUAL(fromPhi.sector(), centreOfOne.sector());
 
-  /// Sector 3 is centred at pi / 4
+  // Sector 3 is centred at pi / 4
   const ExpandedSector centreOfThree{3u, SectorProjector::center};
   BOOST_CHECK_CLOSE(centreOfThree.phi(), std::numbers::pi / 4., 1.e-6);
   BOOST_CHECK(!centreOfThree.insideSector(0.));
 
-  /// Neighbouring expanded sectors differ by one unit
+  // Neighbouring expanded sectors differ by one unit
   BOOST_CHECK(centreOfOne.isNeighbour(
       ExpandedSector{static_cast<ExpandedSector::Index_t>(3)}));
   BOOST_CHECK(!centreOfOne.isNeighbour(centreOfThree));
 
-  /// The expanded-sector index wraps at nExpanded (= 32). Sectors 0 and 31
-  /// meet at the MS boundary and must count as neighbours.
+  // The expanded-sector index wraps at nExpanded (= 32). Sectors 0 and 31
+  // meet at the MS boundary and must count as neighbours.
   const ExpandedSector wrapLo{static_cast<ExpandedSector::Index_t>(0)};
   const ExpandedSector wrapHi{static_cast<ExpandedSector::Index_t>(31)};
   BOOST_CHECK(wrapLo.isNeighbour(wrapHi));
@@ -110,13 +110,13 @@ BOOST_AUTO_TEST_CASE(expanded_sector) {
   BOOST_CHECK(!wrapLo.isNeighbour(
       ExpandedSector{static_cast<ExpandedSector::Index_t>(2)}));
 
-  /// The overlap between two sectors is expressed as the right overlap of the
-  /// lower one, which is why the left overlap maps onto the sector below
+  // The overlap between two sectors is expressed as the right overlap of the
+  // lower one, which is why the left overlap maps onto the sector below
   const ExpandedSector leftOfTwo{2u, SectorProjector::leftOverlap};
   BOOST_CHECK_EQUAL(leftOfTwo.msSector(), 1u);
   BOOST_CHECK(leftOfTwo.projector() == SectorProjector::rightOverlap);
   BOOST_CHECK_EQUAL(leftOfTwo.adjacentMsSector(), 2u);
-  /// An overlap is narrower than a sector
+  // An overlap is narrower than a sector
   BOOST_CHECK_LT(leftOfTwo.sectorSize(), centreOfOne.sectorSize());
 }
 
@@ -143,16 +143,16 @@ BOOST_AUTO_TEST_CASE(station_helpers) {
   BOOST_CHECK(isBarrel(StIndex::BM));
   BOOST_CHECK(!isBarrel(StIndex::EM));
 
-  /// Mdt & micromega hits are precision hits
+  // Mdt & micromega hits are precision hits
   BOOST_CHECK(isPrecisionHit(makeSpacePoint(
       BIL, MuonId::TechField::Mdt, 1u, true, false, Acts::Vector3::Zero())));
   BOOST_CHECK(isPrecisionHit(makeSpacePoint(
       EIL, MuonId::TechField::Mm, 1u, true, false, Acts::Vector3::Zero())));
-  /// Rpc / Tgc strips are trigger hits
+  // Rpc / Tgc strips are trigger hits
   BOOST_CHECK(!isPrecisionHit(makeSpacePoint(
       BML, MuonId::TechField::Rpc, 1u, true, false, Acts::Vector3::Zero())));
-  /// An sTgc hit counts as precision only if it measures eta alone. The channel
-  /// type is not exported, so a combined hit cannot be told from a pad
+  // An sTgc hit counts as precision only if it measures eta alone. The channel
+  // type is not exported, so a combined hit cannot be told from a pad
   BOOST_CHECK(isPrecisionHit(makeSpacePoint(
       EIL, MuonId::TechField::sTgc, 1u, true, false, Acts::Vector3::Zero())));
   BOOST_CHECK(!isPrecisionHit(makeSpacePoint(
@@ -174,8 +174,8 @@ BOOST_AUTO_TEST_CASE(hit_payload_and_topology) {
                                   MuonId::TechField::Mdt, 2u, true, false,
                                   Acts::Vector3{0., 25., 130.}));
 
-  /// A unit transform keeps the sector frame, so the global position is the
-  /// position the space point was built with
+  // A unit transform keeps the sector frame, so the global position is the
+  // position the space point was built with
   const Acts::Transform3 toGlobal{Acts::Transform3::Identity()};
   const HitPayload first{gctx, &bucket[0], &bucket, toGlobal, surface.get()};
   const HitPayload second{gctx, &bucket[1], &bucket, toGlobal, surface.get()};
@@ -191,14 +191,14 @@ BOOST_AUTO_TEST_CASE(hit_payload_and_topology) {
   BOOST_CHECK(first == first);
   BOOST_CHECK(!(first == second));
 
-  /// The hits are grouped by station and ordered by layer
+  // The hits are grouped by station and ordered by layer
   BOOST_CHECK_EQUAL(static_cast<int>(PatternTopology::groupIndex(first)),
                     static_cast<int>(Acts::toUnderlying(StIndex::BI)));
   BOOST_CHECK(PatternTopology::layerSorter(first, second));
   BOOST_CHECK(!PatternTopology::layerSorter(second, first));
   BOOST_CHECK(!PatternTopology::sameLayer(first, second));
   BOOST_CHECK(PatternTopology::sameLayer(second, sameLayerAsSecond));
-  /// Two hits on the same layer are ordered by their position along the layer
+  // Two hits on the same layer are ordered by their position along the layer
   BOOST_CHECK(PatternTopology::layerSorter(second, sameLayerAsSecond));
 }
 
@@ -234,17 +234,17 @@ BOOST_AUTO_TEST_CASE(seed_selector) {
   cfg.thetaSearchWindow = 0.06;
   const SeedSelector selector{SeedSelector::Config{cfg}};
 
-  /// Seeds are taken from the middle & outer station, Mdt hits are excluded
+  // Seeds are taken from the middle & outer station, Mdt hits are excluded
   BOOST_CHECK(selector.goodForSeeding(middleStrip));
   BOOST_CHECK(selector.goodForSeeding(outerStrip));
   BOOST_CHECK(!selector.goodForSeeding(middleStraw));
   BOOST_CHECK(!selector.goodForSeeding(innerStrip));
 
-  /// The window is halved for the middle station
+  // The window is halved for the middle station
   BOOST_CHECK_CLOSE(selector.thetaSearchWindow(outerStrip), 0.06, 1.e-6);
   BOOST_CHECK_CLOSE(selector.thetaSearchWindow(middleStrip), 0.03, 1.e-6);
 
-  /// Both toggles open up the corresponding seeds
+  // Both toggles open up the corresponding seeds
   SeedSelector::Config mdtCfg{cfg};
   mdtCfg.seedFromMdt = true;
   mdtCfg.seedFromInner = true;
