@@ -1906,24 +1906,32 @@ __global__ void prepareSeedsKernel(CudaHitPayloadArrays hits,
   while (padded < n) {
     padded <<= 1u;
   }
-  for (std::uint32_t k = 2u; k <= padded; k <<= 1u) {
-    for (std::uint32_t j = k / 2u; j > 0u; j >>= 1u) {
-      for (std::uint32_t t = lane; t < padded; t += lanesPerWarp) {
-        const std::uint32_t partner{j == k / 2u ? t ^ (k - 1u) : t ^ j};
-        if (partner <= t || partner >= n) {
-          continue;
+  auto sortRows = [&](auto before) {
+    for (std::uint32_t k = 2u; k <= padded; k <<= 1u) {
+      for (std::uint32_t j = k / 2u; j > 0u; j >>= 1u) {
+        for (std::uint32_t t = lane; t < padded; t += lanesPerWarp) {
+          const std::uint32_t partner{j == k / 2u ? t ^ (k - 1u) : t ^ j};
+          if (partner <= t || partner >= n) {
+            continue;
+          }
+          const std::uint32_t rowT{rows[t]};
+          const std::uint32_t rowP{rows[partner]};
+          if (before(rowP, rowT)) {
+            rows[t] = rowP;
+            rows[partner] = rowT;
+          }
         }
-        const std::uint32_t rowT{rows[t]};
-        const std::uint32_t rowP{rows[partner]};
-        if (Math::layerSorter(loadSortHit(hits, rowP),
-                              loadSortHit(hits, rowT))) {
-          rows[t] = rowP;
-          rows[partner] = rowT;
-        }
+        __syncwarp();
       }
-      __syncwarp();
     }
-  }
+  };
+  // The layer order is not transitive for hits of different sectors, so the
+  // rows are put in a fixed order first; otherwise the result would depend on
+  // the order of the candidate list
+  sortRows([](std::uint32_t a, std::uint32_t b) { return a < b; });
+  sortRows([&](std::uint32_t a, std::uint32_t b) {
+    return Math::layerSorter(loadSortHit(hits, a), loadSortHit(hits, b));
+  });
 
   std::uint32_t carry{0u};
   for (std::uint32_t base = 0u; base < n; base += lanesPerWarp) {
