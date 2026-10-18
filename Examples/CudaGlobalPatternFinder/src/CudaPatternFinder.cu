@@ -526,10 +526,6 @@ struct SeedBuilder {
     pat.needUpdate |= Pattern::kLine;
   }
 
-  __device__ bool areOverlapping(const Pattern& a, const Pattern& b) {
-    return ::areOverlapping(hits, cfg, info(a), rowsOf(a), info(b), rowsOf(b));
-  }
-
   __device__ void makeSeedPattern(Pattern& pat, std::uint16_t seedPos,
                                   std::int8_t sector) {
     pat = Pattern{};
@@ -745,10 +741,39 @@ __device__ std::uint32_t warpExclusiveScan(std::uint32_t n, Count count,
   return carry;
 }
 
+/// Warp-wide bitonic sort of items[0, n), first the items for which
+/// before(a, b) holds
+template <typename T, typename Before>
+__device__ void warpSort(T* items, std::uint32_t n, Before before,
+                         std::uint32_t lane) {
+  std::uint32_t padded{1u};
+  while (padded < n) {
+    padded <<= 1u;
+  }
+  for (std::uint32_t k = 2u; k <= padded; k <<= 1u) {
+    for (std::uint32_t j = k / 2u; j > 0u; j >>= 1u) {
+      for (std::uint32_t t = lane; t < padded; t += lanesPerWarp) {
+        const std::uint32_t partner{j == k / 2u ? t ^ (k - 1u) : t ^ j};
+        if (partner <= t || partner >= n) {
+          continue;
+        }
+        if (before(items[partner], items[t])) {
+          const T swap{items[t]};
+          items[t] = items[partner];
+          items[partner] = swap;
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
 constexpr std::uint8_t flagDropped = 1u << 0u;
 constexpr std::uint8_t flagNormalHit = 1u << 1u;
 /// Not selected when memory ran short
 constexpr std::uint8_t flagNoCarry = 1u << 2u;
+
+constexpr std::uint32_t emptySlot = UINT_MAX;
 
 constexpr std::uint8_t undecided = 0u;
 constexpr std::uint8_t kept = 1u;
@@ -837,6 +862,13 @@ struct Candidate {
 
 /// The pattern building of one seed by one warp. Patterns live in two
 /// regions that alternate between layers, grown by doubling.
+// The line tests of each pattern slot double as the scratch of pruning and
+// overlap resolution
+static_assert(lanesPerWarp * sizeof(LineTest) >=
+              11u * sizeof(std::uint32_t));
+static_assert(lanesPerWarp * sizeof(LineTest) >=
+              sizeof(PatternInfo) + 2u * sizeof(std::uint32_t));
+
 struct WarpSeed {
   SeedBuilder b;
   Arena arena;
@@ -857,10 +889,12 @@ struct WarpSeed {
   std::uint32_t* offsets{nullptr};
   std::uint8_t* flags{nullptr};
   std::uint8_t* state{nullptr};
-  std::uint8_t* nextState{nullptr};
   /// [pattern][chunk][hit], reused when the child is built
   LineTest* tests{nullptr};
   std::uint32_t largestBeam{0u};
+  /// Families of the patterns being extended: one forward, then one per
+  /// forward pattern
+  std::uint32_t nFamilies{1u};
 
   __device__ __forceinline__ char* regionOf(std::uint32_t r) const {
     return r == 0u ? region0 : region1;
@@ -904,7 +938,7 @@ struct WarpSeed {
       const unsigned long long testBytes{sizeof(LineTest) * target * maxChunks *
                                          lanesPerWarp};
       const unsigned long long bytes{testBytes + 2ull * maskBytes +
-                                     4ull * target + 3ull * target};
+                                     4ull * target + 2ull * target};
       unsigned long long got{0u};
       char* block{take(bytes, arena.patternLimit, false, got)};
       if (block != nullptr) {
@@ -934,7 +968,6 @@ struct WarpSeed {
         offsets = newOffsets;
         flags = newFlags;
         state = newFlags + target;
-        nextState = newFlags + 2u * target;
         scratchCap = target;
       } else {
         target = scratchCap;
@@ -1048,30 +1081,12 @@ struct WarpSeed {
       }
     }
     __syncwarp();
-    // Bitonic sort, best first; the padding beyond total is never read
-    auto better = [](const Candidate& a, const Candidate& c) {
-      return a.key > c.key || (a.key == c.key && a.order < c.order);
-    };
-    std::uint32_t padded{1u};
-    while (padded < total) {
-      padded <<= 1u;
-    }
-    for (std::uint32_t k = 2u; k <= padded; k <<= 1u) {
-      for (std::uint32_t j = k / 2u; j > 0u; j >>= 1u) {
-        for (std::uint32_t t = lane; t < padded; t += lanesPerWarp) {
-          const std::uint32_t partner{j == k / 2u ? t ^ (k - 1u) : t ^ j};
-          if (partner <= t || partner >= total) {
-            continue;
-          }
-          if (better(candidates[partner], candidates[t])) {
-            const Candidate swap{candidates[t]};
-            candidates[t] = candidates[partner];
-            candidates[partner] = swap;
-          }
-        }
-        __syncwarp();
-      }
-    }
+    warpSort(
+        candidates, total,
+        [](const Candidate& a, const Candidate& c) {
+          return a.key > c.key || (a.key == c.key && a.order < c.order);
+        },
+        lane);
     for (std::uint32_t r = room + lane; r < total; r += lanesPerWarp) {
       drop(candidates[r].order);
     }
@@ -1093,39 +1108,79 @@ struct WarpSeed {
       return static_cast<std::uint32_t>(d < 0 ? -d : d);
     };
 
-    // 1. Prune
+    // 1. Prune. The line tests of the layer are not written yet, so their
+    // memory holds the per-family counters and a hash table of the best
+    // pattern of each family and last hit
+    std::uint32_t nSlots{2u * lanesPerWarp};
+    while (nSlots < 2u * n) {
+      nSlots <<= 1u;
+    }
+    auto* slotKey = reinterpret_cast<std::uint32_t*>(tests);
+    std::uint32_t* slotBest{slotKey + nSlots};
+    std::uint32_t* familySize{slotBest + nSlots};
+    std::uint32_t* familyMissed{familySize + nFamilies};
+    std::uint32_t* familyLong{familyMissed + nFamilies};
+    for (std::uint32_t k = lane; k < nSlots; k += lanesPerWarp) {
+      slotKey[k] = emptySlot;
+      slotBest[k] = emptySlot;
+    }
+    for (std::uint32_t f = lane; f < nFamilies; f += lanesPerWarp) {
+      familySize[f] = 0u;
+      familyMissed[f] = UINT_MAX;
+      familyLong[f] = 0u;
+    }
+    __syncwarp();
+    auto slotOf = [&](const Pattern& pat, bool insert) {
+      const std::uint32_t key{(static_cast<std::uint32_t>(pat.family) << 16u) |
+                              pat.lastInsertedHit};
+      std::uint32_t s{(key * 2654435761u) >> (__clz(nSlots) + 1u)};
+      while (true) {
+        const std::uint32_t held{insert ? atomicCAS(&slotKey[s], emptySlot, key)
+                                        : slotKey[s]};
+        if (held == key || held == emptySlot) {
+          return s;
+        }
+        s = (s + 1u) & (nSlots - 1u);
+      }
+    };
+    for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
+      const Pattern& pat{pattern(from, i)};
+      if (pat.isOverlap) {
+        continue;
+      }
+      atomicAdd(&familySize[pat.family], 1u);
+      atomicMin(&familyMissed[pat.family], missedLayers(pat));
+      if (pat.nBendingLayers() > 2u) {
+        atomicOr(&familyLong[pat.family], 1u);
+      }
+      const std::uint32_t s{slotOf(pat, true)};
+      const PatternInfo info{b.info(pat)};
+      std::uint32_t best{atomicCAS(&slotBest[s], emptySlot, i)};
+      while (best != emptySlot &&
+             outranks(info, 0u, i, b.info(pattern(from, best)), 0u, best)) {
+        const std::uint32_t held{atomicCAS(&slotBest[s], best, i)};
+        if (held == best) {
+          break;
+        }
+        best = held;
+      }
+    }
+    __syncwarp();
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
       const Pattern& pat{pattern(from, i)};
       if (pat.isOverlap) {
         flags[i] = flagDropped;
         continue;
       }
-      std::uint32_t minMissed{UINT_MAX};
-      std::uint32_t nFamily{0u};
-      bool anyLong{false};
-      for (std::uint32_t j = 0u; j < n; ++j) {
-        const Pattern& other{pattern(from, j)};
-        if (other.family != pat.family || other.isOverlap) {
-          continue;
-        }
-        ++nFamily;
-        const std::uint32_t missed{missedLayers(other)};
-        minMissed = missed < minMissed ? missed : minMissed;
-        anyLong = anyLong || other.nBendingLayers() > 2u;
-      }
+      const std::uint32_t minMissed{familyMissed[pat.family]};
       const std::uint32_t maxMissed{b.cfg.maxMissLayersInGroup > minMissed
                                         ? b.cfg.maxMissLayersInGroup
                                         : minMissed};
       bool drop{b.group(pat.lastInsertedHit) == layerGroup &&
                 missedLayers(pat) > maxMissed};
-      if (!drop && nFamily > 1u && anyLong) {
-        const PatternInfo info{b.info(pat)};
-        for (std::uint32_t j = 0u; j < n && !drop; ++j) {
-          const Pattern& other{pattern(from, j)};
-          drop = j != i && !other.isOverlap && other.family == pat.family &&
-                 other.lastInsertedHit == pat.lastInsertedHit &&
-                 outranks(b.info(other), 0u, j, info, 0u, i);
-        }
+      if (!drop && familySize[pat.family] > 1u &&
+          familyLong[pat.family] != 0u) {
+        drop = slotBest[slotOf(pat, false)] != i;
       }
       flags[i] = drop ? flagDropped : 0u;
     }
@@ -1256,55 +1311,90 @@ struct WarpSeed {
     return nOut;
   }
 
-  /// In each round, a pattern not overlapped by a higher-ranked undecided or
-  /// kept pattern is kept, and one overlapped by a higher-ranked kept pattern
-  /// is dropped
+  /// Goes through the patterns best first and keeps each one that no kept
+  /// pattern overlaps; with perFamily, only patterns of one family are
+  /// compared. The line tests are not in use, so their memory holds the
+  /// summaries, the order and the kept patterns.
   __device__ __forceinline__ void resolveOverlaps(std::uint32_t r,
                                                   std::uint32_t n,
                                                   bool perFamily) {
+    auto* infos = reinterpret_cast<PatternInfo*>(tests);
+    auto* order = reinterpret_cast<std::uint32_t*>(infos + n);
+    std::uint32_t* keptList{order + n};
     std::uint32_t* good{offsets};
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
       const Pattern& pat{pattern(r, i)};
-      state[i] = pat.isOverlap ? dropped : undecided;
-      good[i] = pat.isOverlap ? 0u : b.countGroups(pattern(r, i), true);
+      state[i] = 0u;
+      if (!pat.isOverlap) {
+        infos[i] = b.info(pat);
+        good[i] = b.countGroups(pat, true);
+      }
+    }
+    const std::uint32_t nLive{warpExclusiveScan(
+        n, [&](std::uint32_t i) { return pattern(r, i).isOverlap ? 0u : 1u; },
+        keptList, lane)};
+    for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
+      if (!pattern(r, i).isOverlap) {
+        order[keptList[i]] = i;
+      }
     }
     __syncwarp();
-    while (true) {
-      bool anyUndecided{false};
-      for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
-        nextState[i] = state[i];
-        if (state[i] != undecided) {
-          continue;
-        }
-        const Pattern& pat{pattern(r, i)};
-        const PatternInfo info{b.info(pat)};
-        bool isDropped{false};
-        bool isBlocked{false};
-        for (std::uint32_t j = 0u; j < n && !isDropped; ++j) {
-          const Pattern& other{pattern(r, j)};
-          if (j == i || state[j] == dropped ||
-              (perFamily && other.family != pat.family) ||
-              !outranks(b.info(other), good[j], j, info, good[i], i) ||
-              !b.areOverlapping(other, pat)) {
-            continue;
+    auto family = [&](std::uint32_t i) { return pattern(r, i).family; };
+    warpSort(
+        order, nLive,
+        [&](std::uint32_t a, std::uint32_t c) {
+          if (perFamily && family(a) != family(c)) {
+            return family(a) < family(c);
           }
-          isDropped = state[j] == kept;
-          isBlocked = true;
+          return outranks(infos[a], good[a], a, infos[c], good[c], c);
+        },
+        lane);
+    auto overlaps = [&](std::uint32_t upper, std::uint32_t lower) {
+      return ::areOverlapping(b.hits, b.cfg, infos[upper],
+                              b.rowsOf(pattern(r, upper)), infos[lower],
+                              b.rowsOf(pattern(r, lower)));
+    };
+
+    // 32 at a time: against the kept patterns, then against the better ones
+    // of the same 32, decided in order
+    std::uint32_t nKept{0u};
+    for (std::uint32_t base = 0u; base < nLive; base += lanesPerWarp) {
+      const bool has{base + lane < nLive};
+      const std::uint32_t me{has ? order[base + lane] : 0u};
+      bool blocked{false};
+      for (std::uint32_t k = nKept; has && k > 0u && !blocked; --k) {
+        const std::uint32_t other{keptList[k - 1u]};
+        if (perFamily && family(other) != family(me)) {
+          break;
         }
-        nextState[i] = isDropped ? dropped : (isBlocked ? undecided : kept);
-        anyUndecided = anyUndecided || nextState[i] == undecided;
+        blocked = overlaps(other, me);
       }
+      std::uint32_t earlier{0u};
+      for (std::uint32_t j = 0u; j < lanesPerWarp; ++j) {
+        const std::uint32_t other{__shfl_sync(fullMask, me, j)};
+        if (has && !blocked && j < lane &&
+            (!perFamily || family(other) == family(me)) &&
+            overlaps(other, me)) {
+          earlier |= 1u << j;
+        }
+      }
+      const unsigned open{__ballot_sync(fullMask, has && !blocked)};
+      unsigned keep{0u};
+      for (std::uint32_t j = 0u; j < lanesPerWarp; ++j) {
+        const unsigned beaten{__shfl_sync(fullMask, earlier, j)};
+        if (((open >> j) & 1u) != 0u && (beaten & keep) == 0u) {
+          keep |= 1u << j;
+        }
+      }
+      if (((keep >> lane) & 1u) != 0u) {
+        keptList[nKept + __popc(keep & ((1u << lane) - 1u))] = me;
+        state[me] = 1u;
+      }
+      nKept += __popc(keep);
       __syncwarp();
-      for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
-        state[i] = nextState[i];
-      }
-      __syncwarp();
-      if (!__any_sync(fullMask, anyUndecided)) {
-        break;
-      }
     }
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
-      if (state[i] == dropped) {
+      if (state[i] == 0u) {
         pattern(r, i).isOverlap = true;
       }
     }
@@ -1342,6 +1432,7 @@ struct WarpSeed {
     }
     // Restart every forward pattern at the seed, then resolve overlaps.
     // The core fits the restarted line before comparing the patterns.
+    nFamilies = n;
     for (std::uint32_t f = lane; f < n; f += lanesPerWarp) {
       Pattern& start{pattern(current, f)};
       start.family = static_cast<std::uint16_t>(f);
