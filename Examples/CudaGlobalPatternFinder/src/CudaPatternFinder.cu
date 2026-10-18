@@ -2417,6 +2417,89 @@ __global__ void compactEventPatternsKernel(EventBuffers* buffers) {
 
 namespace ActsExamples {
 
+void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream) {
+  int device{0};
+  ACTS_CUDA_CHECK(cudaGetDevice(&device));
+  cudaMemPool_t pool{};
+  ACTS_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, device));
+  std::uint64_t keepAll{std::numeric_limits<std::uint64_t>::max()};
+  ACTS_CUDA_CHECK(
+      cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
+
+  // With lazy module loading a kernel is loaded at its first launch; querying
+  // its attributes loads it now
+  cudaFuncAttributes attributes{};
+  for (const void* kernel :
+       {reinterpret_cast<const void*>(&buildHitPayloadsKernel),
+        reinterpret_cast<const void*>(&Search::entriesKernel),
+        reinterpret_cast<const void*>(&Search::gatherSectorsKernel),
+        reinterpret_cast<const void*>(&Search::segmentsKernel),
+        reinterpret_cast<const void*>(&Search::windowsKernel),
+        reinterpret_cast<const void*>(&Search::totalsKernel),
+        reinterpret_cast<const void*>(&Search::fillListsKernel),
+        reinterpret_cast<const void*>(&prepareSeedsKernel),
+        reinterpret_cast<const void*>(&buildPatternsKernel),
+        reinterpret_cast<const void*>(&carveEventKernel),
+        reinterpret_cast<const void*>(&appendPatternsKernel),
+        reinterpret_cast<const void*>(&countEventGroupsKernel),
+        reinterpret_cast<const void*>(&linkEventPatternsKernel),
+        reinterpret_cast<const void*>(&resolveEventOverlapsKernel),
+        reinterpret_cast<const void*>(&compactEventPatternsKernel)}) {
+    ACTS_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+  }
+
+  // The CUB kernels have no handle to query: run the search's sorts and scans
+  // once on a single element
+  {
+    std::uint64_t* keys{nullptr};
+    std::uint8_t* sectors{nullptr};
+    std::uint32_t* values{nullptr};
+    char* temp{nullptr};
+    ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&keys),
+                                    2u * sizeof(std::uint64_t), stream));
+    ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&sectors),
+                                    2u * sizeof(std::uint8_t), stream));
+    ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&values),
+                                    4u * sizeof(std::uint32_t), stream));
+    ACTS_CUDA_CHECK(cudaMemsetAsync(keys, 0, 2u * sizeof(std::uint64_t), stream));
+    ACTS_CUDA_CHECK(cudaMemsetAsync(sectors, 0, 2u * sizeof(std::uint8_t), stream));
+    ACTS_CUDA_CHECK(cudaMemsetAsync(values, 0, 4u * sizeof(std::uint32_t), stream));
+    std::size_t sortKeyBytes{0u};
+    std::size_t sortSectorBytes{0u};
+    std::size_t scanBytes{0u};
+    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, sortKeyBytes, keys, keys + 1, values, values + 1, 1, 0, 64,
+        stream));
+    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, sortSectorBytes, sectors, sectors + 1, values, values + 1, 1, 0,
+        8, stream));
+    ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, values,
+                                                  values + 2, 1, stream));
+    std::size_t tempBytes{std::max({sortKeyBytes, sortSectorBytes, scanBytes})};
+    ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&temp),
+                                    std::max<std::size_t>(tempBytes, 1u), stream));
+    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        temp, tempBytes, keys, keys + 1, values, values + 1, 1, 0, 64, stream));
+    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        temp, tempBytes, sectors, sectors + 1, values, values + 1, 1, 0, 8,
+        stream));
+    ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp, tempBytes, values,
+                                                  values + 2, 1, stream));
+    for (void* ptr : {static_cast<void*>(keys), static_cast<void*>(sectors),
+                      static_cast<void*>(values), static_cast<void*>(temp)}) {
+      ACTS_CUDA_CHECK(cudaFreeAsync(ptr, stream));
+    }
+  }
+
+  // Taking the arena once leaves it in the pool for the events
+  if (arenaBytes > 0u) {
+    void* arena{nullptr};
+    ACTS_CUDA_CHECK(cudaMallocAsync(&arena, arenaBytes, stream));
+    ACTS_CUDA_CHECK(cudaFreeAsync(arena, stream));
+  }
+  ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 void buildCudaHitPayloads(const CudaMuonSpacePointArrays& spacePoints,
                           const CudaUsedHitArrays& used,
                           const CudaSurfaceTableArrays& surfaces,
@@ -2558,16 +2641,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   if (sizes.workspaceBytes == 0u) {
     throw std::invalid_argument(
         "findCudaPatternsInEta: the workspace has to have some memory");
-  }
-  // Keep freed memory in the pool between events
-  {
-    int device{0};
-    ACTS_CUDA_CHECK(cudaGetDevice(&device));
-    cudaMemPool_t pool{};
-    ACTS_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, device));
-    std::uint64_t keepAll{std::numeric_limits<std::uint64_t>::max()};
-    ACTS_CUDA_CHECK(cudaMemPoolSetAttribute(
-        pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
   }
   std::array<cudaEvent_t, 3> marks{};
   if (timing != nullptr) {

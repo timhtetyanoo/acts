@@ -137,12 +137,28 @@ CudaGlobalPatternFinder::surfaceTable(const Acts::GeometryContext& gctx) const {
   return m_surfaces;
 }
 
+void CudaGlobalPatternFinder::initialize(
+    const Acts::GeometryContext& gctx) const {
+  std::call_once(m_setupOnce, [&]() {
+    surfaceTable(gctx);
+    std::unique_ptr<Workspace> workspace{acquireWorkspace()};
+    workspace->upload.reserve(m_cfg.transferBytes);
+    workspace->device.reserve(m_cfg.transferBytes);
+    workspace->readback.reserve(m_cfg.transferBytes);
+    prepareCudaPatternFinder(
+        m_arenaBytes > 0u ? m_arenaBytes : m_cfg.sizes.workspaceBytes,
+        workspace->stream.get());
+    releaseWorkspace(std::move(workspace));
+  });
+}
+
 MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     const Acts::GeometryContext& gctx,
     const MuonSpacePointContainer& spacePoints,
     const SeedSelector& seedSelector,
     const OnlyPhiHitsProvider& onlyPhiProvider, const BeamspotInfo& beamspot,
     CudaPatternFinderTiming* timing) const {
+  initialize(gctx);
   using Clock = std::chrono::steady_clock;
   auto microseconds = [](Clock::duration d) {
     return std::chrono::duration<double, std::micro>(d).count();
@@ -613,6 +629,11 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   finderCfg.workspaceFraction = m_cfg.workspaceFraction;
   m_finder = std::make_unique<CudaGlobalPatternFinder>(
       std::move(finderCfg), this->logger().clone("CudaGlobalPatternFinder"));
+}
+
+ProcessCode CudaGlobalPatternFinderAlgorithm::initialize() {
+  m_finder->initialize(Acts::GeometryContext::dangerouslyDefaultConstruct());
+  return ProcessCode::SUCCESS;
 }
 
 ProcessCode CudaGlobalPatternFinderAlgorithm::execute(

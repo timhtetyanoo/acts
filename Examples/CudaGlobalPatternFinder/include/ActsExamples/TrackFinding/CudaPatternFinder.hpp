@@ -800,6 +800,11 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
                         CudaCandidateListContainer& lists,
                         CudaPinnedBuffer& readback, cudaStream_t stream);
 
+/// @brief One-off setup of the device: loads every kernel, keeps freed memory
+///        in the device's memory pool and fills the pool with the arena, so
+///        that no event pays for them. Synchronises the stream.
+void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream);
+
 /// @brief Finds the patterns in eta of an event on the device: one warp per
 ///        seed, then overlap resolution over the event by priority. If the
 ///        arena runs short, the best patterns are kept and the overflow bit
@@ -840,18 +845,25 @@ class CudaGlobalPatternFinder {
   struct Config {
     GlobalPatternFinder_t::Config finder{};
     CudaPatternFinderSizes sizes{};
-    /// Its surfaces are uploaded at the first event
+    /// Its surfaces are uploaded at setup
     std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
     bool useMdtHits{true};
     /// Fraction of the free device memory used for the arena; zero uses
     /// sizes.workspaceBytes
     double workspaceFraction{0.5};
+    /// Reserved at setup for each transfer buffer of the event
+    std::size_t transferBytes{std::size_t{16} << 20u};
   };
 
   explicit CudaGlobalPatternFinder(
       Config cfg,
       std::unique_ptr<const Acts::Logger> logger = Acts::getDefaultLogger(
           "CudaGlobalPatternFinder", Acts::Logging::INFO));
+
+  /// @brief One-off setup: CUDA context, surface table, arena size, kernels,
+  ///        memory pool and transfer buffers. Runs once; findPatterns calls it
+  ///        if it has not run.
+  void initialize(const Acts::GeometryContext& gctx) const;
 
   /// @brief Finds the patterns of an event
   /// @param timing Filled with the time of each stage, if given
@@ -887,6 +899,7 @@ class CudaGlobalPatternFinder {
   const SurfaceTable& surfaceTable(const Acts::GeometryContext& gctx) const;
   mutable SurfaceTable m_surfaces{};
   mutable std::once_flag m_surfacesOnce{};
+  mutable std::once_flag m_setupOnce{};
   mutable std::size_t m_arenaBytes{0u};
 
   /// Stream and transfer buffers, one per event in flight
@@ -931,6 +944,9 @@ class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
 
   CudaGlobalPatternFinderAlgorithm(const Config& cfg,
                                    std::unique_ptr<const Acts::Logger> logger);
+
+  /// @brief Sets up the device with the default geometry context
+  ProcessCode initialize() override;
 
   ProcessCode execute(const AlgorithmContext& ctx) const override;
 

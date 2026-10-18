@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -175,13 +176,13 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
   BOOST_TEST_MESSAGE("Reading the events [" << firstEvent << ", " << lastEvent
                                             << ") from " << ntuple.string());
 
-  /// The first event is run once untimed, so that loading the CUDA context
-  ///  and the kernels is not counted against it
+  // The one-off device setup, timed apart from the events
   {
-    ActsExamples::WhiteBoard eventStore{};
-    ActsExamples::AlgorithmContext ctx{0, firstEvent, eventStore, 0};
-    BOOST_REQUIRE(reader.read(ctx) == ActsExamples::ProcessCode::SUCCESS);
-    BOOST_REQUIRE(finder.execute(ctx) == ActsExamples::ProcessCode::SUCCESS);
+    const auto setupStart = std::chrono::steady_clock::now();
+    BOOST_REQUIRE(finder.initialize() == ActsExamples::ProcessCode::SUCCESS);
+    const std::chrono::duration<double, std::milli> setup{
+        std::chrono::steady_clock::now() - setupStart};
+    std::cout << "Setup time: " << setup.count() << " ms" << std::endl;
   }
 
   std::size_t totalPatterns{0};
