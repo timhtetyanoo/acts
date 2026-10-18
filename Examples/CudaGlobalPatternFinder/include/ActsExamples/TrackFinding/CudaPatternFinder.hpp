@@ -702,8 +702,6 @@ struct CudaPatternFinderTiming {
   std::size_t nSeeds{0u};
   std::size_t nCandidates{0u};
   std::size_t nPatternsInEta{0u};
-  /// Most patterns one seed held at once
-  std::size_t largestBeam{0u};
   /// CudaPatternOverflow bits
   std::uint8_t overflow{0u};
 };

@@ -152,7 +152,7 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
     timingFile << "event,nSpacePoints,nBuckets,nPatterns,totalTime_us,"
                   "hostPreTime_us,uploadTime_us,kernelTime_us,"
                   "downloadTime_us,hostPostTime_us,nSeeds,nCandidates,"
-                  "nPatternsInEta,largestBeam,overflow\n";
+                  "nPatternsInEta,overflow\n";
   }
 
   /// The patterns are written out for the offline validation, if asked for
@@ -220,7 +220,6 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
                  << stages.kernelsUs << ',' << stages.downloadUs << ','
                  << stages.hostPostUs << ',' << stages.nSeeds << ','
                  << stages.nCandidates << ',' << stages.nPatternsInEta << ','
-                 << stages.largestBeam << ','
                  << static_cast<int>(stages.overflow) << '\n';
     }
     totalPatterns += patterns.size();

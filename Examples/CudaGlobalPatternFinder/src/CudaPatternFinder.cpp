@@ -360,7 +360,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     ACTS_WARNING(__func__ << "() Patterns did not fit the device buffers "
                           << "(CudaPatternOverflow bits "
                           << static_cast<int>(overflow)
-                          << "); the seeds that did not fit have no patterns");
+                          << "); some patterns are missing");
   }
 
   const auto hostPostStart = Clock::now();

@@ -832,7 +832,6 @@ struct SeedResult {
 struct EventCounts {
   unsigned int nPatterns{0u};
   unsigned int maxHits{0u};
-  unsigned int largestBeam{0u};
   unsigned int overflow{0u};
 };
 
@@ -891,7 +890,6 @@ struct WarpSeed {
   std::uint8_t* state{nullptr};
   /// [pattern][chunk][hit], reused when the child is built
   LineTest* tests{nullptr};
-  std::uint32_t largestBeam{0u};
   /// Families of the patterns being extended: one forward, then one per
   /// forward pattern
   std::uint32_t nFamilies{1u};
@@ -1307,7 +1305,6 @@ struct WarpSeed {
     }
     __syncwarp();
     nOut += nCarried;
-    largestBeam = nOut > largestBeam ? nOut : largestBeam;
     return nOut;
   }
 
@@ -1564,7 +1561,6 @@ __global__ void buildPatternsKernel(CudaHitPayloadArrays hits,
     if (result.nKept > 0u) {
       atomicMax(&counts->maxHits, maxHits);
     }
-    atomicMax(&counts->largestBeam, warp.largestBeam);
     if (overflow != 0u) {
       atomicOr(&counts->overflow, overflow);
     }
@@ -2842,7 +2838,6 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     };
     timing->kernelsUs = elapsedUs(0u, 1u);
     timing->downloadUs = elapsedUs(1u, 2u);
-    timing->largestBeam = totals.largestBeam;
     timing->overflow = overflow;
     timing->nPatternsInEta = nKept[0];
     for (cudaEvent_t& m : marks) {
