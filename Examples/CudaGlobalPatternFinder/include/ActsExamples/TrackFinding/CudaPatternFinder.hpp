@@ -774,7 +774,12 @@ struct CudaSeedSelection {
   /// Bit l set: hits of LayerIndex l seed
   std::uint32_t seedingLayers{0u};
   bool seedFromMdt{false};
-  double thetaSearchWindow{0.};
+  /// |eta| edges of the seed's bins: barrel, transition, endcap
+  double etaBarrelMax{0.};
+  double etaEndcapMin{0.};
+  /// Theta half-window per |eta| bin, seed station and hit station
+  double thetaWindows[3][CudaPatternMath::Station::nGroups]
+                     [CudaPatternMath::Station::nGroups]{};
 };
 
 /// @brief Bucket transforms into the global frame, column-major

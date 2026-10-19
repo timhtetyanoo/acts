@@ -397,9 +397,10 @@ struct SeedBuilder {
     pat.useBeamspot = line.useBeamspot;
   }
 
-  /// Applies the updates booked by addHit. Entering a group that has no hit
-  /// yet draws the line across the previous group instead of the old anchor.
-  __device__ void syncState(Pattern& pat, bool searchInNewGroup) {
+  /// Applies the updates booked by addHit. While the anchor is in another
+  /// group than the last hit, the line is drawn across the last hit's group
+  /// instead, if that group spans minHitDistance4Line.
+  __device__ void syncState(Pattern& pat) {
     if ((pat.needUpdate & Pattern::kBend) != 0u) {
       updateBendPlane(pat);
     }
@@ -408,7 +409,7 @@ struct SeedBuilder {
       pat.needUpdate = (pat.needUpdate & ~Pattern::kAnchor) | Pattern::kLine;
     }
     const std::uint8_t lastGroup{group(pat.lastInsertedHit)};
-    if (searchInNewGroup && lastGroup != group(pat.lineAnchorHit)) {
+    if (lastGroup != group(pat.lineAnchorHit)) {
       const std::uint16_t* hitPos{hitsOf(pat)};
       std::uint16_t furthest{pat.lastInsertedHit};
       std::uint32_t bestDist{0u};
@@ -432,10 +433,6 @@ struct SeedBuilder {
           Math::dot(delta, delta) >=
               Math::square(static_cast<Real>(cfg.minHitDistance4Line))) {
         pat.lineAnchorHit = furthest;
-        pat.needUpdate |= Pattern::kLine;
-      } else if (globLayer(pat.lineAnchorHit) >
-                 globLayer(pat.lastInsertedHit)) {
-        pat.lineAnchorHit = pat.lastInsertedHit;
         pat.needUpdate |= Pattern::kLine;
       }
     }
@@ -1185,7 +1182,7 @@ struct WarpSeed {
     for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
       if ((flags[i] & flagDropped) == 0u) {
         Pattern& pat{pattern(from, i)};
-        b.syncState(pat, b.group(pat.lastInsertedHit) != layerGroup);
+        b.syncState(pat);
       }
     }
     __syncwarp();
@@ -1229,12 +1226,83 @@ struct WarpSeed {
       }
       __syncwarp();
     }
-    for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
+    // The Core takes the hits of a layer one by one. A pattern that already
+    // holds a hit of the layer branches for another one, except between a
+    // precision and a non-precision hit when the precision hit's residual
+    // sigma is clearly the smaller: then the precision hit replaces the other
+    // one, or the non-precision hit is rejected. The parent itself takes the
+    // first hit, and stays without one only while its hits are of low
+    // confidence.
+    auto isPrecision = [&](std::uint32_t c, std::uint32_t h) {
+      return (b.hit(static_cast<std::uint16_t>(first + c * lanesPerWarp + h))
+                  .flags &
+              CudaHitFlags::precision) != 0u;
+    };
+    auto takeInOrder = [&](std::uint32_t i) {
+      const std::size_t row{static_cast<std::size_t>(i) * maxChunks};
+      bool parentFree{true};
       for (std::uint32_t c = 0u; c < nChunks; ++c) {
-        if ((acceptMask[i * maxChunks + c] & ~lowMask[i * maxChunks + c]) !=
-            0u) {
-          flags[i] |= flagNormalHit;
+        for (std::uint32_t todo{acceptMask[row + c]}; todo != 0u;
+             todo &= todo - 1u) {
+          const auto h = static_cast<std::uint32_t>(__ffs(todo) - 1);
+          const std::uint32_t bit{1u << h};
+          const bool prec{isPrecision(c, h)};
+          const Real sigma{tests[(row + c) * lanesPerWarp + h].sigma};
+          bool keep{parentFree};
+          if (parentFree && (lowMask[row + c] & bit) == 0u) {
+            parentFree = false;
+          }
+          // The patterns holding an earlier hit of the layer
+          for (std::uint32_t c2 = 0u; c2 <= c; ++c2) {
+            std::uint32_t held{acceptMask[row + c2]};
+            if (c2 == c) {
+              held &= bit - 1u;
+            }
+            for (; held != 0u; held &= held - 1u) {
+              const auto x = static_cast<std::uint32_t>(__ffs(held) - 1);
+              if (isPrecision(c2, x) == prec) {
+                keep = true;
+                continue;
+              }
+              const Real other{tests[(row + c2) * lanesPerWarp + x].sigma};
+              const Real precSigma{prec ? sigma : other};
+              const Real nonPrecSigma{prec ? other : sigma};
+              if (!(Real{2} * precSigma * precSigma <
+                    nonPrecSigma * nonPrecSigma)) {
+                keep = true;
+              } else if (prec) {
+                keep = true;
+                acceptMask[row + c2] &= ~(1u << x);
+                lowMask[row + c2] &= ~(1u << x);
+              }
+            }
+          }
+          if (!keep) {
+            acceptMask[row + c] &= ~bit;
+            lowMask[row + c] &= ~bit;
+          }
         }
+      }
+      return parentFree;
+    };
+    for (std::uint32_t i = lane; i < n; i += lanesPerWarp) {
+      bool anyPrecision{false};
+      bool anyOther{false};
+      bool anyNormal{false};
+      for (std::uint32_t c = 0u; c < nChunks; ++c) {
+        const std::uint32_t accepted{acceptMask[i * maxChunks + c]};
+        anyNormal |= (accepted & ~lowMask[i * maxChunks + c]) != 0u;
+        for (std::uint32_t todo{accepted}; todo != 0u; todo &= todo - 1u) {
+          const bool prec{isPrecision(c, __ffs(todo) - 1)};
+          anyPrecision |= prec;
+          anyOther |= !prec;
+        }
+      }
+      if (anyPrecision && anyOther) {
+        anyNormal = !takeInOrder(i);
+      }
+      if (anyNormal) {
+        flags[i] |= flagNormalHit;
       }
     }
     __syncwarp();
@@ -1437,7 +1505,7 @@ struct WarpSeed {
       }
       start.lastInsertedHit = seedPos;
       b.moveLineAnchorHit(start, seedPos);
-      b.syncState(start, false);
+      b.syncState(start);
     }
     __syncwarp();
     if (n > 1u) {
@@ -1467,7 +1535,7 @@ struct WarpSeed {
     for (std::uint32_t k = lane; k < n; k += lanesPerWarp) {
       Pattern& pat{pattern(current, k)};
       if (!pat.isOverlap) {
-        b.syncState(pat, false);
+        b.syncState(pat);
       }
     }
     __syncwarp();
@@ -1793,18 +1861,9 @@ __device__ void linkPair(const CudaHitPayloadArrays& hits,
     atomicOr(&buffers.links[word], bit);
   }
   const std::uint32_t seedLower{buffers.seedOf[lower]};
+  // The caller only passes pairs within maxThetaSizeOverlap, the theta window
+  // of the seed-use count
   if (buffers.seedOf[upper] != seedLower) {
-    // A middle-layer seed is counted in half the theta window of an
-    // inner or outer seed, matching SeedSelector::thetaSearchWindow
-    const std::uint8_t seedLayer{
-        Math::layerOf(hits.station[lists.seedHitIndex[seedLower]])};
-    const Real thetaCut{seedLayer == Math::Layer::Inner ||
-                                seedLayer == Math::Layer::Outer
-                            ? static_cast<Real>(cfg.maxThetaSizeOverlap)
-                            : static_cast<Real>(0.5 * cfg.maxThetaSizeOverlap)};
-    if (std::abs(infoI.patTheta - infoJ.patTheta) > thetaCut) {
-      return;
-    }
     const std::uint32_t seedRow{lists.seedHitIndex[seedLower]};
     const auto upperRows = rowsOf(upper);
     for (std::uint32_t k = 0u; k < event.nHits[upper]; ++k) {
@@ -2262,18 +2321,31 @@ __device__ std::uint32_t bucketOf(const CudaMuonSpacePointArrays& sp,
   return bucket;
 }
 
-/// Negative if the hit does not seed
-__device__ double seedWindow(std::uint32_t raw, const CudaSeedSelection& sel) {
-  const std::uint8_t layer{
-      Math::layerOf(MuonIdBits::station(MuonIdBits::stationName(raw)))};
+/// The seed's theta half-window per hit station, or null if the hit does not
+/// seed. The table depends on the seed's station and the bin of its |eta|.
+__device__ const double* seedWindows(std::uint32_t raw, const double x,
+                                     const double y, const double z,
+                                     const CudaSeedSelection& sel) {
+  const std::uint8_t station{MuonIdBits::station(MuonIdBits::stationName(raw))};
+  if (station >= Math::Station::nGroups) {
+    return nullptr;
+  }
+  const std::uint8_t layer{Math::layerOf(station)};
   const bool straw{MuonIdBits::technology(raw) == MuonIdBits::mdt};
   if (((sel.seedingLayers >> layer) & 1u) == 0u ||
       (straw && !sel.seedFromMdt)) {
-    return -1.;
+    return nullptr;
   }
-  return (layer == Math::Layer::Inner || layer == Math::Layer::Outer)
-             ? sel.thetaSearchWindow
-             : 0.5 * sel.thetaSearchWindow;
+  const double eta{std::abs(std::asinh(z / std::sqrt(x * x + y * y)))};
+  const int bin{eta <= sel.etaBarrelMax ? 0 : eta < sel.etaEndcapMin ? 1 : 2};
+  return sel.thetaWindows[bin][station];
+}
+
+/// Station of the hit of an entry, the index of its window
+__device__ std::uint8_t entryStation(const CudaMuonSpacePointArrays& sp,
+                                     std::uint32_t e) {
+  return MuonIdBits::station(
+      MuonIdBits::stationName(sp.muonId[e / projections]));
 }
 
 struct Buffers {
@@ -2292,6 +2364,7 @@ struct Buffers {
   std::uint32_t* count;
   std::uint32_t* offset;
   std::uint32_t* low;
+  std::uint32_t* high;
   // Per sector, [first, last) of its entries
   std::uint32_t* segment;
   std::uint32_t* totals;
@@ -2387,9 +2460,10 @@ __global__ void segmentsKernel(Buffers buf) {
   }
 }
 
-/// For each seeding entry, the range of entries of its sector inside its theta
-/// window: the seed's candidates
-__global__ void windowsKernel(CudaMuonSpacePointArrays sp,
+/// For each seeding entry, the range of entries of its sector inside its widest
+/// theta window, and how many of them are inside the window of their own
+/// station: the seed's candidates
+__global__ void windowsKernel(CudaMuonSpacePointArrays sp, CudaSearchArrays in,
                               CudaSeedSelection sel, Buffers buf) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
   if (i >= buf.nEntries) {
@@ -2402,13 +2476,19 @@ __global__ void windowsKernel(CudaMuonSpacePointArrays sp,
     return;
   }
   const std::uint32_t e{buf.entrySorted2[i]};
-  const double window{seedWindow(sp.muonId[e / projections], sel)};
-  if (window < 0.) {
+  const std::uint32_t r{e / projections};
+  const double* windows{seedWindows(sp.muonId[r], in.positionX[r],
+                                    in.positionY[r], in.positionZ[r], sel)};
+  if (windows == nullptr) {
     return;
   }
+  double widest{0.};
+  for (std::uint32_t g = 0u; g < Math::Station::nGroups; ++g) {
+    widest = windows[g] > widest ? windows[g] : widest;
+  }
   const double t{buf.theta[e]};
-  const double lowEdge{t - window / 2.};
-  const double highEdge{t + window / 2.};
+  const double lowEdge{t - widest};
+  const double highEdge{t + widest};
   auto lowerBound = [&](double value) {
     std::uint32_t lo{buf.segment[2u * s]};
     std::uint32_t hi{buf.segment[2u * s + 1u]};
@@ -2424,9 +2504,16 @@ __global__ void windowsKernel(CudaMuonSpacePointArrays sp,
   };
   const std::uint32_t lo{lowerBound(lowEdge)};
   const std::uint32_t hi{lowerBound(highEdge)};
+  std::uint32_t count{0u};
+  for (std::uint32_t k = lo; k < hi; ++k) {
+    const std::uint32_t c{buf.entrySorted2[k]};
+    count +=
+        std::abs(buf.theta[c] - t) <= windows[entryStation(sp, c)] ? 1u : 0u;
+  }
   buf.isSeed[i] = 1u;
   buf.low[i] = lo;
-  buf.count[i] = hi - lo;
+  buf.high[i] = hi;
+  buf.count[i] = count;
 }
 
 /// Numbers of seeds and of candidates, from the last entry of the scans
@@ -2439,7 +2526,9 @@ __global__ void totalsKernel(Buffers buf) {
 }
 
 /// Seed hit, sector, theta and candidate indices of each seed
-__global__ void fillListsKernel(Buffers buf, CudaCandidateArrays lists) {
+__global__ void fillListsKernel(CudaMuonSpacePointArrays sp,
+                                CudaSearchArrays in, CudaSeedSelection sel,
+                                Buffers buf, CudaCandidateArrays lists) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
   if (i >= buf.nEntries || buf.isSeed[i] == 0u) {
     return;
@@ -2454,9 +2543,15 @@ __global__ void fillListsKernel(Buffers buf, CudaCandidateArrays lists) {
   if (seed + 1u == lists.nSeeds) {
     lists.candidateOffsets[seed + 1u] = first + buf.count[i];
   }
-  for (std::uint32_t k = 0u; k < buf.count[i]; ++k) {
-    lists.candidateIndices[first + k] =
-        buf.entrySorted2[buf.low[i] + k] / projections;
+  const std::uint32_t r{e / projections};
+  const double* windows{seedWindows(sp.muonId[r], in.positionX[r],
+                                    in.positionY[r], in.positionZ[r], sel)};
+  std::uint32_t k{first};
+  for (std::uint32_t j = buf.low[i]; j < buf.high[i]; ++j) {
+    const std::uint32_t c{buf.entrySorted2[j]};
+    if (std::abs(buf.theta[c] - buf.theta[e]) <= windows[entryStation(sp, c)]) {
+      lists.candidateIndices[k++] = c / projections;
+    }
   }
 }
 
@@ -2648,6 +2743,7 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
   allocate(buf.count, n);
   allocate(buf.offset, n);
   allocate(buf.low, n);
+  allocate(buf.high, n);
   allocate(buf.segment, 2u * 32u);
   allocate(buf.totals, 2u);
   std::size_t sortThetaBytes{0u};
@@ -2685,8 +2781,8 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
       buf.entrySorted2, n, 0, 8, stream));
   Search::segmentsKernel<<<entryBlocks, blockSize, 0, stream>>>(buf);
   ACTS_CUDA_CHECK(cudaGetLastError());
-  Search::windowsKernel<<<entryBlocks, blockSize, 0, stream>>>(spacePoints,
-                                                               selection, buf);
+  Search::windowsKernel<<<entryBlocks, blockSize, 0, stream>>>(
+      spacePoints, search, selection, buf);
   ACTS_CUDA_CHECK(cudaGetLastError());
   ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp, tempBytes, buf.isSeed,
                                                 buf.seedSlot, n, stream));
@@ -2706,7 +2802,7 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
   if (nSeeds > 0u) {
     lists.allocateDevice(nSeeds, nCandidates, stream);
     Search::fillListsKernel<<<entryBlocks, blockSize, 0, stream>>>(
-        buf, lists.deviceArrays());
+        spacePoints, search, selection, buf, lists.deviceArrays());
     ACTS_CUDA_CHECK(cudaGetLastError());
   }
   for (void* ptr : blocks) {

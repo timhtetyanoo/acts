@@ -298,9 +298,15 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
 
   // Waits for the numbers of seeds and candidates
-  CudaSeedSelection selection{
-      .seedFromMdt = seedSelector.m_cfg.seedFromMdt,
-      .thetaSearchWindow = seedSelector.m_cfg.thetaSearchWindow};
+  CudaSeedSelection selection{.seedFromMdt = seedSelector.m_cfg.seedFromMdt,
+                              .etaBarrelMax = seedSelector.m_cfg.etaBarrelMax,
+                              .etaEndcapMin = seedSelector.m_cfg.etaEndcapMin};
+  for (std::size_t bin = 0u; bin < seedSelector.m_thetaWindows.size(); ++bin) {
+    for (std::size_t s = 0u; s < CudaPatternMath::Station::nGroups; ++s) {
+      std::ranges::copy(seedSelector.m_thetaWindows[bin][s],
+                        selection.thetaWindows[bin][s]);
+    }
+  }
   for (const LayerIndex layer : seedSelector.m_seedinglayers) {
     if (Acts::toUnderlying(layer) >= 0) {
       selection.seedingLayers |= 1u << Acts::toUnderlying(layer);
@@ -603,7 +609,6 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
 
   SeedSelector::Config selectorCfg{};
   selectorCfg.seedFromMdt = m_cfg.seedFromMdt;
-  selectorCfg.thetaSearchWindow = m_cfg.thetaSearchWindow;
   selectorCfg.seedFromInner = m_cfg.seedFromInner;
   m_seedSelector = std::make_unique<SeedSelector>(std::move(selectorCfg));
 
@@ -611,7 +616,8 @@ CudaGlobalPatternFinderAlgorithm::CudaGlobalPatternFinderAlgorithm(
   GlobalPatternFinder_t::Config& patCfg{finderCfg.finder};
   patCfg.nResidualSigma = m_cfg.nResidualSigma;
   patCfg.lowConfidenceResSigma = m_cfg.lowConfidenceResSigma;
-  patCfg.maxThetaSizeOverlap = 2. * m_cfg.thetaSearchWindow;
+  patCfg.maxThetaSizeOverlap =
+      2. * m_seedSelector->maxThetaWindow() + 0.5 * Acts::UnitConstants::degree;
   patCfg.phiTolerance = m_cfg.phiTolerance;
   patCfg.loosenAcceptanceFactor = 2.5;
   patCfg.minStripEtaLayers = m_cfg.minTriggerLayers;
