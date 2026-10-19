@@ -686,7 +686,7 @@ struct CudaPatternFinderConfig {
 /// @brief Device memory of the pattern finding. If the patterns do not fit,
 ///        the best ones are kept and the overflow is reported.
 struct CudaPatternFinderSizes {
-  /// Arena for the patterns of one event
+  /// Memory for the patterns of one event
   std::size_t workspaceBytes{std::size_t{1} << 30u};
 };
 
@@ -799,13 +799,13 @@ void findCudaCandidates(const CudaMuonSpacePointArrays& spacePoints,
                         CudaPinnedBuffer& readback, cudaStream_t stream);
 
 /// @brief One-off setup of the device: loads every kernel, keeps freed memory
-///        in the device's memory pool and fills the pool with the arena, so
+///        in the device's memory pool and fills the pool with the workspace, so
 ///        that no event pays for them. Synchronises the stream.
-void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream);
+void prepareCudaPatternFinder(std::size_t workspaceBytes, cudaStream_t stream);
 
 /// @brief Finds the patterns in eta of an event on the device: one warp per
 ///        seed, then overlap resolution over the event by priority. If the
-///        arena runs short, the best patterns are kept and the overflow bit
+///        workspace runs short, the best patterns are kept and the overflow bit
 ///        is set. Synchronises the stream.
 /// @param readback Page-locked memory reused between events, if given
 /// @return The kept patterns, as the slots of entry 0
@@ -846,7 +846,7 @@ class CudaGlobalPatternFinder {
     /// Its surfaces are uploaded at setup
     std::shared_ptr<const Acts::TrackingGeometry> trackingGeometry{};
     bool useMdtHits{true};
-    /// Fraction of the free device memory used for the arena; zero uses
+    /// Fraction of the free device memory used for the workspace; zero uses
     /// sizes.workspaceBytes
     double workspaceFraction{0.5};
     /// Reserved at setup for each transfer buffer of the event
@@ -858,7 +858,7 @@ class CudaGlobalPatternFinder {
       std::unique_ptr<const Acts::Logger> logger = Acts::getDefaultLogger(
           "CudaGlobalPatternFinder", Acts::Logging::INFO));
 
-  /// @brief One-off setup: CUDA context, surface table, arena size, kernels,
+  /// @brief One-off setup: CUDA context, surface table, workspace size, kernels,
   ///        memory pool and transfer buffers. Runs once; findPatterns calls it
   ///        if it has not run.
   void initialize(const Acts::GeometryContext& gctx) const;
@@ -898,19 +898,19 @@ class CudaGlobalPatternFinder {
   mutable SurfaceTable m_surfaces{};
   mutable std::once_flag m_surfacesOnce{};
   mutable std::once_flag m_setupOnce{};
-  mutable std::size_t m_arenaBytes{0u};
+  mutable std::size_t m_workspaceBytes{0u};
 
   /// Stream and transfer buffers, one per event in flight
-  struct Workspace;
-  std::unique_ptr<Workspace> acquireWorkspace() const;
-  void releaseWorkspace(std::unique_ptr<Workspace> workspace) const;
-  struct WorkspaceReturn {
+  struct StreamBuffers;
+  std::unique_ptr<StreamBuffers> acquireStreamBuffers() const;
+  void releaseStreamBuffers(std::unique_ptr<StreamBuffers> buffers) const;
+  struct StreamBuffersReturn {
     const CudaGlobalPatternFinder& finder;
-    std::unique_ptr<Workspace>& workspace;
-    ~WorkspaceReturn();
+    std::unique_ptr<StreamBuffers>& buffers;
+    ~StreamBuffersReturn();
   };
-  mutable std::mutex m_workspaceMutex{};
-  mutable std::vector<std::unique_ptr<Workspace>> m_workspaces{};
+  mutable std::mutex m_streamBuffersMutex{};
+  mutable std::vector<std::unique_ptr<StreamBuffers>> m_streamBuffers{};
 
   void addPhiOnlyHits(const Acts::GeometryContext& gctx,
                       const BeamspotInfo& beamspot,
@@ -932,7 +932,7 @@ MuonGlobalPatternContainer toMuonGlobalPatterns(
 class CudaGlobalPatternFinderAlgorithm final : public IAlgorithm {
  public:
   struct Config : GlobalPatternFinderAlgorithm::Config {
-    /// Arena size when workspaceFraction is zero
+    /// Workspace size when workspaceFraction is zero
     std::size_t workspaceBytes{std::size_t{1} << 30u};
     /// See CudaGlobalPatternFinder::Config
     double workspaceFraction{0.5};

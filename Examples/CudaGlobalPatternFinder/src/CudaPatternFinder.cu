@@ -863,8 +863,7 @@ struct Candidate {
 /// regions that alternate between layers, grown by doubling.
 // The line tests of each pattern slot double as the scratch of pruning and
 // overlap resolution
-static_assert(lanesPerWarp * sizeof(LineTest) >=
-              11u * sizeof(std::uint32_t));
+static_assert(lanesPerWarp * sizeof(LineTest) >= 11u * sizeof(std::uint32_t));
 static_assert(lanesPerWarp * sizeof(LineTest) >=
               sizeof(PatternInfo) + 2u * sizeof(std::uint32_t));
 
@@ -1587,9 +1586,9 @@ struct EventBuffers {
 };
 
 /// With a null base, only advances cursor
-__device__ void carveRecords(CudaPatternRecordArrays& r, char* base,
-                             unsigned long long& cursor, std::uint32_t n,
-                             std::uint32_t maxHits) {
+__device__ void layoutRecords(CudaPatternRecordArrays& r, char* base,
+                              unsigned long long& cursor, std::uint32_t n,
+                              std::uint32_t maxHits) {
   auto take = [&](auto*& column, unsigned long long count) {
     if (base != nullptr) {
       column = reinterpret_cast<std::remove_reference_t<decltype(column)>>(
@@ -1642,8 +1641,9 @@ __device__ void carveRecords(CudaPatternRecordArrays& r, char* base,
 
 /// If the buffers do not fit, the event keeps no patterns and gets the
 /// eventPatterns overflow bit
-__global__ void carveEventKernel(Arena arena, EventCounts* counts,
-                                 std::uint32_t nSeeds, EventBuffers* buffers) {
+__global__ void allocateEventBuffersKernel(Arena arena, EventCounts* counts,
+                                           std::uint32_t nSeeds,
+                                           EventBuffers* buffers) {
   if (blockIdx.x != 0u || threadIdx.x != 0u) {
     return;
   }
@@ -1653,9 +1653,9 @@ __global__ void carveEventKernel(Arena arena, EventCounts* counts,
   const std::uint32_t words{(n + 31u) / 32u};
   auto layout = [&](char* base) {
     unsigned long long cursor{0u};
-    carveRecords(out.event, base, cursor, n, maxHits);
+    layoutRecords(out.event, base, cursor, n, maxHits);
     const unsigned long long compactedStart{cursor};
-    carveRecords(out.compacted, base, cursor, n, maxHits);
+    layoutRecords(out.compacted, base, cursor, n, maxHits);
     out.compactedBytes = cursor - compactedStart;
     if (base != nullptr) {
       out.compactedBase = base + compactedStart;
@@ -2298,6 +2298,8 @@ struct Buffers {
   std::uint32_t nEntries;
 };
 
+/// One thread per hit: global position, and the theta and sector of each of
+/// its three projections onto neighbouring sectors
 __global__ void entriesKernel(CudaMuonSpacePointArrays sp, CudaSearchArrays in,
                               Buffers buf) {
   const std::uint32_t r{blockIdx.x * blockDim.x + threadIdx.x};
@@ -2359,6 +2361,7 @@ __global__ void entriesKernel(CudaMuonSpacePointArrays sp, CudaSearchArrays in,
   }
 }
 
+/// Sector of each entry in theta order, the key of the sort by sector
 __global__ void gatherSectorsKernel(Buffers buf) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
   if (i < buf.nEntries) {
@@ -2366,6 +2369,7 @@ __global__ void gatherSectorsKernel(Buffers buf) {
   }
 }
 
+/// [first, last) of each sector's entries in the sorted order
 __global__ void segmentsKernel(Buffers buf) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
   if (i >= buf.nEntries) {
@@ -2383,6 +2387,8 @@ __global__ void segmentsKernel(Buffers buf) {
   }
 }
 
+/// For each seeding entry, the range of entries of its sector inside its theta
+/// window: the seed's candidates
 __global__ void windowsKernel(CudaMuonSpacePointArrays sp,
                               CudaSeedSelection sel, Buffers buf) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
@@ -2423,6 +2429,7 @@ __global__ void windowsKernel(CudaMuonSpacePointArrays sp,
   buf.count[i] = hi - lo;
 }
 
+/// Numbers of seeds and of candidates, from the last entry of the scans
 __global__ void totalsKernel(Buffers buf) {
   if (threadIdx.x == 0u && blockIdx.x == 0u) {
     const std::uint32_t last{buf.nEntries - 1u};
@@ -2431,6 +2438,7 @@ __global__ void totalsKernel(Buffers buf) {
   }
 }
 
+/// Seed hit, sector, theta and candidate indices of each seed
 __global__ void fillListsKernel(Buffers buf, CudaCandidateArrays lists) {
   const std::uint32_t i{blockIdx.x * blockDim.x + threadIdx.x};
   if (i >= buf.nEntries || buf.isSeed[i] == 0u) {
@@ -2504,7 +2512,7 @@ __global__ void compactEventPatternsKernel(EventBuffers* buffers) {
 
 namespace ActsExamples {
 
-void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream) {
+void prepareCudaPatternFinder(std::size_t workspaceBytes, cudaStream_t stream) {
   int device{0};
   ACTS_CUDA_CHECK(cudaGetDevice(&device));
   cudaMemPool_t pool{};
@@ -2526,7 +2534,7 @@ void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream) {
         reinterpret_cast<const void*>(&Search::fillListsKernel),
         reinterpret_cast<const void*>(&prepareSeedsKernel),
         reinterpret_cast<const void*>(&buildPatternsKernel),
-        reinterpret_cast<const void*>(&carveEventKernel),
+        reinterpret_cast<const void*>(&allocateEventBuffersKernel),
         reinterpret_cast<const void*>(&appendPatternsKernel),
         reinterpret_cast<const void*>(&countEventGroupsKernel),
         reinterpret_cast<const void*>(&linkEventPatternsKernel),
@@ -2548,28 +2556,32 @@ void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream) {
                                     2u * sizeof(std::uint8_t), stream));
     ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&values),
                                     4u * sizeof(std::uint32_t), stream));
-    ACTS_CUDA_CHECK(cudaMemsetAsync(keys, 0, 2u * sizeof(std::uint64_t), stream));
-    ACTS_CUDA_CHECK(cudaMemsetAsync(sectors, 0, 2u * sizeof(std::uint8_t), stream));
-    ACTS_CUDA_CHECK(cudaMemsetAsync(values, 0, 4u * sizeof(std::uint32_t), stream));
+    ACTS_CUDA_CHECK(
+        cudaMemsetAsync(keys, 0, 2u * sizeof(std::uint64_t), stream));
+    ACTS_CUDA_CHECK(
+        cudaMemsetAsync(sectors, 0, 2u * sizeof(std::uint8_t), stream));
+    ACTS_CUDA_CHECK(
+        cudaMemsetAsync(values, 0, 4u * sizeof(std::uint32_t), stream));
     std::size_t sortKeyBytes{0u};
     std::size_t sortSectorBytes{0u};
     std::size_t scanBytes{0u};
+    ACTS_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairs(nullptr, sortKeyBytes, keys, keys + 1,
+                                        values, values + 1, 1, 0, 64, stream));
     ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sortKeyBytes, keys, keys + 1, values, values + 1, 1, 0, 64,
-        stream));
-    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, sortSectorBytes, sectors, sectors + 1, values, values + 1, 1, 0,
-        8, stream));
+        nullptr, sortSectorBytes, sectors, sectors + 1, values, values + 1, 1,
+        0, 8, stream));
     ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, values,
                                                   values + 2, 1, stream));
     std::size_t tempBytes{std::max({sortKeyBytes, sortSectorBytes, scanBytes})};
     ACTS_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&temp),
-                                    std::max<std::size_t>(tempBytes, 1u), stream));
+                                    std::max<std::size_t>(tempBytes, 1u),
+                                    stream));
     ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         temp, tempBytes, keys, keys + 1, values, values + 1, 1, 0, 64, stream));
-    ACTS_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        temp, tempBytes, sectors, sectors + 1, values, values + 1, 1, 0, 8,
-        stream));
+    ACTS_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairs(temp, tempBytes, sectors, sectors + 1,
+                                        values, values + 1, 1, 0, 8, stream));
     ACTS_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp, tempBytes, values,
                                                   values + 2, 1, stream));
     for (void* ptr : {static_cast<void*>(keys), static_cast<void*>(sectors),
@@ -2579,9 +2591,9 @@ void prepareCudaPatternFinder(std::size_t arenaBytes, cudaStream_t stream) {
   }
 
   // Taking the arena once leaves it in the pool for the events
-  if (arenaBytes > 0u) {
+  if (workspaceBytes > 0u) {
     void* arena{nullptr};
-    ACTS_CUDA_CHECK(cudaMallocAsync(&arena, arenaBytes, stream));
+    ACTS_CUDA_CHECK(cudaMallocAsync(&arena, workspaceBytes, stream));
     ACTS_CUDA_CHECK(cudaFreeAsync(arena, stream));
   }
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -2780,7 +2792,8 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   }
   EventBuffers* eventBuffers{nullptr};
   allocate(eventBuffers, 1u);
-  carveEventKernel<<<1, 1, 0, stream>>>(arena, counts, nSeeds, eventBuffers);
+  allocateEventBuffersKernel<<<1, 1, 0, stream>>>(arena, counts, nSeeds,
+                                                  eventBuffers);
   ACTS_CUDA_CHECK(cudaGetLastError());
   appendPatternsKernel<<<1, 256, 0, stream>>>(hits.deviceArrays(),
                                               lists.deviceArrays(), cfg,

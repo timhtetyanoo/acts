@@ -42,39 +42,39 @@ void storeRotation(const Acts::RotationMatrix3& rotation, double* out) {
 
 }  // namespace
 
-/// Per-event device resources, reused between events; concurrent events use
-/// separate workspaces
-struct CudaGlobalPatternFinder::Workspace {
+/// Stream and transfer buffers of one event, reused between events;
+/// concurrent events take separate ones
+struct CudaGlobalPatternFinder::StreamBuffers {
   CudaStream stream{};
   CudaPinnedBuffer upload{};
   CudaDeviceBuffer device{};
   CudaPinnedBuffer readback{};
 };
 
-std::unique_ptr<CudaGlobalPatternFinder::Workspace>
-CudaGlobalPatternFinder::acquireWorkspace() const {
+std::unique_ptr<CudaGlobalPatternFinder::StreamBuffers>
+CudaGlobalPatternFinder::acquireStreamBuffers() const {
   {
-    const std::lock_guard lock{m_workspaceMutex};
-    if (!m_workspaces.empty()) {
-      std::unique_ptr<Workspace> workspace{std::move(m_workspaces.back())};
-      m_workspaces.pop_back();
-      return workspace;
+    const std::lock_guard lock{m_streamBuffersMutex};
+    if (!m_streamBuffers.empty()) {
+      std::unique_ptr<StreamBuffers> buffers{std::move(m_streamBuffers.back())};
+      m_streamBuffers.pop_back();
+      return buffers;
     }
   }
-  return std::make_unique<Workspace>();
+  return std::make_unique<StreamBuffers>();
 }
 
-void CudaGlobalPatternFinder::releaseWorkspace(
-    std::unique_ptr<Workspace> workspace) const {
-  if (workspace == nullptr) {
+void CudaGlobalPatternFinder::releaseStreamBuffers(
+    std::unique_ptr<StreamBuffers> buffers) const {
+  if (buffers == nullptr) {
     return;
   }
-  const std::lock_guard lock{m_workspaceMutex};
-  m_workspaces.push_back(std::move(workspace));
+  const std::lock_guard lock{m_streamBuffersMutex};
+  m_streamBuffers.push_back(std::move(buffers));
 }
 
-CudaGlobalPatternFinder::WorkspaceReturn::~WorkspaceReturn() {
-  finder.releaseWorkspace(std::move(workspace));
+CudaGlobalPatternFinder::StreamBuffersReturn::~StreamBuffersReturn() {
+  finder.releaseStreamBuffers(std::move(buffers));
 }
 
 CudaGlobalPatternFinder::~CudaGlobalPatternFinder() {
@@ -122,14 +122,14 @@ CudaGlobalPatternFinder::surfaceTable(const Acts::GeometryContext& gctx) const {
                                cudaMemcpyHostToDevice));
     ACTS_DEBUG(__func__ << "() " << ids.size()
                         << " measurement surfaces on the device");
-    // The arena takes a fraction of the free memory left after the table
+    // The workspace takes a fraction of the free memory left after the table
     if (m_cfg.workspaceFraction > 0.) {
       std::size_t free{0u};
       std::size_t total{0u};
       ACTS_CUDA_CHECK(cudaMemGetInfo(&free, &total));
-      m_arenaBytes = static_cast<std::size_t>(m_cfg.workspaceFraction *
-                                              static_cast<double>(free));
-      ACTS_INFO("Pattern building memory: " << m_arenaBytes / (1u << 20u)
+      m_workspaceBytes = static_cast<std::size_t>(m_cfg.workspaceFraction *
+                                                  static_cast<double>(free));
+      ACTS_INFO("Pattern building memory: " << m_workspaceBytes / (1u << 20u)
                                             << " MiB of " << free / (1u << 20u)
                                             << " MiB free on the device");
     }
@@ -141,14 +141,14 @@ void CudaGlobalPatternFinder::initialize(
     const Acts::GeometryContext& gctx) const {
   std::call_once(m_setupOnce, [&]() {
     surfaceTable(gctx);
-    std::unique_ptr<Workspace> workspace{acquireWorkspace()};
-    workspace->upload.reserve(m_cfg.transferBytes);
-    workspace->device.reserve(m_cfg.transferBytes);
-    workspace->readback.reserve(m_cfg.transferBytes);
+    std::unique_ptr<StreamBuffers> buffers{acquireStreamBuffers()};
+    buffers->upload.reserve(m_cfg.transferBytes);
+    buffers->device.reserve(m_cfg.transferBytes);
+    buffers->readback.reserve(m_cfg.transferBytes);
     prepareCudaPatternFinder(
-        m_arenaBytes > 0u ? m_arenaBytes : m_cfg.sizes.workspaceBytes,
-        workspace->stream.get());
-    releaseWorkspace(std::move(workspace));
+        m_workspaceBytes > 0u ? m_workspaceBytes : m_cfg.sizes.workspaceBytes,
+        buffers->stream.get());
+    releaseStreamBuffers(std::move(buffers));
   });
 }
 
@@ -202,9 +202,9 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
 
   // One upload from reused page-locked memory; the positions and payloads,
   // computed on the device, follow in the same device block
-  std::unique_ptr<Workspace> workspace{acquireWorkspace()};
-  const WorkspaceReturn giveBack{*this, workspace};
-  const cudaStream_t stream{workspace->stream.get()};
+  std::unique_ptr<StreamBuffers> buffers{acquireStreamBuffers()};
+  const StreamBuffersReturn giveBack{*this, buffers};
+  const cudaStream_t stream{buffers->stream.get()};
   const auto nUsed = static_cast<std::uint32_t>(usedPointer.size());
   const auto nBuckets = static_cast<std::uint32_t>(spacePoints.size());
   CudaMuonSpacePointArrays deviceSpacePoints{};
@@ -276,8 +276,8 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   stage(sizing);
   const std::size_t missingAt{(sizing.cursor + 15u) & ~std::size_t{15u}};
   CudaStagedBlock block{
-      .host = workspace->upload.reserve(missingAt + sizeof(std::uint32_t)),
-      .device = workspace->device.reserve(sizing.cursor)};
+      .host = buffers->upload.reserve(missingAt + sizeof(std::uint32_t)),
+      .device = buffers->device.reserve(sizing.cursor)};
   stage(block);
   auto* nMissing = reinterpret_cast<std::uint32_t*>(block.host + missingAt);
   if (timing != nullptr) {
@@ -308,7 +308,7 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
   CudaCandidateListContainer lists{};
   findCudaCandidates(deviceSpacePoints, search, selection, lists,
-                     workspace->readback, stream);
+                     buffers->readback, stream);
   if (timing != nullptr) {
     timing->nSeeds = lists.nSeeds();
     timing->nCandidates = lists.nCandidates();
@@ -335,12 +335,12 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
   }
 
   CudaPatternFinderSizes sizes{m_cfg.sizes};
-  if (m_arenaBytes > 0u) {
-    sizes.workspaceBytes = m_arenaBytes;
+  if (m_workspaceBytes > 0u) {
+    sizes.workspaceBytes = m_workspaceBytes;
   }
   const CudaPatternRecordContainer event{findCudaPatternsInEta(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
-      stream, timing, &workspace->readback)};
+      stream, timing, &buffers->readback)};
   if (timing != nullptr) {
     float ms{0.f};
     ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
