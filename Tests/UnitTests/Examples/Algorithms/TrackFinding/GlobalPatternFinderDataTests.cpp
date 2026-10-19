@@ -108,6 +108,9 @@ BOOST_AUTO_TEST_CASE(pattern_finding_from_ntuple) {
   finderCfg.inSpacePoints = readerCfg.outputSpacePoints;
   finderCfg.outPatterns = "MuonGlobalPatterns";
   finderCfg.trackingGeometry = trackingGeometry;
+  /// Seeds from MDT hits and from the inner station, if set to non-zero
+  finderCfg.seedFromMdt = countFromEnv("ACTS_GPF_SEED_FROM_MDT", 0u) != 0u;
+  finderCfg.seedFromInner = countFromEnv("ACTS_GPF_SEED_FROM_INNER", 0u) != 0u;
   ActsExamples::GlobalPatternFinderAlgorithm finder{
       finderCfg, Acts::getDefaultLogger("GlobalPatternFinderAlgorithm",
                                         Acts::Logging::DEBUG)};

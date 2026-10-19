@@ -121,6 +121,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
   finderCfg.outPatterns = "MuonGlobalPatterns";
   finderCfg.outTiming = "CudaPatternFinderTiming";
   finderCfg.trackingGeometry = trackingGeometry;
+  /// Seeds from MDT hits and from the inner station, if set to non-zero
+  finderCfg.seedFromMdt = countFromEnv("ACTS_GPF_SEED_FROM_MDT", 0u) != 0u;
+  finderCfg.seedFromInner = countFromEnv("ACTS_GPF_SEED_FROM_INNER", 0u) != 0u;
   if (const std::size_t workspaceMB{countFromEnv("ACTS_GPF_WORKSPACE_MB", 0u)};
       workspaceMB > 0u) {
     finderCfg.workspaceBytes = workspaceMB << 20u;
