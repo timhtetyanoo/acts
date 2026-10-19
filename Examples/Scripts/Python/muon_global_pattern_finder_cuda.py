@@ -25,6 +25,7 @@ def runGlobalPatternFinder(
     skip: int = 0,
     timingDir: str = "",
     timingFile: str = "timing.csv",
+    workspaceMB: int = 0,
 ):
     # The muon space points are stored in the frame of their spectrometer sector.
     # Reaching the global frame needs the measurement surfaces, which are read
@@ -62,6 +63,15 @@ def runGlobalPatternFinder(
     )
     s.addReader(spReader)
 
+    # Each event in flight takes its own workspace. By default it is a fraction
+    # of the free device memory, which leaves no room for a second event; with
+    # several threads it needs a fixed size.
+    workspace = (
+        dict(workspaceBytes=workspaceMB << 20, workspaceFraction=0.0)
+        if workspaceMB > 0
+        else {}
+    )
+
     # Reads the space points back via inSpacePoints and writes the found
     # patterns under outPatterns. Every Config field not set here keeps its
     # default from the C++ header.
@@ -70,6 +80,7 @@ def runGlobalPatternFinder(
         outPatterns="MuonGlobalPatterns",
         trackingGeometry=trackingGeometry,
         level=logLevel,
+        **workspace,
     )
     s.addAlgorithm(patternFinder)
 
@@ -130,6 +141,11 @@ if "__main__" == __name__:
         help="Name of the file the per algorithm wall time is written to",
     )
     p.add_argument(
+        "--workspaceMB", default=0, type=int,
+        help="Workspace of each event in flight in MiB, 0 for a fraction of the "
+             "free device memory. Needed with more than one thread",
+    )
+    p.add_argument(
         "--logLevel",
         default="INFO",
         choices=["VERBOSE", "DEBUG", "INFO", "WARNING", "ERROR"],
@@ -147,4 +163,5 @@ if "__main__" == __name__:
         skip=args.skip,
         timingDir=args.timingDir,
         timingFile=args.timingFile,
+        workspaceMB=args.workspaceMB,
     )
