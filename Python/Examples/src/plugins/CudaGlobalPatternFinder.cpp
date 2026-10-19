@@ -21,10 +21,9 @@ PYBIND11_MODULE(ActsExamplesPythonBindingsCudaGlobalPatternFinder, cuda) {
   ACTS_PYTHON_DECLARE_ALGORITHM(
       CudaGlobalPatternFinderAlgorithm, cuda,
       "CudaGlobalPatternFinderAlgorithm", inSpacePoints, outPatterns,
-      trackingGeometry, useMdtHits, seedFromMdt, seedFromInner,
-      thetaSearchWindow, nResidualSigma, lowConfidenceResSigma, phiTolerance,
-      minTriggerLayers, minPrecisionLayers, minPhiLayers, minStationLayers,
-      meanNormRes2Cut, maxSeedAttempts, maxMissLayersInStation,
-      minHitDistance4Line, beamSpotRadius, beamSpotLength, workspaceBytes,
-      workspaceFraction, outTiming);
+      trackingGeometry, useMdtHits, seedFromMdt, seedFromInner, nResidualSigma,
+      lowConfidenceResSigma, phiTolerance, minTriggerLayers, minPrecisionLayers,
+      minPhiLayers, minStationLayers, meanNormRes2Cut, maxSeedAttempts,
+      maxMissLayersInStation, minHitDistance4Line, beamSpotRadius,
+      beamSpotLength, workspaceBytes, workspaceFraction, outTiming);
 }
