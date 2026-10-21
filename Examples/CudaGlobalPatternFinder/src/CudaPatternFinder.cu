@@ -2273,10 +2273,12 @@ __global__ void buildHitPayloadsKernel(CudaMuonSpacePointArrays sp,
       out.sensorDirectionY[r] = sensorDir.y;
       out.sensorDirectionZ[r] = sensorDir.z;
       if (!straw) {
-        etaDir = measPhi && nonOrthogonal ? cross(sensorDir, column(rot, 2u))
-                                          : column(rot, 0u);
-        if (measPhi) {
+        etaDir =
+            nonOrthogonal ? cross(sensorDir, column(rot, 2u)) : column(rot, 0u);
+        if (nonOrthogonal) {
           phiDir = column(rot, 1u);
+          out.flags[r] = static_cast<std::uint8_t>(out.flags[r] |
+                                                   CudaHitFlags::tiltedStrips);
         }
       }
     }

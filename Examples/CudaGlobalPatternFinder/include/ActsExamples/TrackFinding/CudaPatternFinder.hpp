@@ -212,7 +212,7 @@ __host__ __device__ inline T intrinsicVariance(const HitT<T>& hit,
     const T vDotRsq{square(dot(hit.sensorDirection, c))};
     return discVar * (dot(c, c) - vDotRsq) + vDotRsq * hit.phiCovariance;
   }
-  const bool hasSecond{(hit.flags & CudaHitFlags::measuresPhi) != 0u};
+  const bool hasSecond{(hit.flags & CudaHitFlags::tiltedStrips) != 0u};
   const T bendTerm{hit.etaCovariance *
                    square(dot(hit.etaMeasurementDirection, c))};
   if (isProjected && !hasSecond) {

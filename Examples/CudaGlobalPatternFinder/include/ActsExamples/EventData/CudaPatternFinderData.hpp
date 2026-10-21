@@ -97,6 +97,9 @@ struct CudaHitFlags {
   /// @brief The hit measures the non-precision coordinate as well
   static constexpr std::uint8_t measuresPhi = 1u << 2u;
   static constexpr std::uint8_t precision = 1u << 3u;
+  /// @brief Tilted strips: the phi measurement direction differs from the
+  ///        sensor direction
+  static constexpr std::uint8_t tiltedStrips = 1u << 4u;
 };
 
 /// @brief The quantities the pattern finder reads from a hit
@@ -673,6 +676,7 @@ CudaHitPayloadRow makeCudaHitPayloadRow(const Acts::GeometryContext& gctx,
   row.etaMeasurementDirection = primary;
   if (secondary) {
     row.phiMeasurementDirection = *secondary;
+    row.flags |= CudaHitFlags::tiltedStrips;
   }
   return row;
 }
