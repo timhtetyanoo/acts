@@ -2911,16 +2911,22 @@ CudaPatternRecordContainer findCudaPatternsInEta(
   CudaPinnedBuffer ownReadback{};
   CudaPinnedBuffer& pinned{readback != nullptr ? *readback : ownReadback};
   constexpr std::size_t countsAt{(sizeof(EventBuffers) + 15u) & ~15u};
-  char* small{pinned.reserve(countsAt + sizeof(EventCounts))};
+  constexpr std::size_t usedAt{(countsAt + sizeof(EventCounts) + 15u) & ~15u};
+  char* small{pinned.reserve(usedAt + sizeof(unsigned long long))};
   ACTS_CUDA_CHECK(cudaMemcpyAsync(small, eventBuffers, sizeof(EventBuffers),
                                   cudaMemcpyDeviceToHost, stream));
   ACTS_CUDA_CHECK(cudaMemcpyAsync(small + countsAt, counts, sizeof(EventCounts),
                                   cudaMemcpyDeviceToHost, stream));
+  ACTS_CUDA_CHECK(cudaMemcpyAsync(small + usedAt, arena.used,
+                                  sizeof(unsigned long long),
+                                  cudaMemcpyDeviceToHost, stream));
   ACTS_CUDA_CHECK(cudaStreamSynchronize(stream));
   EventBuffers ready{};
   EventCounts totals{};
+  unsigned long long workspaceUsed{0u};
   std::memcpy(&ready, small, sizeof(EventBuffers));
   std::memcpy(&totals, small + countsAt, sizeof(EventCounts));
+  std::memcpy(&workspaceUsed, small + usedAt, sizeof(unsigned long long));
   const std::uint32_t maxHits{std::max(totals.maxHits, 1u)};
   CudaPatternRecordContainer kept{1u, ready.nKept, maxHits};
   if (ready.nKept > 0u) {
@@ -2949,6 +2955,7 @@ CudaPatternRecordContainer findCudaPatternsInEta(
     timing->downloadUs = elapsedUs(1u, 2u);
     timing->overflow = overflow;
     timing->nPatternsInEta = nKept[0];
+    timing->workspaceUsedBytes = workspaceUsed;
     for (cudaEvent_t& m : marks) {
       ACTS_CUDA_CHECK(cudaEventDestroy(m));
     }

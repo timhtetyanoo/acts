@@ -48,6 +48,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -163,7 +164,7 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
     timingFile << "event,nSpacePoints,nBuckets,nPatterns,totalTime_us,"
                   "hostPreTime_us,uploadTime_us,kernelTime_us,"
                   "downloadTime_us,hostPostTime_us,nSeeds,nCandidates,"
-                  "nPatternsInEta,overflow\n";
+                  "nPatternsInEta,overflow,workspaceUsed_bytes,device_bytes\n";
   }
 
   /// The patterns are written out for the offline validation, if asked for
@@ -231,7 +232,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_from_ntuple) {
                  << stages.kernelsUs << ',' << stages.downloadUs << ','
                  << stages.hostPostUs << ',' << stages.nSeeds << ','
                  << stages.nCandidates << ',' << stages.nPatternsInEta << ','
-                 << static_cast<int>(stages.overflow) << '\n';
+                 << static_cast<int>(stages.overflow) << ','
+                 << stages.workspaceUsedBytes << ',' << stages.deviceBytes
+                 << '\n';
     }
     totalPatterns += patterns.size();
     eventsWithPatterns += (patterns.empty() ? 0u : 1u);
@@ -341,6 +344,9 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_throughput) {
   struct Pass {
     double wallTime{0.};
     double cpuTime{0.};
+    /// Start and end in seconds since the epoch, to place GPU samples
+    double startedAt{0.};
+    double endedAt{0.};
     std::size_t failures{0u};
     std::size_t overflows{0u};
   };
@@ -369,6 +375,12 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_throughput) {
         }
       }
     };
+    auto epochSeconds = [] {
+      return std::chrono::duration<double>(
+                 std::chrono::system_clock::now().time_since_epoch())
+          .count();
+    };
+    const double startedAt{epochSeconds()};
     const std::clock_t cpuStart{std::clock()};
     const auto start = std::chrono::steady_clock::now();
     {
@@ -382,6 +394,8 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_throughput) {
     return Pass{.wallTime = wall.count(),
                 .cpuTime = static_cast<double>(std::clock() - cpuStart) /
                            CLOCKS_PER_SEC,
+                .startedAt = startedAt,
+                .endedAt = epochSeconds(),
                 .failures = failures.load(),
                 .overflows = overflows.load()};
   };
@@ -396,7 +410,7 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_throughput) {
   }
   const std::string header{
       "threads,events,wallTime_s,eventsPerSecond,cpuTime_s,coresUsed,"
-      "overflows,failures,mismatches"};
+      "overflows,failures,mismatches,passStart_s,passEnd_s"};
   std::cout << header << std::endl;
   if (outFile.is_open()) {
     outFile << header << '\n';
@@ -415,7 +429,8 @@ BOOST_AUTO_TEST_CASE(cuda_pattern_finding_throughput) {
     row << nThreads << ',' << nEvents << ',' << pass.wallTime << ','
         << static_cast<double>(nEvents) / pass.wallTime << ',' << pass.cpuTime
         << ',' << pass.cpuTime / pass.wallTime << ',' << pass.overflows << ','
-        << pass.failures << ',' << mismatches;
+        << pass.failures << ',' << mismatches << ',' << std::fixed
+        << std::setprecision(3) << pass.startedAt << ',' << pass.endedAt;
     std::cout << row.str() << std::endl;
     if (outFile.is_open()) {
       outFile << row.str() << '\n';

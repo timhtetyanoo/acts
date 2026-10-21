@@ -704,6 +704,12 @@ struct CudaPatternFinderTiming {
   std::size_t nPatternsInEta{0u};
   /// CudaPatternOverflow bits
   std::uint8_t overflow{0u};
+  /// Bytes the pattern building took from the workspace
+  std::size_t workspaceUsedBytes{0u};
+  /// Bytes of device memory the event used at most: the uploaded inputs, the
+  /// search, the candidate lists, the patterns and the output, with the
+  /// workspace counted as far as it was taken. Only with one event in flight
+  std::size_t deviceBytes{0u};
 };
 
 /// @brief Kernel configuration from the pattern finder configuration

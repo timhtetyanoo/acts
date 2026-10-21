@@ -164,6 +164,16 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
     return std::chrono::duration<double, std::micro>(d).count();
   };
   const auto hostPreStart = Clock::now();
+  // The memory pool counts the device memory the event takes from it
+  cudaMemPool_t pool{};
+  if (timing != nullptr) {
+    int device{0};
+    ACTS_CUDA_CHECK(cudaGetDevice(&device));
+    ACTS_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, device));
+    std::uint64_t zero{0u};
+    ACTS_CUDA_CHECK(
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &zero));
+  }
   const SurfaceTable& surfaces{surfaceTable(gctx)};
   const Acts::TrackingGeometry& geometry{*m_cfg.trackingGeometry};
 
@@ -348,6 +358,14 @@ MuonGlobalPatternContainer CudaGlobalPatternFinder::findPatterns(
       hits, lists, makeCudaPatternFinderConfig(m_cfg.finder, beamspot), sizes,
       stream, timing, &buffers->readback)};
   if (timing != nullptr) {
+    // The workspace is taken from the pool whole; only its used part counts
+    std::uint64_t poolHigh{0u};
+    ACTS_CUDA_CHECK(
+        cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &poolHigh));
+    const std::size_t workspaceTaken{sizes.workspaceBytes & ~std::size_t{7u}};
+    timing->deviceBytes =
+        sizing.cursor + timing->workspaceUsedBytes +
+        (poolHigh > workspaceTaken ? poolHigh - workspaceTaken : 0u);
     float ms{0.f};
     ACTS_CUDA_CHECK(cudaEventElapsedTime(&ms, uploadMarks[0], uploadMarks[1]));
     timing->uploadUs = 1000. * ms;
