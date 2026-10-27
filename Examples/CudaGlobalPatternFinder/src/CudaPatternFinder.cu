@@ -2334,8 +2334,10 @@ __device__ const double* seedWindows(std::uint32_t raw, const double x,
   }
   const std::uint8_t layer{Math::layerOf(station)};
   const bool straw{MuonIdBits::technology(raw) == MuonIdBits::mdt};
+  const std::uint32_t technology{MuonIdBits::technology(raw)};
+  const bool nsw{technology == MuonIdBits::sTgc || technology == MuonIdBits::mm};
   if (((sel.seedingLayers >> layer) & 1u) == 0u ||
-      (straw && !sel.seedFromMdt)) {
+      (straw && !sel.seedFromMdt) || (nsw && layer == Math::Layer::Inner)) {
     return nullptr;
   }
   const double eta{std::abs(std::asinh(z / std::sqrt(x * x + y * y)))};

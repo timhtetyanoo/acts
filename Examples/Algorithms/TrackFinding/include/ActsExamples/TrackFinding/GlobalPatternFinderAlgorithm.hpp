@@ -412,7 +412,8 @@ class GlobalPatternFinderAlgorithm final : public IAlgorithm {
     bool useMdtHits{true};
     /// @brief Toggle the seeding from MDT hits
     bool seedFromMdt{false};
-    /// @brief Activate the seeding from Inner station
+    /// @brief Activate the seeding from Inner station, without its NSW (sTGC
+    ///        and MM) hits
     bool seedFromInner{false};
     /// @brief Number of standard deviations to consider for residual acceptance
     double nResidualSigma{3.};

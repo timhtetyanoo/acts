@@ -449,7 +449,11 @@ bool SeedSelector::goodForSeeding(const HitPayload& hit) const {
       (hit.spacePoint()->isStraw() && !m_cfg.seedFromMdt)) {
     return false;
   }
-  return true;
+  // NSW hits (sTGC and MM) of the inner station do not seed
+  using enum MuonSpacePoint::MuonId::TechField;
+  const auto technology{hit.spacePoint()->id().technology()};
+  return hitLayer != LayerIndex::Inner ||
+         (technology != sTgc && technology != Mm);
 }
 SeedSelector::EtaBin SeedSelector::etaBin(const HitPayload& seed) const {
   const double eta{std::abs(Acts::VectorHelpers::eta(seed.position))};
